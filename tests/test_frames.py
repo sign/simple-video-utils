@@ -225,6 +225,130 @@ class TestReadFramesExact:
         frames_multi = list(read_frames_exact(remote_url, 0, 2))
         assert len(frames_multi) == 3
 
+    def test_time_based_extraction(self, video_path):
+        """Test reading frames using time-based parameters."""
+        # Read using time parameters
+        frames = list(read_frames_exact(video_path, start_time=0.0, end_time=1.0))
+
+        # Should get approximately 1 second worth of frames
+        meta = video_metadata(video_path)
+        expected_frames = int(meta.fps) + 1  # +1 because end frame is inclusive
+        # Allow some tolerance for frame extraction
+        assert abs(len(frames) - expected_frames) <= 2
+
+    def test_time_vs_frame_equivalence(self, video_path):
+        """Test that time-based and frame-based extraction produce equivalent results."""
+        meta = video_metadata(video_path)
+        fps = meta.fps
+
+        # Extract frames 10-20 using frame indices
+        frames_by_index = list(read_frames_exact(video_path, start_frame=10, end_frame=20))
+
+        # Extract same frames using time
+        start_time = 10 / fps
+        end_time = 20 / fps
+        frames_by_time = list(read_frames_exact(video_path, start_time=start_time, end_time=end_time))
+
+        # Should get same number of frames
+        assert len(frames_by_index) == len(frames_by_time)
+
+        # Frames should be identical
+        for i, (frame_idx, frame_time) in enumerate(zip(frames_by_index, frames_by_time, strict=False)):
+            np.testing.assert_array_equal(
+                frame_idx,
+                frame_time,
+                err_msg=f"Frame {i} differs between time and index extraction",
+            )
+
+    def test_time_based_start_only(self, video_path):
+        """Test time-based extraction with only start_time specified."""
+        frames = list(read_frames_exact(video_path, start_time=0.5))
+
+        # Should get frames from 0.5 seconds to end
+        assert len(frames) > 0
+        for frame in frames:
+            assert isinstance(frame, np.ndarray)
+            assert frame.dtype == np.uint8
+
+    def test_time_based_end_only(self, video_path):
+        """Test time-based extraction with only end_time specified."""
+        frames = list(read_frames_exact(video_path, end_time=1.0))
+
+        # Should get frames from start to 1.0 seconds
+        meta = video_metadata(video_path)
+        expected_frames = int(meta.fps) + 1
+        assert abs(len(frames) - expected_frames) <= 2
+
+    def test_cannot_mix_frame_and_time_params(self, video_path):
+        """Test that mixing frame and time parameters raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot mix frame-based and time-based"):
+            list(read_frames_exact(video_path, start_frame=0, end_time=1.0))
+
+        with pytest.raises(ValueError, match="Cannot mix frame-based and time-based"):
+            list(read_frames_exact(video_path, start_time=0.0, end_frame=10))
+
+        with pytest.raises(ValueError, match="Cannot mix frame-based and time-based"):
+            list(read_frames_exact(video_path, start_frame=0, start_time=0.0))
+
+    def test_no_parameters_reads_all(self, video_path):
+        """Test that calling with no parameters reads all frames from start."""
+        frames_no_params = list(read_frames_exact(video_path))
+        frames_explicit = list(read_frames_exact(video_path, start_frame=0))
+
+        # Should produce same result
+        assert len(frames_no_params) == len(frames_explicit)
+        for f1, f2 in zip(frames_no_params, frames_explicit, strict=False):
+            np.testing.assert_array_equal(f1, f2)
+
+    def test_time_vs_frame_seeking_precision_remote(self):
+        """Test that time and frame seeking produce identical frames on a longer remote video."""
+        remote_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4"
+
+        # Get video metadata to calculate frame indices
+        meta = video_metadata(remote_url)
+        fps = meta.fps
+
+        # Test 5-7 seconds
+        start_time_sec = 5.0
+        end_time_sec = 7.0
+
+        # Calculate corresponding frame indices
+        start_frame_idx = int(start_time_sec * fps)
+        end_frame_idx = int(end_time_sec * fps)
+
+        # Extract using time parameters
+        frames_by_time = list(read_frames_exact(remote_url, start_time=start_time_sec, end_time=end_time_sec))
+
+        # Extract using frame indices
+        frames_by_frame = list(read_frames_exact(remote_url, start_frame=start_frame_idx, end_frame=end_frame_idx))
+
+        # Should get same number of frames
+        assert len(frames_by_time) == len(frames_by_frame), (
+            f"Frame count mismatch: time-based={len(frames_by_time)}, "
+            f"frame-based={len(frames_by_frame)}"
+        )
+
+        # Verify we got the expected number of frames
+        expected_frame_count = end_frame_idx - start_frame_idx + 1  # +1 because end is inclusive
+        assert len(frames_by_time) == expected_frame_count, (
+            f"Expected {expected_frame_count} frames (from frame {start_frame_idx} to {end_frame_idx}), "
+            f"got {len(frames_by_time)}"
+        )
+
+        # Every frame should be identical
+        for i, (frame_time, frame_idx) in enumerate(zip(frames_by_time, frames_by_frame, strict=False)):
+            actual_frame_num = start_frame_idx + i
+            np.testing.assert_array_equal(
+                frame_time,
+                frame_idx,
+                err_msg=f"Frame {actual_frame_num} differs between time-based and frame-based extraction",
+            )
+
+        # Verify frames are not all identical (video has content)
+        if len(frames_by_time) >= 2:
+            diff = np.sum(np.abs(frames_by_time[0].astype(np.int16) - frames_by_time[-1].astype(np.int16)))
+            assert diff > 0, "First and last frames are identical - video may not have motion"
+
 
 class TestReadFramesFromStream:
     """Tests for streaming video input via read_frames_from_stream."""

@@ -10,59 +10,183 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 
 def _generate_frames(
     container: av.container.InputContainer,
-    start_frame: int = 0,
-    end_frame: int | None = None,
+    skip_frames: int = 0,
+    max_frames: int | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
-    Generate RGB frames from a container.
+    Generate RGB frames from a container's current position.
+
+    Decodes frames from the container's current position and yields frames
+    after skipping the specified number of frames.
 
     Args:
-        container: Open PyAV container.
-        start_frame: First frame index to yield (0-based).
-        end_frame: Last frame index to yield (inclusive), or None for all.
+        container: Open PyAV container (may be seeked to any position).
+        skip_frames: Number of frames to skip from current position before yielding.
+        max_frames: Maximum number of frames to yield, or None for all remaining.
 
     Yields:
-        RGB numpy arrays (H, W, 3).
+        RGB numpy arrays (H, W, 3) for frames after skipping.
     """
-    frame_index = 0
+    frames_decoded = 0
+    frames_yielded = 0
+
     for frame in container.decode(video=0):
-        if frame_index < start_frame:
-            frame_index += 1
+        if frames_decoded < skip_frames:
+            frames_decoded += 1
             continue
 
-        if end_frame is not None and frame_index > end_frame:
-            break
-
         yield frame.to_ndarray(format='rgb24')
-        frame_index += 1
+        frames_yielded += 1
+
+        if max_frames is not None and frames_yielded >= max_frames:
+            break
+        frames_decoded += 1
+
+def _validate_parameters(
+    start_frame: int | None,
+    end_frame: int | None,
+    start_time: float | None,
+    end_time: float | None,
+) -> tuple[bool, bool]:
+    """Validate that time and frame parameters aren't mixed."""
+    has_frame_params = start_frame is not None or end_frame is not None
+    has_time_params = start_time is not None or end_time is not None
+
+    if has_frame_params and has_time_params:
+        msg = "Cannot mix frame-based and time-based parameters"
+        raise ValueError(msg)
+
+    return has_frame_params, has_time_params
+
+
+def _convert_time_to_frames(
+    start_time: float | None,
+    end_time: float | None,
+    fps: float,
+) -> tuple[int, int | None]:
+    """Convert time-based parameters to frame indices."""
+    start = int((start_time or 0.0) * fps)
+    end = int(end_time * fps) if end_time is not None else None
+
+    if end is not None and end < start:
+        msg = "invalid frame range"
+        raise ValueError(msg)
+
+    return start, end
+
+
+def _normalize_frame_range(
+    start_frame: int | None,
+    end_frame: int | None,
+) -> tuple[int, int | None]:
+    """Normalize frame parameters with defaults and validation."""
+    start = start_frame if start_frame is not None else 0
+
+    if end_frame is not None:
+        assert end_frame >= start >= 0, "invalid frame range"
+    else:
+        assert start >= 0, "start_frame must be non-negative"
+
+    return start, end_frame
+
+
+def _calculate_seek_position(
+    target_start_frame: int,
+    fps: float,
+    stream,
+    container,
+) -> int:
+    """
+    Calculate and perform seeking if beneficial.
+
+    Seeks directly to the target position in the file - does NOT decode
+    or process frames before the seek position. This allows efficient
+    extraction from any point in the video without reading the entire file.
+
+    Returns the frame number where container is positioned after seeking.
+    """
+    min_seek_seconds = 3.0  # Only seek if target is 3+ seconds from start
+    seek_buffer_seconds = 1.0  # Seek 1 second before target
+
+    target_time = target_start_frame / fps
+
+    # Only seek if far enough from start
+    if target_time < min_seek_seconds:
+        return 0  # Start from beginning
+
+    # Seek to 1 second before target (jumps directly in file, no decoding)
+    seek_time = target_time - seek_buffer_seconds
+    seek_timestamp = int(seek_time / float(stream.time_base))
+    container.seek(seek_timestamp, stream=stream)
+
+    return int(seek_time * fps)
+
 
 def read_frames_exact(
     src: str,
-    start_frame: int,
+    start_frame: int | None = None,
     end_frame: int | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
-    Return frames [start_frame, end_frame] inclusive as RGB np.ndarrays.
-    If end_frame is None, reads from start_frame to the end of the video.
+    Return frames as RGB np.ndarrays from specified range.
+
+    Supports both frame-based and time-based range specification.
     Uses PyAV for efficient frame extraction.
+
+    Args:
+        src: Path to video file or URL.
+        start_frame: Starting frame index (0-based). Mutually exclusive with start_time.
+        end_frame: Ending frame index (inclusive), or None for end of video.
+        start_time: Starting time in seconds. Mutually exclusive with start_frame.
+        end_time: Ending time in seconds, or None for end of video.
+
+    Returns:
+        Generator yielding RGB numpy arrays (H, W, 3).
+
+    Examples:
+        # All frames
+        frames = list(read_frames_exact("video.mp4"))
+
+        # Frame-based
+        frames = list(read_frames_exact("video.mp4", start_frame=0, end_frame=10))
+
+        # Time-based
+        frames = list(read_frames_exact("video.mp4", start_time=1.5, end_time=3.0))
     """
-    if end_frame is not None:
-        assert end_frame >= start_frame >= 0, "invalid frame range"
-    else:
-        assert start_frame >= 0, "start_frame must be non-negative"
+    # Validate parameters early (before opening file)
+    has_frame_params, has_time_params = _validate_parameters(
+        start_frame, end_frame, start_time, end_time
+    )
+
+    # Early validation for frame-based parameters (before opening file)
+    if has_frame_params:
+        _normalize_frame_range(start_frame, end_frame)
 
     with _open_container(src) as container:
         stream = container.streams.video[0]
 
-        # Seek to approximate start position if not starting from beginning
-        if start_frame > 0:
-            fps = float(stream.average_rate) if stream.average_rate else 30.0
-            seek_time_sec = max(0, (start_frame - 30) / fps)
-            # Convert seconds to stream time_base units
-            seek_timestamp = int(seek_time_sec / float(stream.time_base))
-            container.seek(seek_timestamp, stream=stream)
+        # Get FPS - required for all operations
+        if not stream.average_rate:
+            msg = "Video has no FPS information"
+            raise ValueError(msg)
+        fps = float(stream.average_rate)
 
-        yield from _generate_frames(container, start_frame, end_frame)
+        # Convert parameters to frame indices
+        if has_time_params:
+            target_start, target_end = _convert_time_to_frames(start_time, end_time, fps)
+        else:
+            target_start, target_end = _normalize_frame_range(start_frame, end_frame)
+
+        # Seek to approximate position (if beneficial)
+        seek_position = _calculate_seek_position(target_start, fps, stream, container)
+
+        # Calculate how many frames to skip/yield from seek position
+        skip_count = target_start - seek_position
+        frame_count = (target_end - target_start + 1) if target_end is not None else None
+
+        yield from _generate_frames(container, skip_count, frame_count)
 
 
 def read_frames_from_stream(
@@ -90,6 +214,7 @@ def read_frames_from_stream(
     def frame_generator() -> Generator[np.ndarray, None, None]:
         """Generator that yields frames from the video data."""
         with _open_container(io.BytesIO(video_data)) as container:
-            yield from _generate_frames(container, start_frame=skip_frames)
+            # No seeking in stream mode - skip frames from start
+            yield from _generate_frames(container, skip_frames=skip_frames, max_frames=None)
 
     return meta, frame_generator()
