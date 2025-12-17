@@ -349,6 +349,24 @@ class TestReadFramesExact:
             diff = np.sum(np.abs(frames_by_time[0].astype(np.int16) - frames_by_time[-1].astype(np.int16)))
             assert diff > 0, "First and last frames are identical - video may not have motion"
 
+    def test_corrupted_video_metadata_readable(self):
+        """Test that metadata can be read from corrupted video (ffprobe passes)."""
+        corrupted_path = str(Path(__file__).parent / "assets" / "corrupted.mp4")
+
+        # Metadata should be readable even though video is corrupted
+        meta = video_metadata(corrupted_path)
+        assert meta.width == 256
+        assert meta.height == 256
+        assert meta.fps == 25.0
+
+    def test_corrupted_video_full_read_fails(self):
+        """Test that reading all frames from corrupted video raises RuntimeError."""
+        corrupted_path = str(Path(__file__).parent / "assets" / "corrupted.mp4")
+
+        # Reading all frames should fail when hitting corrupted data
+        with pytest.raises(RuntimeError, match="Failed to open video"):
+            list(read_frames_exact(corrupted_path, 0, None))
+
 
 class TestReadFramesFromStream:
     """Tests for streaming video input via read_frames_from_stream."""
