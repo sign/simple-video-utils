@@ -1,11 +1,10 @@
-import io
 from collections.abc import Generator
 from typing import BinaryIO
 
 import av
 import numpy as np
 
-from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_bytes
+from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
 
 def _generate_frames(
@@ -205,16 +204,17 @@ def read_frames_from_stream(
         The generator yields np.ndarray frames in RGB format (H, W, 3).
 
     Note:
-        PyAV handles format detection and seeking automatically.
-        Works with MP4, WebM, and other formats.
+        For streaming-friendly formats (WebM), frames are yielded as they're
+        decoded without waiting for the complete file. For formats requiring
+        seeking (MP4 with moov at end), the stream must be fully available.
     """
-    video_data = stream.read()
-    meta = video_metadata_from_bytes(video_data)
+    container = av.open(stream, mode='r')
+    meta = video_metadata_from_container(container)
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
-        """Generator that yields frames from the video data."""
-        with _open_container(io.BytesIO(video_data)) as container:
-            # No seeking in stream mode - skip frames from start
+        try:
             yield from _generate_frames(container, skip_frames=skip_frames, max_frames=None)
+        finally:
+            container.close()
 
     return meta, frame_generator()

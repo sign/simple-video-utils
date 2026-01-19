@@ -29,7 +29,7 @@ def _open_container(source: str | io.BytesIO):
             container.close()
 
 
-def _get_metadata_from_container(container: av.container.InputContainer) -> VideoMetadata:
+def video_metadata_from_container(container: av.container.InputContainer) -> VideoMetadata:
     """Extract metadata from an open PyAV container."""
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate else 0.0
@@ -50,11 +50,11 @@ def _get_metadata_from_container(container: av.container.InputContainer) -> Vide
 def video_metadata_from_bytes(data: bytes) -> VideoMetadata:
     """Return key video stream metadata from video bytes."""
     with _open_container(io.BytesIO(data)) as container:
-        return _get_metadata_from_container(container)
+        return video_metadata_from_container(container)
 
 
 @lru_cache(maxsize=8)
 def video_metadata(url_or_path: str) -> VideoMetadata:
     """Return key video stream metadata."""
     with _open_container(url_or_path) as container:
-        return _get_metadata_from_container(container)
+        return video_metadata_from_container(container)
