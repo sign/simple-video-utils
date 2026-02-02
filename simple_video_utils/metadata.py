@@ -1,7 +1,7 @@
 import io
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import NamedTuple
+from typing import NamedTuple, Optional, Union
 
 import av
 
@@ -10,12 +10,12 @@ class VideoMetadata(NamedTuple):
     width: int
     height: int
     fps: float
-    nb_frames: int | None
-    time_base: str | None
+    nb_frames: Optional[int]
+    time_base: Optional[str]
 
 
 @contextmanager
-def _open_container(source: str | io.BytesIO):
+def _open_container(source: Union[str, io.BytesIO]):
     """Context manager for safely opening and closing PyAV containers."""
     container = None
     try:

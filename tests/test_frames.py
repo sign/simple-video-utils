@@ -75,7 +75,7 @@ class TestReadFramesExact:
 
         assert len(range_frames) == len(individual_frames) == 3
 
-        for range_frame, individual_frame in zip(range_frames, individual_frames, strict=False):
+        for range_frame, individual_frame in zip(range_frames, individual_frames):
             np.testing.assert_array_equal(range_frame, individual_frame)
 
     def test_frames_are_different(self, video_path):
@@ -165,7 +165,7 @@ class TestReadFramesExact:
         assert len(frames1) == len(frames2)
 
         # Frames should be identical
-        for f1, f2 in zip(frames1, frames2, strict=False):
+        for f1, f2 in zip(frames1, frames2):
             np.testing.assert_array_equal(f1, f2)
 
     def test_end_frame_none_vs_explicit_end(self, video_path):
@@ -253,7 +253,7 @@ class TestReadFramesExact:
         assert len(frames_by_index) == len(frames_by_time)
 
         # Frames should be identical
-        for i, (frame_idx, frame_time) in enumerate(zip(frames_by_index, frames_by_time, strict=False)):
+        for i, (frame_idx, frame_time) in enumerate(zip(frames_by_index, frames_by_time)):
             np.testing.assert_array_equal(
                 frame_idx,
                 frame_time,
@@ -297,7 +297,7 @@ class TestReadFramesExact:
 
         # Should produce same result
         assert len(frames_no_params) == len(frames_explicit)
-        for f1, f2 in zip(frames_no_params, frames_explicit, strict=False):
+        for f1, f2 in zip(frames_no_params, frames_explicit):
             np.testing.assert_array_equal(f1, f2)
 
     def test_time_vs_frame_seeking_precision_remote(self):
@@ -336,7 +336,7 @@ class TestReadFramesExact:
         )
 
         # Every frame should be identical
-        for i, (frame_time, frame_idx) in enumerate(zip(frames_by_time, frames_by_frame, strict=False)):
+        for i, (frame_time, frame_idx) in enumerate(zip(frames_by_time, frames_by_frame)):
             actual_frame_num = start_frame_idx + i
             np.testing.assert_array_equal(
                 frame_time,
@@ -410,7 +410,7 @@ class TestReadFramesFromStream:
         assert len(stream_frames) == len(file_frames)
 
         # Frames should be identical
-        for i, (stream_frame, file_frame) in enumerate(zip(stream_frames, file_frames, strict=False)):
+        for i, (stream_frame, file_frame) in enumerate(zip(stream_frames, file_frames)):
             np.testing.assert_array_equal(
                 stream_frame,
                 file_frame,
@@ -430,7 +430,7 @@ class TestReadFramesFromStream:
 
         assert len(stream_frames) == len(file_frames)
 
-        for i, (stream_frame, file_frame) in enumerate(zip(stream_frames, file_frames, strict=False)):
+        for i, (stream_frame, file_frame) in enumerate(zip(stream_frames, file_frames)):
             np.testing.assert_array_equal(
                 stream_frame,
                 file_frame,

@@ -1,5 +1,4 @@
-from collections.abc import Generator
-from typing import BinaryIO
+from typing import BinaryIO, Generator, Optional, Tuple
 
 import av
 import numpy as np
@@ -10,7 +9,7 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 def _generate_frames(
     container: av.container.InputContainer,
     skip_frames: int = 0,
-    max_frames: int | None = None,
+    max_frames: Optional[int] = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Generate RGB frames from a container's current position.
@@ -42,11 +41,11 @@ def _generate_frames(
         frames_decoded += 1
 
 def _validate_parameters(
-    start_frame: int | None,
-    end_frame: int | None,
-    start_time: float | None,
-    end_time: float | None,
-) -> tuple[bool, bool]:
+    start_frame: Optional[int],
+    end_frame: Optional[int],
+    start_time: Optional[float],
+    end_time: Optional[float],
+) -> Tuple[bool, bool]:
     """Validate that time and frame parameters aren't mixed."""
     has_frame_params = start_frame is not None or end_frame is not None
     has_time_params = start_time is not None or end_time is not None
@@ -59,10 +58,10 @@ def _validate_parameters(
 
 
 def _convert_time_to_frames(
-    start_time: float | None,
-    end_time: float | None,
+    start_time: Optional[float],
+    end_time: Optional[float],
     fps: float,
-) -> tuple[int, int | None]:
+) -> Tuple[int, Optional[int]]:
     """Convert time-based parameters to frame indices."""
     start = int((start_time or 0.0) * fps)
     end = int(end_time * fps) if end_time is not None else None
@@ -75,9 +74,9 @@ def _convert_time_to_frames(
 
 
 def _normalize_frame_range(
-    start_frame: int | None,
-    end_frame: int | None,
-) -> tuple[int, int | None]:
+    start_frame: Optional[int],
+    end_frame: Optional[int],
+) -> Tuple[int, Optional[int]]:
     """Normalize frame parameters with defaults and validation."""
     start = start_frame if start_frame is not None else 0
 
@@ -123,10 +122,10 @@ def _calculate_seek_position(
 
 def read_frames_exact(
     src: str,
-    start_frame: int | None = None,
-    end_frame: int | None = None,
-    start_time: float | None = None,
-    end_time: float | None = None,
+    start_frame: Optional[int] = None,
+    end_frame: Optional[int] = None,
+    start_time: Optional[float] = None,
+    end_time: Optional[float] = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Return frames as RGB np.ndarrays from specified range.
@@ -191,7 +190,7 @@ def read_frames_exact(
 def read_frames_from_stream(
     stream: BinaryIO,
     skip_frames: int = 0,
-) -> tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
+) -> Tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
     """
     Read frames from a video stream (file-like object).
 
