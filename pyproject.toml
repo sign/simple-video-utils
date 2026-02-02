@@ -1,7 +1,7 @@
 [project]
 name = "simple-video-utils"
 description = "Shared utilities for processing videos for sign language."
-version = "0.0.1"
+version = "0.0.4"
 authors = [
     { name = "Amit Moryossef", email = "amit@sign.mt" },
 ]
