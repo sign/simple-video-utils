@@ -126,6 +126,7 @@ def read_frames_exact(
     end_frame: Optional[int] = None,
     start_time: Optional[float] = None,
     end_time: Optional[float] = None,
+    thread_type: str = "AUTO",
 ) -> Generator[np.ndarray, None, None]:
     """
     Return frames as RGB np.ndarrays from specified range.
@@ -139,6 +140,7 @@ def read_frames_exact(
         end_frame: Ending frame index (inclusive), or None for end of video.
         start_time: Starting time in seconds. Mutually exclusive with start_frame.
         end_time: Ending time in seconds, or None for end of video.
+        thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
 
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3).
@@ -164,6 +166,7 @@ def read_frames_exact(
 
     with _open_container(src) as container:
         stream = container.streams.video[0]
+        stream.thread_type = thread_type
 
         # Get FPS - required for all operations
         if not stream.average_rate:
@@ -190,6 +193,7 @@ def read_frames_exact(
 def read_frames_from_stream(
     stream: BinaryIO,
     skip_frames: int = 0,
+    thread_type: str = "AUTO",
 ) -> Tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
     """
     Read frames from a video stream (file-like object).
@@ -197,6 +201,7 @@ def read_frames_from_stream(
     Args:
         stream: A file-like object containing video data (e.g., uploaded file).
         skip_frames: Number of initial frames to skip (for resume support).
+        thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
 
     Returns:
         A tuple of (VideoMetadata, frame_generator).
@@ -208,6 +213,8 @@ def read_frames_from_stream(
         seeking (MP4 with moov at end), the stream must be fully available.
     """
     container = av.open(stream, mode='r')
+    for s in container.streams.video:
+        s.thread_type = thread_type
     meta = video_metadata_from_container(container)
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
