@@ -194,6 +194,7 @@ def read_frames_from_stream(
     stream: BinaryIO,
     skip_frames: int = 0,
     thread_type: str = "AUTO",
+    buffer_size: int = 32768, # PyAV default buffer size, can be reduced for lower latency when realtime streaming
 ) -> Tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
     """
     Read frames from a video stream (file-like object).
@@ -202,6 +203,9 @@ def read_frames_from_stream(
         stream: A file-like object containing video data (e.g., uploaded file).
         skip_frames: Number of initial frames to skip (for resume support).
         thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
+        buffer_size: Size of PyAV's internal read buffer in bytes. Smaller values
+            reduce latency when streaming (frames are decoded sooner), but increase
+            the number of read syscalls. Default is 32768 (PyAV default).
 
     Returns:
         A tuple of (VideoMetadata, frame_generator).
@@ -212,7 +216,7 @@ def read_frames_from_stream(
         decoded without waiting for the complete file. For formats requiring
         seeking (MP4 with moov at end), the stream must be fully available.
     """
-    container = av.open(stream, mode='r')
+    container = av.open(stream, mode='r', buffer_size=buffer_size)
     for s in container.streams.video:
         s.thread_type = thread_type
     meta = video_metadata_from_container(container)
