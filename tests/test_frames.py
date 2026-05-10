@@ -208,7 +208,7 @@ class TestReadFramesExact:
 
     def test_remote_video_url(self):
         """Test reading frames from a remote video URL."""
-        remote_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4"
+        remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
 
         # Test reading first frame
         frames = list(read_frames_exact(remote_url, 0, 0))
@@ -302,7 +302,7 @@ class TestReadFramesExact:
 
     def test_time_vs_frame_seeking_precision_remote(self):
         """Test that time and frame seeking produce identical frames on a longer remote video."""
-        remote_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4"
+        remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
 
         # Get video metadata to calculate frame indices
         meta = video_metadata(remote_url)
