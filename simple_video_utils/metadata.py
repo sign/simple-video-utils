@@ -36,10 +36,19 @@ def video_metadata_from_container(container: av.container.InputContainer) -> Vid
     fps = float(stream.average_rate) if stream.average_rate else 0.0
     nb_frames = stream.frames if stream.frames > 0 else None
     time_base = str(stream.time_base) if stream.time_base else None
-    # container.duration is in av.time_base units (microseconds), or None for
-    # live streams / raw bitstreams with no container-level duration. Reading
-    # this is a header lookup — no decoding.
-    duration = container.duration / av.time_base if container.duration else None
+    # Prefer the video stream's duration over container.duration. They usually
+    # match, but when audio outlasts video the container header reports the
+    # longer of the two — and downstream consumers (ffmpeg padding, model APIs
+    # that measure the video stream) only see the video stream. PyAV's
+    # `stream.duration` is in stream time_base units; some containers (notably
+    # browser-recorded webm) don't stamp it, so we fall back to
+    # container.duration (microseconds) in that case.
+    if stream.duration and stream.time_base:
+        duration = float(stream.duration * stream.time_base)
+    elif container.duration:
+        duration = container.duration / av.time_base
+    else:
+        duration = None
 
     return VideoMetadata(
         width=stream.width,
