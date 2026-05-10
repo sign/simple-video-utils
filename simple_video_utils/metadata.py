@@ -12,6 +12,7 @@ class VideoMetadata(NamedTuple):
     fps: float
     nb_frames: Optional[int]
     time_base: Optional[str]
+    duration: Optional[float]  # seconds; None if the container header doesn't carry one
 
 
 @contextmanager
@@ -35,6 +36,10 @@ def video_metadata_from_container(container: av.container.InputContainer) -> Vid
     fps = float(stream.average_rate) if stream.average_rate else 0.0
     nb_frames = stream.frames if stream.frames > 0 else None
     time_base = str(stream.time_base) if stream.time_base else None
+    # container.duration is in av.time_base units (microseconds), or None for
+    # live streams / raw bitstreams with no container-level duration. Reading
+    # this is a header lookup — no decoding.
+    duration = container.duration / av.time_base if container.duration else None
 
     return VideoMetadata(
         width=stream.width,
@@ -42,6 +47,7 @@ def video_metadata_from_container(container: av.container.InputContainer) -> Vid
         fps=fps,
         nb_frames=nb_frames,
         time_base=time_base,
+        duration=duration,
     )
 
 

@@ -25,9 +25,12 @@ class TestVideoMetadata:
         assert meta.width > 0
         assert meta.height > 0
         assert meta.fps > 0
+        assert meta.duration is not None
+        assert meta.duration > 0
         assert isinstance(meta.width, int)
         assert isinstance(meta.height, int)
         assert isinstance(meta.fps, float)
+        assert isinstance(meta.duration, float)
 
     def test_video_metadata_from_bytes(self, video_bytes):
         """Test metadata extraction from video bytes."""
@@ -36,6 +39,8 @@ class TestVideoMetadata:
         assert meta.width > 0
         assert meta.height > 0
         assert meta.fps > 0
+        assert meta.duration is not None
+        assert meta.duration > 0
         assert isinstance(meta.width, int)
         assert isinstance(meta.height, int)
         assert isinstance(meta.fps, float)
@@ -48,6 +53,7 @@ class TestVideoMetadata:
         assert meta_bytes.width == meta_file.width
         assert meta_bytes.height == meta_file.height
         assert meta_bytes.fps == meta_file.fps
+        assert meta_bytes.duration == meta_file.duration
 
     def test_bad_color_space_video(self):
         """Test metadata extraction from a video with unusual color space."""
@@ -66,6 +72,10 @@ class TestVideoMetadata:
         assert meta.width > 0
         assert meta.height > 0
         assert meta.fps > 0
+        # webm without nb_frames in the header — common for browser
+        # MediaRecorder output. duration must still be recoverable.
+        assert meta.duration is not None
+        assert meta.duration > 0
 
     def test_remote_video_url(self):
         """Test metadata extraction from a remote video URL."""
