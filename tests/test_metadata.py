@@ -79,12 +79,14 @@ class TestVideoMetadata:
 
     def test_remote_video_url(self):
         """Test metadata extraction from a remote video URL."""
-        remote_url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerMeltdowns.mp4"
+        remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
 
         meta = video_metadata(remote_url)
         assert meta.width > 0
         assert meta.height > 0
         assert meta.fps > 0
+        assert meta.duration is not None
+        assert meta.duration > 0
 
 
 if __name__ == "__main__":
