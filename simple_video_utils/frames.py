@@ -1,4 +1,5 @@
-from typing import BinaryIO, Generator, Optional, Tuple
+from collections.abc import Generator
+from typing import BinaryIO, Optional
 
 import av
 import numpy as np
@@ -64,7 +65,7 @@ def _validate_parameters(
     end_frame: Optional[int],
     start_time: Optional[float],
     end_time: Optional[float],
-) -> Tuple[bool, bool]:
+) -> tuple[bool, bool]:
     """Validate that time and frame parameters aren't mixed."""
     has_frame_params = start_frame is not None or end_frame is not None
     has_time_params = start_time is not None or end_time is not None
@@ -80,7 +81,7 @@ def _convert_time_to_frames(
     start_time: Optional[float],
     end_time: Optional[float],
     fps: float,
-) -> Tuple[int, Optional[int]]:
+) -> tuple[int, Optional[int]]:
     """Convert time-based parameters to frame indices."""
     start = int((start_time or 0.0) * fps)
     end = int(end_time * fps) if end_time is not None else None
@@ -95,7 +96,7 @@ def _convert_time_to_frames(
 def _normalize_frame_range(
     start_frame: Optional[int],
     end_frame: Optional[int],
-) -> Tuple[int, Optional[int]]:
+) -> tuple[int, Optional[int]]:
     """Normalize frame parameters with defaults and validation."""
     start = start_frame if start_frame is not None else 0
 
@@ -214,7 +215,7 @@ def read_frames_from_stream(
     skip_frames: int = 0,
     thread_type: str = "AUTO",
     buffer_size: int = 32768, # PyAV default buffer size, can be reduced for lower latency when realtime streaming
-) -> Tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
+) -> tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
     """
     Read frames from a video stream (file-like object).
 

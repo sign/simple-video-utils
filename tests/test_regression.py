@@ -2,9 +2,10 @@
 
 import json
 import subprocess
+from collections.abc import Generator
 from functools import lru_cache
 from pathlib import Path
-from typing import Generator, NamedTuple, Optional
+from typing import NamedTuple, Optional
 
 import numpy as np
 import pytest
