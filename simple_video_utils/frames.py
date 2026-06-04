@@ -6,6 +6,23 @@ import numpy as np
 from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
 
+def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
+    """
+    Convert a frame to an RGB array in display orientation.
+
+    PyAV decodes frames in their stored orientation and does not apply the
+    container's display-matrix rotation (unlike the ffmpeg CLI, which
+    autorotates). Phone-recorded videos commonly store landscape frames with
+    a 90° rotation tag, so we apply it here.
+    """
+    array = frame.to_ndarray(format='rgb24')
+    rotation = frame.rotation % 360
+    if rotation and rotation % 90 == 0:
+        # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly
+        array = np.rot90(array, k=rotation // 90)
+    return array
+
+
 def _generate_frames(
     container: av.container.InputContainer,
     skip_frames: int = 0,
@@ -23,7 +40,7 @@ def _generate_frames(
         max_frames: Maximum number of frames to yield, or None for all remaining.
 
     Yields:
-        RGB numpy arrays (H, W, 3) for frames after skipping.
+        RGB numpy arrays (H, W, 3) in display orientation for frames after skipping.
     """
     frames_decoded = 0
     frames_yielded = 0
@@ -33,7 +50,7 @@ def _generate_frames(
             frames_decoded += 1
             continue
 
-        yield frame.to_ndarray(format='rgb24')
+        yield _frame_to_rgb(frame)
         frames_yielded += 1
 
         if max_frames is not None and frames_yielded >= max_frames:
@@ -219,11 +236,23 @@ def read_frames_from_stream(
     container = av.open(stream, mode='r', buffer_size=buffer_size)
     for s in container.streams.video:
         s.thread_type = thread_type
-    meta = video_metadata_from_container(container)
+
+    # The display-matrix rotation is only exposed per-frame, and the stream may
+    # not be seekable (e.g. a pipe) — so decode the first frame eagerly for the
+    # metadata and hand it back through the generator.
+    first_frame = next(container.decode(video=0), None)
+    rotation = first_frame.rotation if first_frame is not None else 0
+    meta = video_metadata_from_container(container, rotation=rotation)
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
-            yield from _generate_frames(container, skip_frames=skip_frames, max_frames=None)
+            remaining_skip = skip_frames
+            if first_frame is not None:
+                if remaining_skip == 0:
+                    yield _frame_to_rgb(first_frame)
+                else:
+                    remaining_skip -= 1
+            yield from _generate_frames(container, skip_frames=remaining_skip, max_frames=None)
         finally:
             container.close()
 
