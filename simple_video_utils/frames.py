@@ -1,4 +1,5 @@
-from typing import BinaryIO, Generator, Optional, Tuple
+from collections.abc import Generator
+from typing import BinaryIO
 
 import av
 import numpy as np
@@ -6,10 +7,29 @@ import numpy as np
 from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
 
+def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
+    """
+    Convert a frame to an RGB array in display orientation.
+
+    PyAV decodes frames in their stored orientation and does not apply the
+    container's display-matrix rotation (unlike the ffmpeg CLI, which
+    autorotates). Phone-recorded videos commonly store landscape frames with
+    a 90° rotation tag, so we apply it here.
+    """
+    array = frame.to_ndarray(format='rgb24')
+    rotation = frame.rotation % 360
+    if rotation and rotation % 90 == 0:
+        # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
+        # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
+        # and OpenCV reject — copy to a contiguous array.
+        array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
+    return array
+
+
 def _generate_frames(
     container: av.container.InputContainer,
     skip_frames: int = 0,
-    max_frames: Optional[int] = None,
+    max_frames: int | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Generate RGB frames from a container's current position.
@@ -23,7 +43,7 @@ def _generate_frames(
         max_frames: Maximum number of frames to yield, or None for all remaining.
 
     Yields:
-        RGB numpy arrays (H, W, 3) for frames after skipping.
+        RGB numpy arrays (H, W, 3) in display orientation for frames after skipping.
     """
     frames_decoded = 0
     frames_yielded = 0
@@ -33,7 +53,7 @@ def _generate_frames(
             frames_decoded += 1
             continue
 
-        yield frame.to_ndarray(format='rgb24')
+        yield _frame_to_rgb(frame)
         frames_yielded += 1
 
         if max_frames is not None and frames_yielded >= max_frames:
@@ -41,11 +61,11 @@ def _generate_frames(
         frames_decoded += 1
 
 def _validate_parameters(
-    start_frame: Optional[int],
-    end_frame: Optional[int],
-    start_time: Optional[float],
-    end_time: Optional[float],
-) -> Tuple[bool, bool]:
+    start_frame: int | None,
+    end_frame: int | None,
+    start_time: float | None,
+    end_time: float | None,
+) -> tuple[bool, bool]:
     """Validate that time and frame parameters aren't mixed."""
     has_frame_params = start_frame is not None or end_frame is not None
     has_time_params = start_time is not None or end_time is not None
@@ -58,10 +78,10 @@ def _validate_parameters(
 
 
 def _convert_time_to_frames(
-    start_time: Optional[float],
-    end_time: Optional[float],
+    start_time: float | None,
+    end_time: float | None,
     fps: float,
-) -> Tuple[int, Optional[int]]:
+) -> tuple[int, int | None]:
     """Convert time-based parameters to frame indices."""
     start = int((start_time or 0.0) * fps)
     end = int(end_time * fps) if end_time is not None else None
@@ -74,9 +94,9 @@ def _convert_time_to_frames(
 
 
 def _normalize_frame_range(
-    start_frame: Optional[int],
-    end_frame: Optional[int],
-) -> Tuple[int, Optional[int]]:
+    start_frame: int | None,
+    end_frame: int | None,
+) -> tuple[int, int | None]:
     """Normalize frame parameters with defaults and validation."""
     start = start_frame if start_frame is not None else 0
 
@@ -122,10 +142,10 @@ def _calculate_seek_position(
 
 def read_frames_exact(
     src: str,
-    start_frame: Optional[int] = None,
-    end_frame: Optional[int] = None,
-    start_time: Optional[float] = None,
-    end_time: Optional[float] = None,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
     thread_type: str = "AUTO",
 ) -> Generator[np.ndarray, None, None]:
     """
@@ -195,7 +215,7 @@ def read_frames_from_stream(
     skip_frames: int = 0,
     thread_type: str = "AUTO",
     buffer_size: int = 32768, # PyAV default buffer size, can be reduced for lower latency when realtime streaming
-) -> Tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
+) -> tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
     """
     Read frames from a video stream (file-like object).
 
@@ -217,13 +237,29 @@ def read_frames_from_stream(
         seeking (MP4 with moov at end), the stream must be fully available.
     """
     container = av.open(stream, mode='r', buffer_size=buffer_size)
-    for s in container.streams.video:
-        s.thread_type = thread_type
-    meta = video_metadata_from_container(container)
+    try:
+        for s in container.streams.video:
+            s.thread_type = thread_type
+
+        # The display-matrix rotation is only exposed per-frame, and the stream may
+        # not be seekable (e.g. a pipe) — so decode the first frame eagerly for the
+        # metadata and hand it back through the generator.
+        first_frame = next(container.decode(video=0), None)
+        rotation = first_frame.rotation if first_frame is not None else 0
+        meta = video_metadata_from_container(container, rotation=rotation)
+    except Exception:
+        container.close()
+        raise
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
-            yield from _generate_frames(container, skip_frames=skip_frames, max_frames=None)
+            remaining_skip = skip_frames
+            if first_frame is not None:
+                if remaining_skip == 0:
+                    yield _frame_to_rgb(first_frame)
+                else:
+                    remaining_skip -= 1
+            yield from _generate_frames(container, skip_frames=remaining_skip, max_frames=None)
         finally:
             container.close()
 

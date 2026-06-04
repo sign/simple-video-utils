@@ -1,7 +1,7 @@
 import io
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import NamedTuple, Optional, Union
+from typing import NamedTuple
 
 import av
 
@@ -10,13 +10,14 @@ class VideoMetadata(NamedTuple):
     width: int
     height: int
     fps: float
-    nb_frames: Optional[int]
-    time_base: Optional[str]
-    duration: Optional[float]  # seconds; None if the container header doesn't carry one
+    nb_frames: int | None
+    time_base: str | None
+    duration: float | None  # seconds; None if the container header doesn't carry one
+    rotation: int = 0  # display-matrix rotation in degrees; width/height already account for it
 
 
 @contextmanager
-def _open_container(source: Union[str, io.BytesIO]):
+def _open_container(source: str | io.BytesIO):
     """Context manager for safely opening and closing PyAV containers."""
     container = None
     try:
@@ -30,8 +31,39 @@ def _open_container(source: Union[str, io.BytesIO]):
             container.close()
 
 
-def video_metadata_from_container(container: av.container.InputContainer) -> VideoMetadata:
-    """Extract metadata from an open PyAV container."""
+def _probe_rotation(container: av.container.InputContainer) -> int:
+    """
+    Read the display-matrix rotation by decoding the first frame, then rewind.
+
+    PyAV only exposes the rotation per-frame (``VideoFrame.rotation``), not on
+    the stream. Requires a seekable container; returns 0 if the video can't be
+    decoded.
+    """
+    try:
+        frame = next(container.decode(video=0), None)
+        rotation = frame.rotation if frame is not None else 0
+    except (av.FFmpegError, OSError):
+        rotation = 0
+    container.seek(0)
+    return rotation
+
+
+def video_metadata_from_container(
+    container: av.container.InputContainer,
+    rotation: int | None = None,
+) -> VideoMetadata:
+    """
+    Extract metadata from an open PyAV container.
+
+    Width/height are reported in display orientation (rotation applied),
+    matching the frames yielded by the frames module.
+
+    Args:
+        container: Open PyAV container.
+        rotation: Display rotation in degrees if already known (e.g. from a
+            decoded frame). When None, it is probed by decoding the first
+            frame and rewinding — pass it explicitly for non-seekable input.
+    """
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate else 0.0
     nb_frames = stream.frames if stream.frames > 0 else None
@@ -50,13 +82,22 @@ def video_metadata_from_container(container: av.container.InputContainer) -> Vid
     else:
         duration = None
 
+    if rotation is None:
+        rotation = _probe_rotation(container)
+    rotation %= 360
+
+    width, height = stream.width, stream.height
+    if rotation % 180 == 90:
+        width, height = height, width
+
     return VideoMetadata(
-        width=stream.width,
-        height=stream.height,
+        width=width,
+        height=height,
         fps=fps,
         nb_frames=nb_frames,
         time_base=time_base,
         duration=duration,
+        rotation=rotation,
     )
 
 

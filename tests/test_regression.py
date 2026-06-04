@@ -2,9 +2,10 @@
 
 import json
 import subprocess
+from collections.abc import Generator
 from functools import lru_cache
 from pathlib import Path
-from typing import Generator, NamedTuple, Optional
+from typing import NamedTuple
 
 import numpy as np
 import pytest
@@ -17,8 +18,8 @@ class VideoMetadata(NamedTuple):
     width: int
     height: int
     fps: float
-    nb_frames: Optional[int]
-    time_base: Optional[str]
+    nb_frames: int | None
+    time_base: str | None
 
 
 @lru_cache(maxsize=8)
@@ -53,7 +54,7 @@ def ffprobe(url_or_path: str) -> VideoMetadata:
 def ffmpeg_read_frames_exact(  # noqa: C901
     src: str,
     start_frame: int,
-    end_frame: Optional[int] = None,
+    end_frame: int | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Return frames [start_frame, end_frame] inclusive as RGB np.ndarrays using ffmpeg.
@@ -194,7 +195,7 @@ class TestRegressionAgainstFFmpeg:
         )
 
         # Every frame should be identical (pixel-perfect)
-        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames)):
+        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames, strict=False)):
             np.testing.assert_array_equal(
                 pyav_frame,
                 ffmpeg_frame,
@@ -265,7 +266,7 @@ class TestRegressionAgainstFFmpeg:
         )
 
         # Every frame should be identical
-        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames)):
+        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames, strict=False)):
             actual_frame_num = start_frame + i
             np.testing.assert_array_equal(
                 pyav_frame,
