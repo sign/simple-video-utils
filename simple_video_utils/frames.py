@@ -237,15 +237,19 @@ def read_frames_from_stream(
         seeking (MP4 with moov at end), the stream must be fully available.
     """
     container = av.open(stream, mode='r', buffer_size=buffer_size)
-    for s in container.streams.video:
-        s.thread_type = thread_type
+    try:
+        for s in container.streams.video:
+            s.thread_type = thread_type
 
-    # The display-matrix rotation is only exposed per-frame, and the stream may
-    # not be seekable (e.g. a pipe) — so decode the first frame eagerly for the
-    # metadata and hand it back through the generator.
-    first_frame = next(container.decode(video=0), None)
-    rotation = first_frame.rotation if first_frame is not None else 0
-    meta = video_metadata_from_container(container, rotation=rotation)
+        # The display-matrix rotation is only exposed per-frame, and the stream may
+        # not be seekable (e.g. a pipe) — so decode the first frame eagerly for the
+        # metadata and hand it back through the generator.
+        first_frame = next(container.decode(video=0), None)
+        rotation = first_frame.rotation if first_frame is not None else 0
+        meta = video_metadata_from_container(container, rotation=rotation)
+    except Exception:
+        container.close()
+        raise
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
