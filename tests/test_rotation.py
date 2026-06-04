@@ -6,7 +6,9 @@ orientation and metadata reports display dimensions, matching the ffmpeg
 CLI's autorotate behavior.
 """
 
+import os
 import subprocess
+import threading
 from io import BytesIO
 from pathlib import Path
 
@@ -110,6 +112,29 @@ class TestRotatedVideo:
         _, frames = read_frames_from_stream(BytesIO(video_bytes), skip_frames=2)
 
         assert_frames_close(next(frames), ref[2], "Skipped-to frame differs from ffmpeg")
+
+    def test_stream_reading_from_non_seekable_pipe(self, video_bytes):
+        """Rotation must work on a truly non-seekable stream (BytesIO can seek; a pipe cannot)."""
+        read_fd, write_fd = os.pipe()
+        read_file = os.fdopen(read_fd, "rb")
+        write_file = os.fdopen(write_fd, "wb")
+
+        def writer():
+            write_file.write(video_bytes)
+            write_file.close()
+
+        thread = threading.Thread(target=writer)
+        thread.start()
+        try:
+            meta, frames = read_frames_from_stream(read_file)
+            frame_list = list(frames)
+        finally:
+            thread.join()
+            read_file.close()
+
+        assert (meta.width, meta.height, meta.rotation) == (360, 640, 90)
+        assert len(frame_list) == 30
+        assert all(frame.shape == (640, 360, 3) for frame in frame_list)
 
 
 if __name__ == "__main__":
