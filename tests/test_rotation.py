@@ -84,6 +84,8 @@ class TestRotatedVideo:
 
         assert len(frames) == 5
         assert all(frame.shape == (640, 360, 3) for frame in frames)
+        # np.rot90 alone yields a non-contiguous view, which MediaPipe/OpenCV reject
+        assert all(frame.flags["C_CONTIGUOUS"] for frame in frames)
 
     def test_frames_match_ffmpeg_autorotate(self, video_path):
         """Rotating the wrong way yields the same shape — compare pixels against ffmpeg."""

@@ -18,8 +18,10 @@ def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
     array = frame.to_ndarray(format='rgb24')
     rotation = frame.rotation % 360
     if rotation and rotation % 90 == 0:
-        # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly
-        array = np.rot90(array, k=rotation // 90)
+        # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
+        # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
+        # and OpenCV reject — copy to a contiguous array.
+        array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
     return array
 
 
