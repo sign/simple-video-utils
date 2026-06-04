@@ -1,5 +1,5 @@
 from collections.abc import Generator
-from typing import BinaryIO, Optional
+from typing import BinaryIO
 
 import av
 import numpy as np
@@ -29,7 +29,7 @@ def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
 def _generate_frames(
     container: av.container.InputContainer,
     skip_frames: int = 0,
-    max_frames: Optional[int] = None,
+    max_frames: int | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Generate RGB frames from a container's current position.
@@ -61,10 +61,10 @@ def _generate_frames(
         frames_decoded += 1
 
 def _validate_parameters(
-    start_frame: Optional[int],
-    end_frame: Optional[int],
-    start_time: Optional[float],
-    end_time: Optional[float],
+    start_frame: int | None,
+    end_frame: int | None,
+    start_time: float | None,
+    end_time: float | None,
 ) -> tuple[bool, bool]:
     """Validate that time and frame parameters aren't mixed."""
     has_frame_params = start_frame is not None or end_frame is not None
@@ -78,10 +78,10 @@ def _validate_parameters(
 
 
 def _convert_time_to_frames(
-    start_time: Optional[float],
-    end_time: Optional[float],
+    start_time: float | None,
+    end_time: float | None,
     fps: float,
-) -> tuple[int, Optional[int]]:
+) -> tuple[int, int | None]:
     """Convert time-based parameters to frame indices."""
     start = int((start_time or 0.0) * fps)
     end = int(end_time * fps) if end_time is not None else None
@@ -94,9 +94,9 @@ def _convert_time_to_frames(
 
 
 def _normalize_frame_range(
-    start_frame: Optional[int],
-    end_frame: Optional[int],
-) -> tuple[int, Optional[int]]:
+    start_frame: int | None,
+    end_frame: int | None,
+) -> tuple[int, int | None]:
     """Normalize frame parameters with defaults and validation."""
     start = start_frame if start_frame is not None else 0
 
@@ -142,10 +142,10 @@ def _calculate_seek_position(
 
 def read_frames_exact(
     src: str,
-    start_frame: Optional[int] = None,
-    end_frame: Optional[int] = None,
-    start_time: Optional[float] = None,
-    end_time: Optional[float] = None,
+    start_frame: int | None = None,
+    end_frame: int | None = None,
+    start_time: float | None = None,
+    end_time: float | None = None,
     thread_type: str = "AUTO",
 ) -> Generator[np.ndarray, None, None]:
     """

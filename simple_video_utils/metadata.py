@@ -1,7 +1,7 @@
 import io
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import NamedTuple, Optional, Union
+from typing import NamedTuple
 
 import av
 
@@ -10,14 +10,14 @@ class VideoMetadata(NamedTuple):
     width: int
     height: int
     fps: float
-    nb_frames: Optional[int]
-    time_base: Optional[str]
-    duration: Optional[float]  # seconds; None if the container header doesn't carry one
+    nb_frames: int | None
+    time_base: str | None
+    duration: float | None  # seconds; None if the container header doesn't carry one
     rotation: int = 0  # display-matrix rotation in degrees; width/height already account for it
 
 
 @contextmanager
-def _open_container(source: Union[str, io.BytesIO]):
+def _open_container(source: str | io.BytesIO):
     """Context manager for safely opening and closing PyAV containers."""
     container = None
     try:
@@ -50,7 +50,7 @@ def _probe_rotation(container: av.container.InputContainer) -> int:
 
 def video_metadata_from_container(
     container: av.container.InputContainer,
-    rotation: Optional[int] = None,
+    rotation: int | None = None,
 ) -> VideoMetadata:
     """
     Extract metadata from an open PyAV container.
