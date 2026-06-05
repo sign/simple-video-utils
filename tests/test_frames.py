@@ -367,6 +367,13 @@ class TestReadFramesExact:
         assert len(frames) == 59
         assert frames[0].shape == (360, 640, 3)
 
+    def test_empty_video_raises(self):
+        """A zero-frame video opens with no video stream, so frame reading must raise."""
+        empty = str(Path(__file__).parent / "assets" / "empty.mp4")
+
+        with pytest.raises(RuntimeError, match="Failed to open video"):
+            list(read_frames_exact(empty))
+
     def test_corrupted_video_full_read_fails(self):
         """Test that reading all frames from corrupted video raises RuntimeError."""
         corrupted_path = str(Path(__file__).parent / "assets" / "corrupted.mp4")

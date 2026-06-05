@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.metadata import video_metadata, video_metadata_from_bytes
 
 
@@ -77,6 +78,15 @@ class TestVideoMetadata:
         assert meta.duration is not None
         assert meta.duration > 0
 
+    @pytest.mark.parametrize("filename", ["no_nb_frames.mkv", "no_nb_frames.webm"])
+    def test_nb_frames_exact_when_header_missing(self, filename):
+        """Matroska/WebM without nb_frames in the header: counted exactly by demuxing."""
+        video = str(Path(__file__).parent / "assets" / filename)
+
+        meta = video_metadata(video)
+        decoded_frames = list(read_frames_exact(video))
+        assert meta.nb_frames == len(decoded_frames)
+
     def test_invalid_utf8_metadata_video(self):
         """Test a video whose stray data streams carry non-UTF-8 handler_name metadata."""
         video = str(Path(__file__).parent / "assets" / "invalid_utf8_metadata.mp4")
@@ -87,6 +97,17 @@ class TestVideoMetadata:
         assert abs(meta.fps - 29.97) < 0.01
         assert meta.duration is not None
         assert meta.duration > 0
+
+    def test_empty_video_raises(self):
+        """
+        A zero-frame video (created with `ffmpeg -f lavfi -i color -frames:v 0`):
+        the mov demuxer drops the sample-less track, so the container opens with
+        no video stream and metadata extraction must raise.
+        """
+        empty = str(Path(__file__).parent / "assets" / "empty.mp4")
+
+        with pytest.raises(RuntimeError, match="Failed to open video"):
+            video_metadata(empty)
 
     def test_remote_video_url(self):
         """Test metadata extraction from a remote video URL."""

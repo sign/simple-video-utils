@@ -10,7 +10,7 @@ class VideoMetadata(NamedTuple):
     width: int
     height: int
     fps: float
-    nb_frames: int | None
+    nb_frames: int | None  # from the header or counted by demuxing; estimated for non-seekable input
     time_base: str | None
     duration: float | None  # seconds; None if the container header doesn't carry one
     rotation: int = 0  # display-matrix rotation in degrees; width/height already account for it
@@ -32,6 +32,21 @@ def _open_container(source: str | io.BytesIO):
     finally:
         if container:
             container.close()
+
+
+def _count_video_packets(container: av.container.InputContainer) -> int | None:
+    """
+    Count video frames exactly by demuxing packets (no decoding), then rewind.
+
+    Video codecs carry one frame per packet, so the packet count is the frame
+    count. Requires a seekable container; returns None if demuxing fails.
+    """
+    try:
+        return sum(1 for packet in container.demux(video=0) if packet.size)
+    except (av.FFmpegError, OSError):
+        return None
+    finally:
+        container.seek(0)
 
 
 def _probe_rotation(container: av.container.InputContainer) -> int:
@@ -69,7 +84,6 @@ def video_metadata_from_container(
     """
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate else 0.0
-    nb_frames = stream.frames if stream.frames > 0 else None
     time_base = str(stream.time_base) if stream.time_base else None
     # Prefer the video stream's duration over container.duration. They usually
     # match, but when audio outlasts video the container header reports the
@@ -84,6 +98,18 @@ def video_metadata_from_container(
         duration = container.duration / av.time_base
     else:
         duration = None
+
+    if stream.frames > 0:
+        nb_frames = stream.frames
+    else:
+        # Matroska/WebM headers often omit the frame count. When the container
+        # is seekable (rotation is None — same contract as rotation probing),
+        # demux the packets for an exact count. Otherwise estimate; the
+        # container duration can overshoot the video stream, so the estimate
+        # may run a frame high.
+        nb_frames = _count_video_packets(container) if rotation is None else None
+        if nb_frames is None and fps and duration:
+            nb_frames = round(duration * fps)
 
     if rotation is None:
         rotation = _probe_rotation(container)
