@@ -236,7 +236,8 @@ def read_frames_from_stream(
         decoded without waiting for the complete file. For formats requiring
         seeking (MP4 with moov at end), the stream must be fully available.
     """
-    container = av.open(stream, mode='r', buffer_size=buffer_size)
+    # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
+    container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
     try:
         for s in container.streams.video:
             s.thread_type = thread_type

@@ -21,7 +21,10 @@ def _open_container(source: str | io.BytesIO):
     """Context manager for safely opening and closing PyAV containers."""
     container = None
     try:
-        container = av.open(source)
+        # metadata_errors='replace': some files carry non-UTF-8 stream metadata
+        # (e.g. handler_name in stray mp4s data tracks), which would otherwise
+        # raise UnicodeDecodeError before the video stream is even reachable.
+        container = av.open(source, metadata_errors="replace")
         yield container
     except Exception as e:
         msg = "Failed to open video"

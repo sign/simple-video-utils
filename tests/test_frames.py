@@ -359,6 +359,14 @@ class TestReadFramesExact:
         assert meta.height == 256
         assert meta.fps == 25.0
 
+    def test_invalid_utf8_metadata_video_decodes(self):
+        """Test that all frames decode from a video with non-UTF-8 stream metadata."""
+        video = str(Path(__file__).parent / "assets" / "invalid_utf8_metadata.mp4")
+
+        frames = list(read_frames_exact(video))
+        assert len(frames) == 59
+        assert frames[0].shape == (360, 640, 3)
+
     def test_corrupted_video_full_read_fails(self):
         """Test that reading all frames from corrupted video raises RuntimeError."""
         corrupted_path = str(Path(__file__).parent / "assets" / "corrupted.mp4")

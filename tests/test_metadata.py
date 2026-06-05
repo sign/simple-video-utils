@@ -77,6 +77,17 @@ class TestVideoMetadata:
         assert meta.duration is not None
         assert meta.duration > 0
 
+    def test_invalid_utf8_metadata_video(self):
+        """Test a video whose stray data streams carry non-UTF-8 handler_name metadata."""
+        video = str(Path(__file__).parent / "assets" / "invalid_utf8_metadata.mp4")
+
+        meta = video_metadata(video)
+        assert meta.width == 640
+        assert meta.height == 360
+        assert abs(meta.fps - 29.97) < 0.01
+        assert meta.duration is not None
+        assert meta.duration > 0
+
     def test_remote_video_url(self):
         """Test metadata extraction from a remote video URL."""
         remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
