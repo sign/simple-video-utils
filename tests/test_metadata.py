@@ -2,8 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from simple_video_utils.frames import read_frames_exact
-from simple_video_utils.metadata import video_metadata, video_metadata_from_bytes
+from simple_video_utils.metadata import count_frames, video_metadata, video_metadata_from_bytes
 
 
 class TestVideoMetadata:
@@ -78,14 +77,20 @@ class TestVideoMetadata:
         assert meta.duration is not None
         assert meta.duration > 0
 
-    @pytest.mark.parametrize("filename", ["no_nb_frames.mkv", "no_nb_frames.webm"])
-    def test_nb_frames_exact_when_header_missing(self, filename):
-        """Matroska/WebM without nb_frames in the header: counted exactly by demuxing."""
+    @pytest.mark.parametrize(
+        "filename",
+        [
+            "no_nb_frames.mkv",  # Matroska without nb_frames in the header
+            "no_nb_frames.webm",  # WebM without nb_frames in the header
+            "buggy_mov_header.mov",  # header declares more frames than actually decode
+        ],
+    )
+    def test_nb_frames_matches_decoded_frames(self, filename):
+        """nb_frames must match the true decoded count even when the header is absent or lies."""
         video = str(Path(__file__).parent / "assets" / filename)
 
         meta = video_metadata(video)
-        decoded_frames = list(read_frames_exact(video))
-        assert meta.nb_frames == len(decoded_frames)
+        assert meta.nb_frames == count_frames(video)
 
     def test_invalid_utf8_metadata_video(self):
         """Test a video whose stray data streams carry non-UTF-8 handler_name metadata."""
