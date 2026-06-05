@@ -181,7 +181,11 @@ def count_frames(source: str | io.BytesIO) -> int:
     regardless of what the container header claims.
     """
     with _open_container(source) as container:
-        return sum(1 for _ in container.decode(video=0))
+        count = _count_decoded_frames(container)
+        if count is None:
+            msg = "Failed to decode video"
+            raise RuntimeError(msg)
+        return count
 
 
 def video_metadata_from_bytes(data: bytes) -> VideoMetadata:
