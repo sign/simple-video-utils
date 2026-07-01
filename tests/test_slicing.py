@@ -55,14 +55,10 @@ def test_matching_size_is_copied(tmp_path):
     assert _dims(clip) == (128, 128)
 
 
-def test_out_of_range_slice_is_empty_bytes(video):
-    # Source is 1s; a slice past the end has no frames in either path.
-    assert list(slice_video(video, [(5.0, 5.5)])) == [b""]
-    assert list(slice_video(video, [(5.0, 5.5)], size=256)) == [b""]
-
-
-def test_invalid_range_raises(video):
-    with pytest.raises(ValueError, match="before start"):
-        slice_video(video, [(0.5, 0.2)])
-    with pytest.raises(ValueError, match="before start"):
-        slice_video(video, [(0.5, 0.2)], size=256)
+def test_out_of_range_slice_raises(video):
+    # Source is 1s; slices past the end, before 0, or reversed are errors.
+    for bad in [(5.0, 5.5), (-0.1, 0.3), (0.5, 0.2)]:
+        with pytest.raises(ValueError, match="out of range"):
+            list(slice_video(video, [bad]))
+        with pytest.raises(ValueError, match="out of range"):
+            list(slice_video(video, [bad], size=256))
