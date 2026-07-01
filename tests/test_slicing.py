@@ -62,3 +62,11 @@ def test_out_of_range_slice_raises(video):
             list(slice_video(video, [bad]))
         with pytest.raises(ValueError, match="out of range"):
             list(slice_video(video, [bad], size=256))
+
+
+def test_zero_length_slice_raises(video):
+    # A clip needs positive duration; start == end is out of range in both paths.
+    with pytest.raises(ValueError, match="out of range"):
+        list(slice_video(video, [(0.5, 0.5)]))
+    with pytest.raises(ValueError, match="out of range"):
+        list(slice_video(video, [(0.5, 0.5)], size=256))
