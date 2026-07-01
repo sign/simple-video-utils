@@ -35,6 +35,7 @@ def test_slice_returns_one_clip_per_range(video):
 
 
 def test_slice_keeps_source_size_by_default(video):
+    # Default path stream-copies, so the source resolution is preserved.
     [clip] = slice_video(video, [(0.0, 0.3)])
     assert _dims(clip) == (320, 240)
 
@@ -42,3 +43,9 @@ def test_slice_keeps_source_size_by_default(video):
 def test_slice_center_crops_and_resizes(video):
     [clip] = slice_video(video, [(0.0, 0.3)], size=256)
     assert _dims(clip) == (256, 256)
+
+
+def test_out_of_range_slice_is_empty_bytes(video):
+    # Source is 1s; a slice past the end has no frames in either path.
+    assert slice_video(video, [(5.0, 5.5)]) == [b""]
+    assert slice_video(video, [(5.0, 5.5)], size=256) == [b""]
