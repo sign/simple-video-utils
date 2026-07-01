@@ -7,14 +7,14 @@ center-cropped to a square, resized, and re-encoded.
 """
 
 import io
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from fractions import Fraction
 
 import av
 import numpy as np
 
 from simple_video_utils.frames import read_frames_exact
-from simple_video_utils.metadata import video_metadata
+from simple_video_utils.metadata import _open_container, video_metadata
 
 
 def _center_crop_square(frame: np.ndarray) -> np.ndarray:
@@ -53,10 +53,12 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
 
         buffer = io.BytesIO()
         first_dts = None
+        # packet.pts is on the stream's absolute timeline, which may not start at 0.
+        origin = in_stream.start_time or 0
         with av.open(buffer, mode="w", format="mp4") as output:
             out_stream = output.add_stream_from_template(in_stream)
-            source.seek(int(start / time_base), stream=in_stream, backward=True)
-            end_pts = end / time_base
+            source.seek(int(start / time_base) + origin, stream=in_stream, backward=True)
+            end_pts = end / time_base + origin
             for packet in source.demux(in_stream):
                 if packet.pts is None or packet.dts is None:
                     continue
@@ -71,32 +73,52 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
         return buffer.getvalue() if first_dts is not None else b""
 
 
+def _already_square(src: str, size: int) -> bool:
+    with _open_container(src) as container:
+        stream = container.streams.video[0]
+        return stream.codec_context.width == size and stream.codec_context.height == size
+
+
+def _copy_slices(src: str, slices: Sequence[tuple[float, float]]) -> Iterator[bytes]:
+    for start, end in slices:
+        yield _copy_clip(src, start, end)
+
+
+def _encode_slices(src: str, slices: Sequence[tuple[float, float]], size: int, codec: str) -> Iterator[bytes]:
+    fps = video_metadata(src).fps
+    for start, end in slices:
+        yield _encode_clip(list(read_frames_exact(src, start_time=start, end_time=end)), fps, size, codec)
+
+
 def slice_video(
     src: str,
     slices: Sequence[tuple[float, float]],
     size: int | None = None,
     codec: str = "h264",
-) -> list[bytes]:
+) -> Iterator[bytes]:
     """Cut ``src`` into clips, one per (start, end) second range, as encoded MP4 bytes.
+
+    Yields one clip at a time so a long list of slices doesn't hold every clip in
+    memory at once.
 
     Args:
         src: Path or URL to the source video.
         slices: (start, end) second ranges.
-        size: If set, each frame is center-cropped to a square and resized to
-            ``size`` x ``size`` (re-encoded). If None, packets are stream-copied
-            at the source resolution — faster and lossless, but the cut snaps to
-            the keyframe at or before ``start``.
-        codec: Output codec, used only when re-encoding (``size`` is set).
+        size: If set, frames are center-cropped to a square and resized to
+            ``size`` x ``size``. When the source is already ``size`` x ``size``
+            (or ``size`` is None) packets are stream-copied — faster and lossless,
+            but the cut snaps to the keyframe at or before ``start``.
+        codec: Output codec, used only when re-encoding.
 
-    Returns:
+    Yields:
         One ``bytes`` MP4 per slice, in order (empty ``bytes`` for a slice with
         no frames).
     """
-    if size is None:
-        return [_copy_clip(src, start, end) for start, end in slices]
+    for start, end in slices:
+        if end < start:
+            msg = f"slice end {end} is before start {start}"
+            raise ValueError(msg)
 
-    fps = video_metadata(src).fps
-    return [
-        _encode_clip(list(read_frames_exact(src, start_time=start, end_time=end)), fps, size, codec)
-        for start, end in slices
-    ]
+    if size is None or _already_square(src, size):
+        return _copy_slices(src, slices)
+    return _encode_slices(src, slices, size, codec)

@@ -7,19 +7,22 @@ import pytest
 from simple_video_utils.slicing import slice_video
 
 
-@pytest.fixture
-def video(tmp_path):
-    path = tmp_path / "src.mp4"
+def _write_video(path, width=320, height=240, frames=30, fps=30):
     with av.open(str(path), mode="w") as container:
-        stream = container.add_stream("h264", rate=30)
-        stream.width, stream.height, stream.pix_fmt = 320, 240, "yuv420p"
-        for i in range(30):
-            arr = np.full((240, 320, 3), i * 8 % 256, dtype=np.uint8)
+        stream = container.add_stream("h264", rate=fps)
+        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        for i in range(frames):
+            arr = np.full((height, width, 3), i * 8 % 256, dtype=np.uint8)
             for packet in stream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
                 container.mux(packet)
         for packet in stream.encode():
             container.mux(packet)
     return str(path)
+
+
+@pytest.fixture
+def video(tmp_path):
+    return _write_video(tmp_path / "src.mp4")
 
 
 def _dims(clip: bytes) -> tuple[int, int]:
@@ -29,7 +32,7 @@ def _dims(clip: bytes) -> tuple[int, int]:
 
 
 def test_slice_returns_one_clip_per_range(video):
-    clips = slice_video(video, [(0.0, 0.3), (0.5, 0.8)])
+    clips = list(slice_video(video, [(0.0, 0.3), (0.5, 0.8)]))
     assert len(clips) == 2
     assert all(clip for clip in clips)
 
@@ -45,7 +48,21 @@ def test_slice_center_crops_and_resizes(video):
     assert _dims(clip) == (256, 256)
 
 
+def test_matching_size_is_copied(tmp_path):
+    # Source is already 128x128, so size=128 needs no re-encode.
+    square = _write_video(tmp_path / "square.mp4", width=128, height=128, frames=15)
+    [clip] = slice_video(square, [(0.0, 0.3)], size=128)
+    assert _dims(clip) == (128, 128)
+
+
 def test_out_of_range_slice_is_empty_bytes(video):
     # Source is 1s; a slice past the end has no frames in either path.
-    assert slice_video(video, [(5.0, 5.5)]) == [b""]
-    assert slice_video(video, [(5.0, 5.5)], size=256) == [b""]
+    assert list(slice_video(video, [(5.0, 5.5)])) == [b""]
+    assert list(slice_video(video, [(5.0, 5.5)], size=256)) == [b""]
+
+
+def test_invalid_range_raises(video):
+    with pytest.raises(ValueError, match="before start"):
+        slice_video(video, [(0.5, 0.2)])
+    with pytest.raises(ValueError, match="before start"):
+        slice_video(video, [(0.5, 0.2)], size=256)
