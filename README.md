@@ -54,6 +54,18 @@ with open("video.mp4", "rb") as f:
         pass
 ```
 
+### Slice into Clips
+
+```python
+from simple_video_utils.slicing import slice_video
+
+# One MP4 (bytes) per (start, end) second range
+clips = slice_video("video.mp4", [(0.0, 1.5), (2.0, 3.2)])
+
+# Center-crop to a square and resize to 256x256 (e.g. for model input)
+clips = slice_video("video.mp4", [(0.0, 1.5)], size=256)
+```
+
 ### Remote Videos
 
 ```python
