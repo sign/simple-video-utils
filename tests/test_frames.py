@@ -1,6 +1,7 @@
 from io import BytesIO
 from pathlib import Path
 
+import av
 import numpy as np
 import pytest
 
@@ -190,6 +191,51 @@ class TestReadFramesExact:
             for i in range(min(min_len, 10)):  # Compare first 10 frames
                 np.testing.assert_array_equal(frames_none[i], frames_explicit[i])
 
+    def test_seek_path_matches_full_decode(self, video_path):
+        """Starts past the 3s seek threshold must yield the exact target frames.
+
+        Seeking lands on the keyframe at/before the seek point (this file's only
+        keyframe is frame 0), so frames must be located by timestamp — counting
+        from an assumed landing position used to yield frames ~2.5s too early.
+        """
+        all_frames = list(read_frames_exact(video_path))
+        frames = list(read_frames_exact(video_path, start_frame=105, end_frame=110))
+        assert len(frames) == 6
+        for got, expected in zip(frames, all_frames[105:111], strict=True):
+            np.testing.assert_array_equal(got, expected)
+
+        by_time = list(read_frames_exact(video_path, start_time=3.5, end_time=110 / 30))
+        assert len(by_time) == 6
+        for got, expected in zip(by_time, frames, strict=True):
+            np.testing.assert_array_equal(got, expected)
+
+    def test_seek_path_with_nonzero_stream_start_time(self, video_path, tmp_path):
+        """Frame indices must be measured from the stream origin, not t=0.
+
+        Stream timestamps don't have to start at 0; the seek path used to
+        compute every frame's index ~origin*fps too high and return nothing.
+        """
+        shifted = str(tmp_path / "shifted.mp4")
+        with av.open(video_path) as source, av.open(shifted, mode="w") as output:
+            in_stream = source.streams.video[0]
+            out_stream = output.add_stream_from_template(in_stream)
+            offset = round(100 / in_stream.time_base)
+            for packet in source.demux(in_stream):
+                if packet.pts is None or packet.dts is None:
+                    continue
+                packet.pts += offset
+                packet.dts += offset
+                packet.stream = out_stream
+                output.mux(packet)
+        with av.open(shifted) as check:
+            assert check.streams.video[0].start_time > 0, "fixture must not start at 0"
+
+        all_frames = list(read_frames_exact(video_path))
+        frames = list(read_frames_exact(shifted, start_frame=105, end_frame=110))
+        assert len(frames) == 6
+        for got, expected in zip(frames, all_frames[105:111], strict=True):
+            np.testing.assert_array_equal(got, expected)
+
     def test_bad_color_space_video(self):
         """Test reading frames from a video with unusual color space metadata."""
         strange_video = str(Path(__file__).parent / "assets" / "bad_colorspace.mp4")
@@ -374,13 +420,20 @@ class TestReadFramesExact:
         with pytest.raises(RuntimeError, match="Failed to open video"):
             list(read_frames_exact(empty))
 
-    def test_corrupted_video_full_read_fails(self):
-        """Test that reading all frames from corrupted video raises RuntimeError."""
+    def test_corrupted_video_full_read_never_leaks_av_errors(self):
+        """Corrupted data either raises our RuntimeError or decodes gracefully.
+
+        What matters is that no raw av exception escapes: av <= 17 errors
+        partway through the corrupted stream, av >= 18 recovers and decodes.
+        """
         corrupted_path = str(Path(__file__).parent / "assets" / "corrupted.mp4")
 
-        # Reading all frames should fail when hitting corrupted data
-        with pytest.raises(RuntimeError, match="Failed to open video"):
-            list(read_frames_exact(corrupted_path, 0, None))
+        try:
+            frames = list(read_frames_exact(corrupted_path, 0, None))
+        except RuntimeError:
+            pass
+        else:
+            assert len(frames) > 0
 
 
 class TestReadFramesFromStream:

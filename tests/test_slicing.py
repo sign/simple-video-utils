@@ -1,9 +1,11 @@
 import io
+from pathlib import Path
 
 import av
 import numpy as np
 import pytest
 
+from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.slicing import slice_video
 
 
@@ -53,6 +55,33 @@ def test_matching_size_is_copied(tmp_path):
     square = _write_video(tmp_path / "square.mp4", width=128, height=128, frames=15)
     [clip] = slice_video(square, [(0.0, 0.3)], size=128)
     assert _dims(clip) == (128, 128)
+
+
+def test_copy_playback_starts_at_requested_start():
+    # The keyframe lead-in is muxed at negative pts, which the mp4 muxer turns
+    # into an edit list — decoders skip straight to `start` instead of showing
+    # everything from the keyframe.
+    src = str(Path(__file__).parent / "assets" / "example.mp4")
+    [clip] = slice_video(src, [(2.7, 3.03)])
+    with av.open(io.BytesIO(clip)) as container:
+        frames = list(container.decode(video=0))
+        first_time = float(frames[0].pts * frames[0].time_base)
+        first_pixels = frames[0].to_ndarray(format="rgb24")
+    assert first_time == 0.0
+    assert len(frames) <= 13  # 10 frames cover [2.7, 3.03] at 30 fps, plus B-frame extras
+    [expected] = read_frames_exact(src, start_frame=81, end_frame=81)  # the frame at 2.7s
+    np.testing.assert_array_equal(first_pixels, expected)
+
+
+def test_copy_keeps_trailing_frames():
+    # Packets arrive in decode order, so a B-frame with pts <= end can follow a
+    # packet with pts > end; cutting on pts used to drop such tail frames.
+    # The synthetic fixture encodes without that reordering — use a real asset.
+    src = str(Path(__file__).parent / "assets" / "example-short.mp4")
+    [clip] = slice_video(src, [(0.0, 0.68)])
+    with av.open(io.BytesIO(clip)) as container:
+        clip_count = sum(1 for _ in container.decode(video=0))
+    assert clip_count >= 21  # frames 0..20 cover [0, 0.68] at 30 fps
 
 
 def test_out_of_range_slice_raises(video):
