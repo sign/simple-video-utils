@@ -392,13 +392,20 @@ class TestReadFramesExact:
         with pytest.raises(RuntimeError, match="Failed to open video"):
             list(read_frames_exact(empty))
 
-    def test_corrupted_video_full_read_fails(self):
-        """Test that reading all frames from corrupted video raises RuntimeError."""
+    def test_corrupted_video_full_read_never_leaks_av_errors(self):
+        """Corrupted data either raises our RuntimeError or decodes gracefully.
+
+        What matters is that no raw av exception escapes: av <= 17 errors
+        partway through the corrupted stream, av >= 18 recovers and decodes.
+        """
         corrupted_path = str(Path(__file__).parent / "assets" / "corrupted.mp4")
 
-        # Reading all frames should fail when hitting corrupted data
-        with pytest.raises(RuntimeError, match="Failed to open video"):
-            list(read_frames_exact(corrupted_path, 0, None))
+        try:
+            frames = list(read_frames_exact(corrupted_path, 0, None))
+        except RuntimeError:
+            pass
+        else:
+            assert len(frames) > 0
 
 
 class TestReadFramesFromStream:
