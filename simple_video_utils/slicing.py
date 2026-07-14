@@ -2,7 +2,10 @@
 
 When no pixel change is needed — the target ``size`` is None, or the source is
 already ``size`` x ``size`` and unrotated — packets are stream-copied: fast and
-lossless, but the cut snaps to the keyframe at or before ``start``. Otherwise
+lossless. The file still carries the lead-in from the keyframe at/before
+``start`` (required for decoding), but an edit list hides it, so playback
+starts at ``start``; a few frames past ``end`` may remain visible (B-frame
+reordering). Otherwise
 frames are decoded, center-cropped to a square, resized, and re-encoded.
 """
 
@@ -42,29 +45,43 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int) -> b
 
 
 def _copy_clip(src: str, start: float, end: float) -> bytes:
-    """Remux [start, end] seconds without re-encoding, cutting on the keyframe at/before start."""
+    """
+    Remux [start, end] seconds without re-encoding.
+
+    The copied packets start on the keyframe at/before ``start`` (the lead-in
+    is needed to decode) and may run a few frames past ``end``: packets arrive
+    in decode order, so a B-frame with pts <= end can follow a packet with
+    pts > end — cutting on pts would drop it. Cutting on dts (monotonic,
+    dts <= pts) keeps every frame in range at the cost of a few trailing ones.
+
+    Timestamps are rebased so ``start`` is t=0, putting the lead-in at
+    negative pts — the mp4 muxer records that as an edit list, so players
+    begin playback at ``start`` and the reported duration excludes the
+    lead-in. Consumers that enumerate raw decoded frames still see the
+    lead-in (with pts < 0); only presentation skips it.
+    """
     with av.open(src) as source:
         in_stream = source.streams.video[0]
         time_base = in_stream.time_base
         origin = in_stream.start_time or 0  # pts is on the stream's absolute timeline
+        start_pts = int(start / time_base) + origin
+        end_pts = end / time_base + origin
         buffer = io.BytesIO()
-        first_dts = None
+        muxed = False
         with av.open(buffer, mode="w", format="mp4") as output:
             out_stream = output.add_stream_from_template(in_stream)
-            source.seek(int(start / time_base) + origin, stream=in_stream, backward=True)
-            end_pts = end / time_base + origin
+            source.seek(start_pts, stream=in_stream, backward=True)
             for packet in source.demux(in_stream):
                 if packet.pts is None or packet.dts is None:
                     continue
-                if packet.pts > end_pts:
+                if packet.dts > end_pts:
                     break
-                if first_dts is None:
-                    first_dts = packet.dts
-                packet.pts -= first_dts
-                packet.dts -= first_dts
+                packet.pts -= start_pts
+                packet.dts -= start_pts
                 packet.stream = out_stream
                 output.mux(packet)
-        return buffer.getvalue() if first_dts is not None else b""
+                muxed = True
+        return buffer.getvalue() if muxed else b""
 
 
 def slice_video(
