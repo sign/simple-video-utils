@@ -7,7 +7,10 @@ import numpy as np
 from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
 
-def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
+def _frame_to_rgb(
+    frame: av.VideoFrame,
+    reformatter: av.video.reformatter.VideoReformatter,
+) -> np.ndarray:
     """
     Convert a frame to an RGB array in display orientation.
 
@@ -15,8 +18,13 @@ def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
     container's display-matrix rotation (unlike the ffmpeg CLI, which
     autorotates). Phone-recorded videos commonly store landscape frames with
     a 90° rotation tag, so we apply it here.
+
+    A single ``reformatter`` is reused across all frames of a read so the
+    swscale conversion context is built once instead of being reallocated on
+    every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
+    dramatically faster full-clip decode.
     """
-    array = frame.to_ndarray(format='rgb24')
+    array = reformatter.reformat(frame, format='rgb24').to_ndarray()
     rotation = frame.rotation % 360
     if rotation and rotation % 90 == 0:
         # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
@@ -28,6 +36,7 @@ def _frame_to_rgb(frame: av.VideoFrame) -> np.ndarray:
 
 def _generate_frames(
     container: av.container.InputContainer,
+    reformatter: av.video.reformatter.VideoReformatter,
     skip_frames: int = 0,
     max_frames: int | None = None,
 ) -> Generator[np.ndarray, None, None]:
@@ -39,6 +48,7 @@ def _generate_frames(
 
     Args:
         container: Open PyAV container (may be seeked to any position).
+        reformatter: Reformatter reused for every YUV->RGB conversion in this read.
         skip_frames: Number of frames to skip from current position before yielding.
         max_frames: Maximum number of frames to yield, or None for all remaining.
 
@@ -53,7 +63,7 @@ def _generate_frames(
             frames_decoded += 1
             continue
 
-        yield _frame_to_rgb(frame)
+        yield _frame_to_rgb(frame, reformatter)
         frames_yielded += 1
 
         if max_frames is not None and frames_yielded >= max_frames:
@@ -144,6 +154,7 @@ def _generate_frames_by_index(
     fps: float,
     target_start: int,
     target_end: int | None,
+    reformatter: av.video.reformatter.VideoReformatter,
 ) -> Generator[np.ndarray, None, None]:
     """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
     origin = float((stream.start_time or 0) * stream.time_base)
@@ -155,7 +166,7 @@ def _generate_frames_by_index(
             continue
         if target_end is not None and index > target_end:
             break
-        yield _frame_to_rgb(frame)
+        yield _frame_to_rgb(frame, reformatter)
 
 
 def read_frames_exact(
@@ -218,11 +229,17 @@ def read_frames_exact(
         else:
             target_start, target_end = _normalize_frame_range(start_frame, end_frame)
 
+        # Build the swscale conversion context once and reuse it for every frame
+        # in this read (per-frame reallocation dominated PyAV decode cost).
+        reformatter = av.video.reformatter.VideoReformatter()
+
         if _seek_near(target_start, fps, stream, container):
-            yield from _generate_frames_by_index(container, stream, fps, target_start, target_end)
+            yield from _generate_frames_by_index(
+                container, stream, fps, target_start, target_end, reformatter
+            )
         else:
             frame_count = (target_end - target_start + 1) if target_end is not None else None
-            yield from _generate_frames(container, target_start, frame_count)
+            yield from _generate_frames(container, reformatter, target_start, frame_count)
 
 
 def read_frames_from_stream(
@@ -269,13 +286,17 @@ def read_frames_from_stream(
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
+            # Reuse one swscale context across the whole stream (see _frame_to_rgb).
+            reformatter = av.video.reformatter.VideoReformatter()
             remaining_skip = skip_frames
             if first_frame is not None:
                 if remaining_skip == 0:
-                    yield _frame_to_rgb(first_frame)
+                    yield _frame_to_rgb(first_frame, reformatter)
                 else:
                     remaining_skip -= 1
-            yield from _generate_frames(container, skip_frames=remaining_skip, max_frames=None)
+            yield from _generate_frames(
+                container, reformatter, skip_frames=remaining_skip, max_frames=None
+            )
         finally:
             container.close()
 
