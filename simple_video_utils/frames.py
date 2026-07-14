@@ -108,36 +108,50 @@ def _normalize_frame_range(
     return start, end_frame
 
 
-def _calculate_seek_position(
+def _seek_near(
     target_start_frame: int,
     fps: float,
     stream,
     container,
-) -> int:
+) -> bool:
     """
-    Calculate and perform seeking if beneficial.
+    Seek toward the target position if it is far enough from the start.
 
-    Seeks directly to the target position in the file - does NOT decode
-    or process frames before the seek position. This allows efficient
-    extraction from any point in the video without reading the entire file.
-
-    Returns the frame number where container is positioned after seeking.
+    Seeks directly in the file — does NOT decode or process frames before
+    the seek position. This allows efficient extraction from any point in
+    the video without reading the entire file. Returns whether a seek
+    happened; the resulting position is the keyframe at or before the seek
+    point, which can be anywhere, so callers must locate frames by
+    timestamp rather than by counting.
     """
     min_seek_seconds = 3.0  # Only seek if target is 3+ seconds from start
     seek_buffer_seconds = 1.0  # Seek 1 second before target
 
     target_time = target_start_frame / fps
-
-    # Only seek if far enough from start
     if target_time < min_seek_seconds:
-        return 0  # Start from beginning
+        return False
 
-    # Seek to 1 second before target (jumps directly in file, no decoding)
-    seek_time = target_time - seek_buffer_seconds
-    seek_timestamp = int(seek_time / float(stream.time_base))
+    seek_timestamp = int((target_time - seek_buffer_seconds) / float(stream.time_base))
     container.seek(seek_timestamp, stream=stream)
+    return True
 
-    return int(seek_time * fps)
+
+def _generate_frames_by_index(
+    container: av.container.InputContainer,
+    fps: float,
+    target_start: int,
+    target_end: int | None,
+) -> Generator[np.ndarray, None, None]:
+    """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
+    for frame in container.decode(video=0):
+        if frame.time is None:
+            continue
+        index = round(frame.time * fps)
+        if index < target_start:
+            continue
+        if target_end is not None and index > target_end:
+            break
+        yield _frame_to_rgb(frame)
 
 
 def read_frames_exact(
@@ -200,14 +214,11 @@ def read_frames_exact(
         else:
             target_start, target_end = _normalize_frame_range(start_frame, end_frame)
 
-        # Seek to approximate position (if beneficial)
-        seek_position = _calculate_seek_position(target_start, fps, stream, container)
-
-        # Calculate how many frames to skip/yield from seek position
-        skip_count = target_start - seek_position
-        frame_count = (target_end - target_start + 1) if target_end is not None else None
-
-        yield from _generate_frames(container, skip_count, frame_count)
+        if _seek_near(target_start, fps, stream, container):
+            yield from _generate_frames_by_index(container, fps, target_start, target_end)
+        else:
+            frame_count = (target_end - target_start + 1) if target_end is not None else None
+            yield from _generate_frames(container, target_start, frame_count)
 
 
 def read_frames_from_stream(

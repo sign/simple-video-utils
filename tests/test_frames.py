@@ -190,6 +190,24 @@ class TestReadFramesExact:
             for i in range(min(min_len, 10)):  # Compare first 10 frames
                 np.testing.assert_array_equal(frames_none[i], frames_explicit[i])
 
+    def test_seek_path_matches_full_decode(self, video_path):
+        """Starts past the 3s seek threshold must yield the exact target frames.
+
+        Seeking lands on the keyframe at/before the seek point (this file's only
+        keyframe is frame 0), so frames must be located by timestamp — counting
+        from an assumed landing position used to yield frames ~2.5s too early.
+        """
+        all_frames = list(read_frames_exact(video_path))
+        frames = list(read_frames_exact(video_path, start_frame=105, end_frame=110))
+        assert len(frames) == 6
+        for got, expected in zip(frames, all_frames[105:111], strict=True):
+            np.testing.assert_array_equal(got, expected)
+
+        by_time = list(read_frames_exact(video_path, start_time=3.5, end_time=110 / 30))
+        assert len(by_time) == 6
+        for got, expected in zip(by_time, frames, strict=True):
+            np.testing.assert_array_equal(got, expected)
+
     def test_bad_color_space_video(self):
         """Test reading frames from a video with unusual color space metadata."""
         strange_video = str(Path(__file__).parent / "assets" / "bad_colorspace.mp4")
