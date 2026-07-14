@@ -64,8 +64,10 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
         in_stream = source.streams.video[0]
         time_base = in_stream.time_base
         origin = in_stream.start_time or 0  # pts is on the stream's absolute timeline
-        start_pts = int(start / time_base) + origin
-        end_pts = end / time_base + origin
+        # round, not int: a frame landing exactly on a boundary must not be
+        # excluded by float noise in the division
+        start_pts = round(start / time_base) + origin
+        end_pts = round(end / time_base) + origin
         buffer = io.BytesIO()
         muxed = False
         with av.open(buffer, mode="w", format="mp4") as output:

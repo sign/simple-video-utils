@@ -131,22 +131,26 @@ def _seek_near(
     if target_time < min_seek_seconds:
         return False
 
-    seek_timestamp = int((target_time - seek_buffer_seconds) / float(stream.time_base))
+    # stream timestamps don't have to start at 0 — seek on the stream's timeline
+    origin = stream.start_time or 0
+    seek_timestamp = int((target_time - seek_buffer_seconds) / float(stream.time_base)) + origin
     container.seek(seek_timestamp, stream=stream)
     return True
 
 
 def _generate_frames_by_index(
     container: av.container.InputContainer,
+    stream,
     fps: float,
     target_start: int,
     target_end: int | None,
 ) -> Generator[np.ndarray, None, None]:
     """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
+    origin = float((stream.start_time or 0) * stream.time_base)
     for frame in container.decode(video=0):
         if frame.time is None:
             continue
-        index = round(frame.time * fps)
+        index = round((frame.time - origin) * fps)
         if index < target_start:
             continue
         if target_end is not None and index > target_end:
@@ -215,7 +219,7 @@ def read_frames_exact(
             target_start, target_end = _normalize_frame_range(start_frame, end_frame)
 
         if _seek_near(target_start, fps, stream, container):
-            yield from _generate_frames_by_index(container, fps, target_start, target_end)
+            yield from _generate_frames_by_index(container, stream, fps, target_start, target_end)
         else:
             frame_count = (target_end - target_start + 1) if target_end is not None else None
             yield from _generate_frames(container, target_start, frame_count)

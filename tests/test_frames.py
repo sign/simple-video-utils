@@ -1,6 +1,7 @@
 from io import BytesIO
 from pathlib import Path
 
+import av
 import numpy as np
 import pytest
 
@@ -206,6 +207,33 @@ class TestReadFramesExact:
         by_time = list(read_frames_exact(video_path, start_time=3.5, end_time=110 / 30))
         assert len(by_time) == 6
         for got, expected in zip(by_time, frames, strict=True):
+            np.testing.assert_array_equal(got, expected)
+
+    def test_seek_path_with_nonzero_stream_start_time(self, video_path, tmp_path):
+        """Frame indices must be measured from the stream origin, not t=0.
+
+        Stream timestamps don't have to start at 0; the seek path used to
+        compute every frame's index ~origin*fps too high and return nothing.
+        """
+        shifted = str(tmp_path / "shifted.mp4")
+        with av.open(video_path) as source, av.open(shifted, mode="w") as output:
+            in_stream = source.streams.video[0]
+            out_stream = output.add_stream_from_template(in_stream)
+            offset = round(100 / in_stream.time_base)
+            for packet in source.demux(in_stream):
+                if packet.pts is None or packet.dts is None:
+                    continue
+                packet.pts += offset
+                packet.dts += offset
+                packet.stream = out_stream
+                output.mux(packet)
+        with av.open(shifted) as check:
+            assert check.streams.video[0].start_time > 0, "fixture must not start at 0"
+
+        all_frames = list(read_frames_exact(video_path))
+        frames = list(read_frames_exact(shifted, start_frame=105, end_frame=110))
+        assert len(frames) == 6
+        for got, expected in zip(frames, all_frames[105:111], strict=True):
             np.testing.assert_array_equal(got, expected)
 
     def test_bad_color_space_video(self):
