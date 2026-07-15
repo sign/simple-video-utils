@@ -11,7 +11,6 @@ class VideoMetadata(NamedTuple):
     height: int
     fps: float
     nb_frames: int | None  # best effort: header, cross-checked against duration×fps, decoded on disagreement
-    time_base: str | None
     duration: float | None  # seconds; None if the container header doesn't carry one
     rotation: int = 0  # display-matrix rotation in degrees; width/height already account for it
 
@@ -133,7 +132,6 @@ def video_metadata_from_container(
     """
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate else 0.0
-    time_base = str(stream.time_base) if stream.time_base else None
     # Prefer the video stream's duration over container.duration. They usually
     # match, but when audio outlasts video the container header reports the
     # longer of the two — and downstream consumers (ffmpeg padding, model APIs
@@ -164,7 +162,6 @@ def video_metadata_from_container(
         height=height,
         fps=fps,
         nb_frames=nb_frames,
-        time_base=time_base,
         duration=duration,
         rotation=rotation,
     )

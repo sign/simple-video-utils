@@ -136,6 +136,3 @@ class TestRotatedVideo:
         assert len(frame_list) == 30
         assert all(frame.shape == (640, 360, 3) for frame in frame_list)
 
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
