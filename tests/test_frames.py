@@ -19,14 +19,21 @@ class TestReadFramesExact:
         return str(Path(__file__).parent / "assets" / "example.mp4")
 
     def test_invalid_frame_range_negative_start(self):
-        """Test that negative start frame raises AssertionError."""
-        with pytest.raises(AssertionError, match="invalid frame range"):
-            list(read_frames_exact("example.mp4", -1, 5))
+        """Test that negative start frame raises ValueError at call time."""
+        with pytest.raises(ValueError, match="start_frame must be non-negative"):
+            read_frames_exact("example.mp4", -1, 5)
 
     def test_invalid_frame_range_end_before_start(self):
-        """Test that end_frame < start_frame raises AssertionError."""
-        with pytest.raises(AssertionError, match="invalid frame range"):
-            list(read_frames_exact("example.mp4", 10, 5))
+        """Test that end_frame < start_frame raises ValueError at call time."""
+        with pytest.raises(ValueError, match="invalid frame range"):
+            read_frames_exact("example.mp4", 10, 5)
+
+    def test_invalid_time_range_raises_at_call_time(self):
+        """Inverted or fully-negative time windows fail fast, before opening."""
+        with pytest.raises(ValueError, match="invalid time range"):
+            read_frames_exact("example.mp4", start_time=3.0, end_time=1.0)
+        with pytest.raises(ValueError, match="invalid time range"):
+            read_frames_exact("example.mp4", start_time=-0.5, end_time=-0.01)
 
     def test_float_frame_index_raises_type_error(self):
         """Frame indices must be integers; floats fail fast, not as a container error."""
@@ -507,6 +514,11 @@ class TestReadFramesFromStream:
         """Negative skip_frames fails fast with a clear error, before opening."""
         with pytest.raises(ValueError, match="skip_frames must be non-negative"):
             read_frames_from_stream(BytesIO(video_bytes), skip_frames=-1)
+
+    def test_read_frames_from_stream_huge_skip_raises(self, video_bytes):
+        """skip_frames beyond islice's bound fails fast instead of leaking the container."""
+        with pytest.raises(ValueError, match="skip_frames is too large"):
+            read_frames_from_stream(BytesIO(video_bytes), skip_frames=2**63)
 
     # skip=1 is the boundary where the eagerly-decoded first frame is consumed
     # by the skip instead of being yielded.

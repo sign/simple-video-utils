@@ -1,4 +1,5 @@
 import operator
+import sys
 from collections.abc import Generator, Iterable
 from itertools import islice
 from typing import BinaryIO
@@ -52,8 +53,8 @@ def _validate_parameters(
     end_frame: int | None,
     start_time: float | None,
     end_time: float | None,
-) -> tuple[bool, bool]:
-    """Validate that time and frame parameters aren't mixed."""
+) -> bool:
+    """Validate parameter combinations; returns whether the range is time-based."""
     has_frame_params = start_frame is not None or end_frame is not None
     has_time_params = start_time is not None or end_time is not None
 
@@ -61,7 +62,13 @@ def _validate_parameters(
         msg = "Cannot mix frame-based and time-based parameters"
         raise ValueError(msg)
 
-    return has_frame_params, has_time_params
+    # fps-free time checks run here, before the container opens — errors raised
+    # inside `with _open_container` get wrapped as "Failed to open video".
+    if end_time is not None and (end_time < 0 or end_time < (start_time or 0.0)):
+        msg = "invalid time range"
+        raise ValueError(msg)
+
+    return has_time_params
 
 
 def _convert_time_to_frames(
@@ -72,14 +79,30 @@ def _convert_time_to_frames(
     """Convert time-based parameters to frame indices."""
     # Clamp so a padded window (e.g. clip_start - 0.5s) degrades to "from the
     # beginning" instead of a negative index blowing up islice downstream.
+    # Fully-negative ranges were already rejected by _validate_parameters.
     start = max(int((start_time or 0.0) * fps), 0)
     end = int(end_time * fps) if end_time is not None else None
-
-    if end is not None and end < start:
-        msg = "invalid frame range"
-        raise ValueError(msg)
-
     return start, end
+
+
+def _nonnegative_index(value: int, name: str) -> int:
+    """
+    Validate an index eagerly, with a clear error.
+
+    islice would reject bad values only once a read is underway — after
+    av.open (leaking the container in read_frames_from_stream) or wrapped in
+    a misleading "Failed to open video" (in read_frames_exact). operator.index
+    keeps duck-typed integers (np.int64) working while rejecting floats.
+    """
+    index = operator.index(value)
+    if index < 0:
+        msg = f"{name} must be non-negative"
+        raise ValueError(msg)
+    # bound leaves room for islice's exclusive stop (end + 1)
+    if index > sys.maxsize - 1:
+        msg = f"{name} is too large"
+        raise ValueError(msg)
+    return index
 
 
 def _normalize_frame_range(
@@ -87,15 +110,12 @@ def _normalize_frame_range(
     end_frame: int | None,
 ) -> tuple[int, int | None]:
     """Normalize frame parameters with defaults and validation."""
-    # operator.index rejects floats up front with a clear TypeError; islice
-    # would otherwise fail later, wrapped in a misleading "Failed to open video".
-    start = operator.index(start_frame) if start_frame is not None else 0
-    end = operator.index(end_frame) if end_frame is not None else None
+    start = _nonnegative_index(start_frame, "start_frame") if start_frame is not None else 0
+    end = _nonnegative_index(end_frame, "end_frame") if end_frame is not None else None
 
-    if end is not None:
-        assert end >= start >= 0, "invalid frame range"
-    else:
-        assert start >= 0, "start_frame must be non-negative"
+    if end is not None and end < start:
+        msg = "invalid frame range"
+        raise ValueError(msg)
 
     return start, end
 
@@ -174,6 +194,13 @@ def read_frames_exact(
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3).
 
+    Raises:
+        ValueError: If frame and time parameters are mixed, or a range is
+            invalid (negative or inverted). Raised at call time, before the
+            file is opened. A negative start_time is clamped to 0 instead
+            (padded windows are common), as long as the range stays valid.
+        TypeError: If a frame index is not an integer (np.int64 is fine).
+
     Examples:
         # All frames
         frames = list(read_frames_exact("video.mp4"))
@@ -184,41 +211,39 @@ def read_frames_exact(
         # Time-based
         frames = list(read_frames_exact("video.mp4", start_time=1.5, end_time=3.0))
     """
-    # Validate parameters early (before opening file)
-    has_frame_params, has_time_params = _validate_parameters(
-        start_frame, end_frame, start_time, end_time
-    )
+    has_time_params = _validate_parameters(start_frame, end_frame, start_time, end_time)
+    if not has_time_params:
+        frame_range = _normalize_frame_range(start_frame, end_frame)
 
-    # Early validation for frame-based parameters (before opening file)
-    if has_frame_params:
-        _normalize_frame_range(start_frame, end_frame)
+    # Inner generator so validation above raises at call time, not first next().
+    def generate() -> Generator[np.ndarray, None, None]:
+        with _open_container(src) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = thread_type
 
-    with _open_container(src) as container:
-        stream = container.streams.video[0]
-        stream.thread_type = thread_type
+            # Get FPS - required for all operations
+            if not stream.average_rate:
+                msg = "Video has no FPS information"
+                raise ValueError(msg)
+            fps = float(stream.average_rate)
 
-        # Get FPS - required for all operations
-        if not stream.average_rate:
-            msg = "Video has no FPS information"
-            raise ValueError(msg)
-        fps = float(stream.average_rate)
+            if has_time_params:
+                target_start, target_end = _convert_time_to_frames(start_time, end_time, fps)
+            else:
+                target_start, target_end = frame_range
 
-        # Convert parameters to frame indices
-        if has_time_params:
-            target_start, target_end = _convert_time_to_frames(start_time, end_time, fps)
-        else:
-            target_start, target_end = _normalize_frame_range(start_frame, end_frame)
+            did_seek = _seek_near(target_start, fps, stream, container)
+            decoded = container.decode(video=0)
+            if did_seek:
+                origin = float((stream.start_time or 0) * stream.time_base)
+                frames = _select_frames_by_index(decoded, origin, fps, target_start, target_end)
+            else:
+                stop = target_end + 1 if target_end is not None else None
+                frames = islice(decoded, target_start, stop)
 
-        did_seek = _seek_near(target_start, fps, stream, container)
-        decoded = container.decode(video=0)
-        if did_seek:
-            origin = float((stream.start_time or 0) * stream.time_base)
-            frames = _select_frames_by_index(decoded, origin, fps, target_start, target_end)
-        else:
-            stop = target_end + 1 if target_end is not None else None
-            frames = islice(decoded, target_start, stop)
+            yield from _frames_to_rgb(frames)
 
-        yield from _frames_to_rgb(frames)
+    return generate()
 
 
 def read_frames_from_stream(
@@ -242,17 +267,19 @@ def read_frames_from_stream(
         A tuple of (VideoMetadata, frame_generator).
         The generator yields np.ndarray frames in RGB format (H, W, 3).
 
+    Raises:
+        ValueError: If skip_frames is negative or too large. Raised at call
+            time, before the stream is opened.
+        TypeError: If skip_frames is not an integer (np.int64 is fine).
+
     Note:
         For streaming-friendly formats (WebM), frames are yielded as they're
         decoded without waiting for the complete file. For formats requiring
         seeking (MP4 with moov at end), the stream must be fully available.
+        The generator owns the container: if it is discarded without ever
+        being iterated, the container is closed only at garbage collection.
     """
-    # Validate before av.open: islice would reject bad values only after the
-    # container is open, leaking it past the cleanup paths below.
-    skip_frames = operator.index(skip_frames)
-    if skip_frames < 0:
-        msg = "skip_frames must be non-negative"
-        raise ValueError(msg)
+    skip_frames = _nonnegative_index(skip_frames, "skip_frames")
 
     # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
     container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
