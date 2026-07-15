@@ -1,6 +1,8 @@
 import operator
 import sys
 from collections.abc import Generator, Iterable
+from fractions import Fraction
+from functools import lru_cache
 from itertools import islice
 from typing import BinaryIO
 
@@ -17,21 +19,26 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
 
-def _rotation_graph(template: av.VideoFrame, rotation: int) -> av.filter.Graph:
+def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
     """
-    Build a filter graph rotating rgb24 frames shaped like ``template``.
+    Build a filter graph rotating rgb24 frames.
 
     rotation=90 maps to a counterclockwise transpose, matching ffmpeg
     autorotate (and np.rot90 k=1) pixel-exactly. Graphs are stateful
-    (push/pull is a FIFO), so they must stay per-read — never share or
-    cache one across reads.
+    (push/pull is a FIFO), so cache only per-read (the lru_cache in
+    _frames_to_rgb) — a shared/module-level cache would interleave
+    frames across concurrent reads.
     """
     graph = av.filter.Graph()
     if rotation == 180:
         filters = [graph.add("hflip"), graph.add("vflip")]
     else:
         filters = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
-    graph.link_nodes(graph.add_buffer(template=template), *filters, graph.add("buffersink"))
+    # add_buffer without an explicit time_base is deprecated; the value only
+    # affects pts interpretation, never pixels, and we only take arrays.
+    source = graph.add_buffer(width=width, height=height, format="rgb24",
+                              time_base=time_base or Fraction(1, 1000))
+    graph.link_nodes(source, *filters, graph.add("buffersink"))
     graph.configure()
     return graph
 
@@ -58,20 +65,16 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
     pixel-exactness (measured maxdiff 2-3).
     """
     reformatter = av.video.reformatter.VideoReformatter()
-    graph = None
-    graph_key = None
+    # One-slot cache: built on the first rotated frame, reused for the whole
+    # read, rebuilt only if stream geometry changes mid-read. Created here so
+    # each read gets its own graph (see _rotation_graph on why).
+    rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
     for frame in frames:
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
         rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
-            # Built once and reused for the whole read; the key only exists
-            # because stream reads can change geometry mid-stream, and pushing
-            # a differently-shaped frame into a configured graph is an error.
-            key = (rotation, rgb.width, rgb.height)
-            if key != graph_key:
-                graph = _rotation_graph(rgb, rotation)
-                graph_key = key
+            graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
             rgb = graph.pull()
             # The filtered frame's linesize may be padded past width*3, making
