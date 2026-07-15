@@ -6,7 +6,13 @@ import av
 import numpy as np
 import pytest
 
-from simple_video_utils.frames import _select_frames_by_index, read_frames_exact, read_frames_from_stream
+from simple_video_utils.frames import (
+    _select_frames_by_index,
+    read_frames_batched,
+    read_frames_exact,
+    read_frames_from_stream,
+    stack_frames,
+)
 from simple_video_utils.metadata import video_metadata
 
 
@@ -564,6 +570,78 @@ class TestReadFramesFromStream:
 
         frames = list(frames_gen)
         assert len(frames) == 67  # Same as test_webm_file
+
+
+class TestStackFrames:
+    """stack_frames must equal np.stack for any iterable of arrays."""
+
+    @staticmethod
+    def _arrays(n):
+        rng = np.random.default_rng(seed=n)
+        return [rng.integers(0, 255, (4, 6, 3), dtype=np.uint8) for _ in range(n)]
+
+    @pytest.mark.parametrize("n", [1, 5, 64, 200])
+    def test_matches_np_stack_without_hint(self, n):
+        """Covers partial, exactly-one-chunk, and multi-chunk growth paths."""
+        arrays = self._arrays(n)
+        assert np.array_equal(stack_frames(iter(arrays)), np.stack(arrays))
+
+    @pytest.mark.parametrize("hint", [1, 90, 100, 150])
+    def test_wrong_hints_still_correct(self, hint):
+        """Under- and over-counting hints compact or extend transparently."""
+        arrays = self._arrays(100)
+        assert np.array_equal(stack_frames(iter(arrays), size_hint=hint), np.stack(arrays))
+
+    def test_exact_hint_returns_single_allocation(self):
+        arrays = self._arrays(10)
+        result = stack_frames(iter(arrays), size_hint=10)
+        assert np.array_equal(result, np.stack(arrays))
+        assert result.base is None  # owns its memory, no compaction copy
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="no frames"):
+            stack_frames(iter([]))
+
+
+class TestReadFramesBatched:
+    """read_frames_batched must equal np.stack over read_frames_exact."""
+
+    ASSETS = Path(__file__).parent / "assets"
+
+    @pytest.mark.parametrize("name", ["example.mp4", "rotated90.mp4", "no_nb_frames.webm"])
+    def test_matches_stacked_generator(self, name):
+        """Byte-equal to the generator path: known count, rotation, and unknown count (webm)."""
+        src = str(self.ASSETS / name)
+        expected = np.stack(list(read_frames_exact(src)))
+        assert np.array_equal(read_frames_batched(src), expected)
+
+    def test_frame_range(self):
+        src = str(self.ASSETS / "example.mp4")
+        expected = np.stack(list(read_frames_exact(src, start_frame=5, end_frame=20)))
+        result = read_frames_batched(src, start_frame=5, end_frame=20)
+        assert np.array_equal(result, expected)
+        assert result.base is None  # range hint was exact: single allocation, no compaction
+
+    def test_time_range(self):
+        src = str(self.ASSETS / "example.mp4")
+        expected = np.stack(list(read_frames_exact(src, start_time=1.0, end_time=2.0)))
+        assert np.array_equal(read_frames_batched(src, start_time=1.0, end_time=2.0), expected)
+
+    def test_range_past_end_is_compacted(self):
+        """end_frame beyond the video must not leave uninitialized rows."""
+        src = str(self.ASSETS / "example.mp4")
+        expected = np.stack(list(read_frames_exact(src, start_frame=120, end_frame=500)))
+        result = read_frames_batched(src, start_frame=120, end_frame=500)
+        assert np.array_equal(result, expected)
+
+    def test_empty_range_raises(self):
+        src = str(self.ASSETS / "example.mp4")
+        with pytest.raises(ValueError, match="no frames"):
+            read_frames_batched(src, start_frame=100_000)
+
+    def test_invalid_params_raise_before_open(self):
+        with pytest.raises(ValueError, match="Cannot mix"):
+            read_frames_batched("does-not-exist.mp4", start_frame=0, start_time=1.0)
 
 
 class TestSelectFramesByIndex:
