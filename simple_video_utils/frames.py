@@ -26,7 +26,12 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
     """
     reformatter = av.video.reformatter.VideoReformatter()
     for frame in frames:
-        array = reformatter.reformat(frame, format='rgb24').to_ndarray()
+        # swscale's default threads=0 (auto) spawns a slice job per CPU even for
+        # tiny frames, where dispatch overhead exceeds the conversion itself —
+        # measured 2x slower than single-threaded at 320x240. Output is
+        # byte-identical either way; frames from ~SD upward benefit from auto.
+        threads = 1 if frame.width * frame.height < 300_000 else 0
+        array = reformatter.reformat(frame, format='rgb24', threads=threads).to_ndarray()
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
             # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
