@@ -1,7 +1,7 @@
 import operator
 import sys
 from collections.abc import Generator, Iterable
-from itertools import islice, pairwise
+from itertools import islice
 from typing import BinaryIO
 
 import av
@@ -29,12 +29,11 @@ _ROTATION_FILTERS = {
 def _rotation_graph(template: av.VideoFrame, rotation: int) -> av.filter.Graph:
     """Build a filter graph rotating rgb24 frames shaped like ``template``."""
     graph = av.filter.Graph()
-    chain = [graph.add_buffer(template=template)]
-    for name, arg in _ROTATION_FILTERS[rotation]:
-        chain.append(graph.add(name, arg))
-    chain.append(graph.add("buffersink"))
-    for a, b in pairwise(chain):
-        a.link_to(b)
+    graph.link_nodes(
+        graph.add_buffer(template=template),
+        *(graph.add(name, arg) for name, arg in _ROTATION_FILTERS[rotation]),
+        graph.add("buffersink"),
+    )
     graph.configure()
     return graph
 
