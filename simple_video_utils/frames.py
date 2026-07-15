@@ -77,12 +77,10 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
             rgb = graph.pull()
-            # The filtered frame's linesize may be padded past width*3, making
-            # to_ndarray a non-contiguous view — consumers like MediaPipe and
-            # OpenCV reject those, so copy (no-op when already contiguous).
-            yield np.ascontiguousarray(rgb.to_ndarray())
-        else:
-            yield rgb.to_ndarray()
+        # The frame's linesize may be padded past width*3, making to_ndarray
+        # a non-contiguous view — consumers like MediaPipe and OpenCV reject
+        # those, so copy (no-op when already contiguous).
+        yield np.ascontiguousarray(rgb.to_ndarray())
 
 
 def _prepend(
