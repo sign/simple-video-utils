@@ -1,7 +1,7 @@
 import operator
 import sys
 from collections.abc import Generator, Iterable
-from itertools import islice
+from itertools import islice, pairwise
 from typing import BinaryIO
 
 import av
@@ -17,6 +17,27 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
 
+# rotation=90 maps to a counterclockwise transpose (np.rot90 k=1 equivalent),
+# matching ffmpeg autorotate pixel-exactly.
+_ROTATION_FILTERS = {
+    90: (("transpose", "cclock"),),
+    180: (("hflip", None), ("vflip", None)),
+    270: (("transpose", "clock"),),
+}
+
+
+def _rotation_graph(template: av.VideoFrame, rotation: int) -> av.filter.Graph:
+    """Build a filter graph rotating rgb24 frames shaped like ``template``."""
+    graph = av.filter.Graph()
+    chain = [graph.add_buffer(template=template)]
+    for name, arg in _ROTATION_FILTERS[rotation]:
+        chain.append(graph.add(name, arg))
+    chain.append(graph.add("buffersink"))
+    for a, b in pairwise(chain):
+        a.link_to(b)
+    graph.configure()
+    return graph
+
 
 def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
@@ -31,18 +52,34 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
     swscale conversion context is built once instead of being reallocated on
     every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
     dramatically faster full-clip decode.
+
+    Rotation runs as a libavfilter transpose/flip on the rgb24 frame — a pure
+    pixel permutation, so it stays byte-identical to np.rot90 while ffmpeg's
+    cache-blocked transpose is ~10x faster than numpy's strided copy. It is
+    applied after the rgb24 reformat, not on the decoded yuv420p frame:
+    transposing before chroma upsampling changes the interpolation and breaks
+    pixel-exactness (measured maxdiff 2-3).
     """
     reformatter = av.video.reformatter.VideoReformatter()
+    graph = None
+    graph_key = None
     for frame in frames:
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        array = reformatter.reformat(frame, format='rgb24', threads=threads).to_ndarray()
+        rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
-            # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
-            # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
-            # and OpenCV reject — copy to a contiguous array.
-            array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
-        yield array
+            key = (rotation, rgb.width, rgb.height)
+            if key != graph_key:
+                graph = _rotation_graph(rgb, rotation)
+                graph_key = key
+            graph.push(rgb)
+            rgb = graph.pull()
+            # The filtered frame's linesize may be padded past width*3, making
+            # to_ndarray a non-contiguous view — consumers like MediaPipe and
+            # OpenCV reject those, so copy (no-op when already contiguous).
+            yield np.ascontiguousarray(rgb.to_ndarray())
+        else:
+            yield rgb.to_ndarray()
 
 
 def _prepend(
