@@ -1,5 +1,6 @@
+import operator
 from collections.abc import Generator, Iterable
-from itertools import chain, islice
+from itertools import islice
 from typing import BinaryIO
 
 import av
@@ -34,6 +35,18 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
         yield array
 
 
+def _prepend(
+    first: av.VideoFrame,
+    rest: Iterable[av.VideoFrame],
+) -> Generator[av.VideoFrame, None, None]:
+    """Yield ``first`` then everything in ``rest``."""
+    yield first
+    # Unlike itertools.chain (which pins its arguments until exhaustion), drop
+    # the reference so the decoded frame is collectable once consumed.
+    del first
+    yield from rest
+
+
 def _validate_parameters(
     start_frame: int | None,
     end_frame: int | None,
@@ -57,7 +70,9 @@ def _convert_time_to_frames(
     fps: float,
 ) -> tuple[int, int | None]:
     """Convert time-based parameters to frame indices."""
-    start = int((start_time or 0.0) * fps)
+    # Clamp so a padded window (e.g. clip_start - 0.5s) degrades to "from the
+    # beginning" instead of a negative index blowing up islice downstream.
+    start = max(int((start_time or 0.0) * fps), 0)
     end = int(end_time * fps) if end_time is not None else None
 
     if end is not None and end < start:
@@ -72,14 +87,17 @@ def _normalize_frame_range(
     end_frame: int | None,
 ) -> tuple[int, int | None]:
     """Normalize frame parameters with defaults and validation."""
-    start = start_frame if start_frame is not None else 0
+    # operator.index rejects floats up front with a clear TypeError; islice
+    # would otherwise fail later, wrapped in a misleading "Failed to open video".
+    start = operator.index(start_frame) if start_frame is not None else 0
+    end = operator.index(end_frame) if end_frame is not None else None
 
-    if end_frame is not None:
-        assert end_frame >= start >= 0, "invalid frame range"
+    if end is not None:
+        assert end >= start >= 0, "invalid frame range"
     else:
         assert start >= 0, "start_frame must be non-negative"
 
-    return start, end_frame
+    return start, end
 
 
 def _seek_near(
@@ -191,14 +209,14 @@ def read_frames_exact(
         else:
             target_start, target_end = _normalize_frame_range(start_frame, end_frame)
 
-        if _seek_near(target_start, fps, stream, container):
+        did_seek = _seek_near(target_start, fps, stream, container)
+        decoded = container.decode(video=0)
+        if did_seek:
             origin = float((stream.start_time or 0) * stream.time_base)
-            frames = _select_frames_by_index(
-                container.decode(video=0), origin, fps, target_start, target_end
-            )
+            frames = _select_frames_by_index(decoded, origin, fps, target_start, target_end)
         else:
             stop = target_end + 1 if target_end is not None else None
-            frames = islice(container.decode(video=0), target_start, stop)
+            frames = islice(decoded, target_start, stop)
 
         yield from _frames_to_rgb(frames)
 
@@ -229,6 +247,13 @@ def read_frames_from_stream(
         decoded without waiting for the complete file. For formats requiring
         seeking (MP4 with moov at end), the stream must be fully available.
     """
+    # Validate before av.open: islice would reject bad values only after the
+    # container is open, leaking it past the cleanup paths below.
+    skip_frames = operator.index(skip_frames)
+    if skip_frames < 0:
+        msg = "skip_frames must be non-negative"
+        raise ValueError(msg)
+
     # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
     container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
     try:
@@ -245,12 +270,11 @@ def read_frames_from_stream(
         container.close()
         raise
 
-    # Built outside frame_generator so the closure doesn't pin the decoded
-    # first_frame (~3 MB at 1080p) for the whole read — chain releases it
-    # right after yielding.
+    # Built outside frame_generator so its closure doesn't capture (and pin)
+    # the decoded first_frame (~3 MB at 1080p) for the whole read.
     decoded = container.decode(video=0)
     if first_frame is not None:
-        decoded = chain([first_frame], decoded)
+        decoded = _prepend(first_frame, decoded)
     frames = islice(decoded, skip_frames, None)
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
