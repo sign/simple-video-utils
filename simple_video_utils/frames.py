@@ -112,16 +112,15 @@ def _seek_near(
     return True
 
 
-def _generate_frames_by_index(
-    container: av.container.InputContainer,
-    stream,
+def _select_frames_by_index(
+    frames: Iterable[av.VideoFrame],
+    origin: float,
     fps: float,
     target_start: int,
     target_end: int | None,
 ) -> Generator[av.VideoFrame, None, None]:
     """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
-    origin = float((stream.start_time or 0) * stream.time_base)
-    for frame in container.decode(video=0):
+    for frame in frames:
         if frame.time is None:
             continue
         index = round((frame.time - origin) * fps)
@@ -193,7 +192,10 @@ def read_frames_exact(
             target_start, target_end = _normalize_frame_range(start_frame, end_frame)
 
         if _seek_near(target_start, fps, stream, container):
-            frames = _generate_frames_by_index(container, stream, fps, target_start, target_end)
+            origin = float((stream.start_time or 0) * stream.time_base)
+            frames = _select_frames_by_index(
+                container.decode(video=0), origin, fps, target_start, target_end
+            )
         else:
             stop = target_end + 1 if target_end is not None else None
             frames = islice(container.decode(video=0), target_start, stop)
@@ -243,11 +245,17 @@ def read_frames_from_stream(
         container.close()
         raise
 
+    # Built outside frame_generator so the closure doesn't pin the decoded
+    # first_frame (~3 MB at 1080p) for the whole read — chain releases it
+    # right after yielding.
+    decoded = container.decode(video=0)
+    if first_frame is not None:
+        decoded = chain([first_frame], decoded)
+    frames = islice(decoded, skip_frames, None)
+
     def frame_generator() -> Generator[np.ndarray, None, None]:
-        decoded = container.decode(video=0)
-        frames = chain([first_frame], decoded) if first_frame is not None else decoded
         try:
-            yield from _frames_to_rgb(islice(frames, skip_frames, None))
+            yield from _frames_to_rgb(frames)
         finally:
             container.close()
 
