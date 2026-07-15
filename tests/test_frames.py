@@ -5,7 +5,7 @@ import av
 import numpy as np
 import pytest
 
-from simple_video_utils.frames import read_frames_exact, read_frames_from_stream
+from simple_video_utils.frames import _select_frames_by_index, read_frames_exact, read_frames_from_stream
 from simple_video_utils.metadata import video_metadata
 
 
@@ -485,6 +485,23 @@ class TestReadFramesFromStream:
                 err_msg=f"Frame {i} differs between stream and file reading",
             )
 
+    def test_read_frames_from_stream_skip_one(self, video_bytes, video_path):
+        """Skipping exactly the eagerly-decoded first frame matches file reading."""
+        stream = BytesIO(video_bytes)
+        _, frames_gen = read_frames_from_stream(stream, skip_frames=1)
+        stream_frames = list(frames_gen)
+
+        file_frames = list(read_frames_exact(video_path, 1, None))
+
+        assert len(stream_frames) == len(file_frames)
+        np.testing.assert_array_equal(stream_frames[0], file_frames[0])
+
+    def test_read_frames_from_stream_skip_past_end(self, video_bytes):
+        """Skipping more frames than the video has yields nothing, without error."""
+        stream = BytesIO(video_bytes)
+        _, frames_gen = read_frames_from_stream(stream, skip_frames=10_000)
+        assert list(frames_gen) == []
+
     def test_read_frames_from_stream_skip_frames(self, video_bytes, video_path):
         """Test skipping initial frames from stream."""
         skip = 5
@@ -533,3 +550,31 @@ class TestReadFramesFromStream:
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+
+class TestSelectFramesByIndex:
+    """Unit tests for the timestamp-based frame filter, using stub frames."""
+
+    class Frame:
+        def __init__(self, time):
+            self.time = time
+
+    def test_selects_inclusive_index_range(self):
+        frames = [self.Frame(i / 10) for i in range(10)]
+        selected = list(_select_frames_by_index(frames, origin=0.0, fps=10.0, target_start=3, target_end=5))
+        assert selected == frames[3:6]
+
+    def test_end_none_selects_to_exhaustion(self):
+        frames = [self.Frame(i / 10) for i in range(5)]
+        selected = list(_select_frames_by_index(frames, origin=0.0, fps=10.0, target_start=2, target_end=None))
+        assert selected == frames[2:]
+
+    def test_skips_frames_without_timestamp(self):
+        frames = [self.Frame(None), self.Frame(0.0), self.Frame(0.1)]
+        selected = list(_select_frames_by_index(frames, origin=0.0, fps=10.0, target_start=0, target_end=0))
+        assert selected == [frames[1]]
+
+    def test_nonzero_origin_offsets_indices(self):
+        frames = [self.Frame(5.0 + i / 10) for i in range(5)]
+        selected = list(_select_frames_by_index(frames, origin=5.0, fps=10.0, target_start=1, target_end=2))
+        assert selected == frames[1:3]
