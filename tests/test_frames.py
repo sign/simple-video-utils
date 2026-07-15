@@ -593,6 +593,3 @@ class TestSelectFramesByIndex:
         selected = list(_select_frames_by_index(frames, origin=5.0, fps=10.0, target_start=1, target_end=2))
         assert selected == frames[1:3]
 
-
-if __name__ == "__main__":
-    pytest.main([__file__])

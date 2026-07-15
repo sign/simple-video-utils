@@ -36,17 +36,13 @@ def ffprobe(url_or_path: str) -> VideoMetadata:
     v = next(s for s in info["streams"] if s.get("codec_type") == "video")
     num, den = map(int, v["avg_frame_rate"].split("/")) if "avg_frame_rate" in v else (0, 1)
     fps = num / den if den else 0.0
-    nb_frames = v.get("nb_frames", "/")
-    if not nb_frames.isdigit():
-        nb_frames = None
-    else:
-        nb_frames = int(nb_frames)
+    nb = v.get("nb_frames", "")
 
     return VideoMetadata(
         width=int(v["width"]),
         height=int(v["height"]),
         fps=fps,
-        nb_frames=nb_frames,
+        nb_frames=int(nb) if nb.isdigit() else None,
         time_base=v.get("time_base"),
     )
 
@@ -301,6 +297,3 @@ class TestRegressionAgainstFFmpeg:
                 "PyAV implementation is more accurate."
             )
 
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

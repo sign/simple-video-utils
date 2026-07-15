@@ -125,6 +125,3 @@ class TestVideoMetadata:
         assert meta.duration is not None
         assert meta.duration > 0
 
-
-if __name__ == "__main__":
-    pytest.main([__file__])

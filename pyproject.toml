@@ -39,7 +39,6 @@ select = [
     "UP", # pyupgrade
     "B", # flake8-bugbear
     "PT", # flake8-pytest-style
-    "W605", # invalid escape sequence
     "BLE", # flake8-blind-except
     "TRY", # tryceratops
 ]
@@ -47,6 +46,5 @@ select = [
 [tool.pytest.ini_options]
 addopts = "-v"
 testpaths = [
-    "simple_video_utils",
     "tests",
 ]
