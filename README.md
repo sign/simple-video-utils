@@ -25,7 +25,7 @@ from simple_video_utils.metadata import video_metadata
 
 meta = video_metadata("video.mp4")
 print(f"{meta.width}x{meta.height} @ {meta.fps} fps, {meta.duration}s")
-# Output: VideoMetadata(width=1920, height=1080, fps=30.0, nb_frames=450, duration=15.0)
+# Output: VideoMetadata(width=1920, height=1080, fps=30.0, nb_frames=450, time_base='1/15360', duration=15.0)
 ```
 
 ### Read Frames from File

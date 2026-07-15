@@ -19,6 +19,7 @@ class VideoMetadata(NamedTuple):
     height: int
     fps: float
     nb_frames: int | None
+    time_base: str | None
 
 
 @lru_cache(maxsize=8)
@@ -42,6 +43,7 @@ def ffprobe(url_or_path: str) -> VideoMetadata:
         height=int(v["height"]),
         fps=fps,
         nb_frames=int(nb) if nb.isdigit() else None,
+        time_base=v.get("time_base"),
     )
 
 
