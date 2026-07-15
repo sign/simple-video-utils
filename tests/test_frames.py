@@ -1,11 +1,12 @@
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import av
 import numpy as np
 import pytest
 
-from simple_video_utils.frames import read_frames_exact, read_frames_from_stream
+from simple_video_utils.frames import _select_frames_by_index, read_frames_exact, read_frames_from_stream
 from simple_video_utils.metadata import video_metadata
 
 
@@ -18,14 +19,32 @@ class TestReadFramesExact:
         return str(Path(__file__).parent / "assets" / "example.mp4")
 
     def test_invalid_frame_range_negative_start(self):
-        """Test that negative start frame raises AssertionError."""
-        with pytest.raises(AssertionError, match="invalid frame range"):
-            list(read_frames_exact("example.mp4", -1, 5))
+        """Test that negative start frame raises ValueError at call time."""
+        with pytest.raises(ValueError, match="start_frame must be non-negative"):
+            read_frames_exact("example.mp4", -1, 5)
 
     def test_invalid_frame_range_end_before_start(self):
-        """Test that end_frame < start_frame raises AssertionError."""
-        with pytest.raises(AssertionError, match="invalid frame range"):
-            list(read_frames_exact("example.mp4", 10, 5))
+        """Test that end_frame < start_frame raises ValueError at call time."""
+        with pytest.raises(ValueError, match="invalid frame range"):
+            read_frames_exact("example.mp4", 10, 5)
+
+    def test_invalid_time_range_raises_at_call_time(self):
+        """Inverted or fully-negative time windows fail fast, before opening."""
+        with pytest.raises(ValueError, match="invalid time range"):
+            read_frames_exact("example.mp4", start_time=3.0, end_time=1.0)
+        with pytest.raises(ValueError, match="invalid time range"):
+            read_frames_exact("example.mp4", start_time=-0.5, end_time=-0.01)
+
+    def test_float_frame_index_raises_type_error(self):
+        """Frame indices must be integers; floats fail fast, not as a container error."""
+        with pytest.raises(TypeError):
+            list(read_frames_exact("example.mp4", 2.0, 4.0))
+
+    def test_negative_start_time_clamps_to_video_start(self, video_path):
+        """A padded window reaching before 0 reads from the beginning."""
+        padded = list(read_frames_exact(video_path, start_time=-0.5, end_time=0.2))
+        from_zero = list(read_frames_exact(video_path, start_time=0.0, end_time=0.2))
+        assert len(padded) == len(from_zero) > 0
 
     def test_read_single_frame(self, video_path):
         """Test reading a single frame from example.mp4."""
@@ -485,15 +504,31 @@ class TestReadFramesFromStream:
                 err_msg=f"Frame {i} differs between stream and file reading",
             )
 
-    def test_read_frames_from_stream_skip_frames(self, video_bytes, video_path):
-        """Test skipping initial frames from stream."""
-        skip = 5
+    def test_read_frames_from_stream_skip_past_end(self, video_bytes):
+        """Skipping more frames than the video has yields nothing, without error."""
+        stream = BytesIO(video_bytes)
+        _, frames_gen = read_frames_from_stream(stream, skip_frames=10_000)
+        assert list(frames_gen) == []
 
+    def test_read_frames_from_stream_negative_skip_raises(self, video_bytes):
+        """Negative skip_frames fails fast with a clear error, before opening."""
+        with pytest.raises(ValueError, match="skip_frames must be non-negative"):
+            read_frames_from_stream(BytesIO(video_bytes), skip_frames=-1)
+
+    def test_read_frames_from_stream_huge_skip_raises(self, video_bytes):
+        """skip_frames beyond islice's bound fails fast instead of leaking the container."""
+        with pytest.raises(ValueError, match="skip_frames is too large"):
+            read_frames_from_stream(BytesIO(video_bytes), skip_frames=2**63)
+
+    # skip=1 is the boundary where the eagerly-decoded first frame is consumed
+    # by the skip instead of being yielded.
+    @pytest.mark.parametrize("skip", [1, 5])
+    def test_read_frames_from_stream_skip_frames(self, video_bytes, video_path, skip):
+        """Test skipping initial frames from stream."""
         stream = BytesIO(video_bytes)
         _, frames_gen = read_frames_from_stream(stream, skip_frames=skip)
         stream_frames = list(frames_gen)
 
-        # Compare with file-based reading starting at frame 5
         file_frames = list(read_frames_exact(video_path, skip, None))
 
         assert len(stream_frames) == len(file_frames)
@@ -529,6 +564,34 @@ class TestReadFramesFromStream:
 
         frames = list(frames_gen)
         assert len(frames) == 67  # Same as test_webm_file
+
+
+class TestSelectFramesByIndex:
+    """Unit tests for the timestamp-based frame filter, using stub frames."""
+
+    @staticmethod
+    def _frames(times):
+        return [SimpleNamespace(time=t) for t in times]
+
+    def test_selects_inclusive_index_range(self):
+        frames = self._frames(i / 10 for i in range(10))
+        selected = list(_select_frames_by_index(frames, origin=0.0, fps=10.0, target_start=3, target_end=5))
+        assert selected == frames[3:6]
+
+    def test_end_none_selects_to_exhaustion(self):
+        frames = self._frames(i / 10 for i in range(5))
+        selected = list(_select_frames_by_index(frames, origin=0.0, fps=10.0, target_start=2, target_end=None))
+        assert selected == frames[2:]
+
+    def test_skips_frames_without_timestamp(self):
+        frames = self._frames([None, 0.0, 0.1])
+        selected = list(_select_frames_by_index(frames, origin=0.0, fps=10.0, target_start=0, target_end=0))
+        assert selected == [frames[1]]
+
+    def test_nonzero_origin_offsets_indices(self):
+        frames = self._frames(5.0 + i / 10 for i in range(5))
+        selected = list(_select_frames_by_index(frames, origin=5.0, fps=10.0, target_start=1, target_end=2))
+        assert selected == frames[1:3]
 
 
 if __name__ == "__main__":
