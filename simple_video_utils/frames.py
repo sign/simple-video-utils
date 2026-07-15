@@ -9,6 +9,14 @@ import numpy as np
 
 from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
+# Below this frame size, swscale's threads=0 (auto, one slice job per CPU)
+# loses to single-threaded: dispatch overhead exceeds the conversion itself —
+# measured 2x slower at 320x240, a wash at 640x360, auto wins from ~960x540.
+# Output is byte-identical at any thread count. The crossover is
+# hardware-dependent (thread dispatch cost vs single-core throughput), so this
+# is a calibration knob, not a derived value.
+_SINGLE_THREAD_MAX_PIXELS = 300_000
+
 
 def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
@@ -26,7 +34,8 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
     """
     reformatter = av.video.reformatter.VideoReformatter()
     for frame in frames:
-        array = reformatter.reformat(frame, format='rgb24').to_ndarray()
+        threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
+        array = reformatter.reformat(frame, format='rgb24', threads=threads).to_ndarray()
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
             # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
