@@ -1,4 +1,4 @@
-from collections.abc import Generator
+from collections.abc import Generator, Iterable
 from typing import BinaryIO
 
 import av
@@ -7,53 +7,50 @@ import numpy as np
 from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
 
-def _frame_to_rgb(
-    frame: av.VideoFrame,
-    reformatter: av.video.reformatter.VideoReformatter,
-) -> np.ndarray:
+def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
-    Convert a frame to an RGB array in display orientation.
+    Convert decoded frames to RGB arrays in display orientation.
 
     PyAV decodes frames in their stored orientation and does not apply the
     container's display-matrix rotation (unlike the ffmpeg CLI, which
     autorotates). Phone-recorded videos commonly store landscape frames with
     a 90° rotation tag, so we apply it here.
 
-    A single ``reformatter`` is reused across all frames of a read so the
+    A single reformatter is reused across all frames of a read so the
     swscale conversion context is built once instead of being reallocated on
     every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
     dramatically faster full-clip decode.
     """
-    array = reformatter.reformat(frame, format='rgb24').to_ndarray()
-    rotation = frame.rotation % 360
-    if rotation and rotation % 90 == 0:
-        # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
-        # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
-        # and OpenCV reject — copy to a contiguous array.
-        array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
-    return array
+    reformatter = av.video.reformatter.VideoReformatter()
+    for frame in frames:
+        array = reformatter.reformat(frame, format='rgb24').to_ndarray()
+        rotation = frame.rotation % 360
+        if rotation and rotation % 90 == 0:
+            # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
+            # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
+            # and OpenCV reject — copy to a contiguous array.
+            array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
+        yield array
 
 
 def _generate_frames(
     container: av.container.InputContainer,
-    reformatter: av.video.reformatter.VideoReformatter,
     skip_frames: int = 0,
     max_frames: int | None = None,
-) -> Generator[np.ndarray, None, None]:
+) -> Generator[av.VideoFrame, None, None]:
     """
-    Generate RGB frames from a container's current position.
+    Generate decoded frames from a container's current position.
 
     Decodes frames from the container's current position and yields frames
     after skipping the specified number of frames.
 
     Args:
         container: Open PyAV container (may be seeked to any position).
-        reformatter: Reformatter reused for every YUV->RGB conversion in this read.
         skip_frames: Number of frames to skip from current position before yielding.
         max_frames: Maximum number of frames to yield, or None for all remaining.
 
     Yields:
-        RGB numpy arrays (H, W, 3) in display orientation for frames after skipping.
+        Decoded ``av.VideoFrame`` objects for frames after skipping.
     """
     frames_decoded = 0
     frames_yielded = 0
@@ -63,7 +60,7 @@ def _generate_frames(
             frames_decoded += 1
             continue
 
-        yield _frame_to_rgb(frame, reformatter)
+        yield frame
         frames_yielded += 1
 
         if max_frames is not None and frames_yielded >= max_frames:
@@ -154,8 +151,7 @@ def _generate_frames_by_index(
     fps: float,
     target_start: int,
     target_end: int | None,
-    reformatter: av.video.reformatter.VideoReformatter,
-) -> Generator[np.ndarray, None, None]:
+) -> Generator[av.VideoFrame, None, None]:
     """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
     origin = float((stream.start_time or 0) * stream.time_base)
     for frame in container.decode(video=0):
@@ -166,7 +162,7 @@ def _generate_frames_by_index(
             continue
         if target_end is not None and index > target_end:
             break
-        yield _frame_to_rgb(frame, reformatter)
+        yield frame
 
 
 def read_frames_exact(
@@ -229,17 +225,13 @@ def read_frames_exact(
         else:
             target_start, target_end = _normalize_frame_range(start_frame, end_frame)
 
-        # Build the swscale conversion context once and reuse it for every frame
-        # in this read (per-frame reallocation dominated PyAV decode cost).
-        reformatter = av.video.reformatter.VideoReformatter()
-
         if _seek_near(target_start, fps, stream, container):
-            yield from _generate_frames_by_index(
-                container, stream, fps, target_start, target_end, reformatter
-            )
+            frames = _generate_frames_by_index(container, stream, fps, target_start, target_end)
         else:
             frame_count = (target_end - target_start + 1) if target_end is not None else None
-            yield from _generate_frames(container, reformatter, target_start, frame_count)
+            frames = _generate_frames(container, target_start, frame_count)
+
+        yield from _frames_to_rgb(frames)
 
 
 def read_frames_from_stream(
@@ -284,19 +276,18 @@ def read_frames_from_stream(
         container.close()
         raise
 
+    def raw_frames() -> Generator[av.VideoFrame, None, None]:
+        remaining_skip = skip_frames
+        if first_frame is not None:
+            if remaining_skip == 0:
+                yield first_frame
+            else:
+                remaining_skip -= 1
+        yield from _generate_frames(container, skip_frames=remaining_skip, max_frames=None)
+
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
-            # Reuse one swscale context across the whole stream (see _frame_to_rgb).
-            reformatter = av.video.reformatter.VideoReformatter()
-            remaining_skip = skip_frames
-            if first_frame is not None:
-                if remaining_skip == 0:
-                    yield _frame_to_rgb(first_frame, reformatter)
-                else:
-                    remaining_skip -= 1
-            yield from _generate_frames(
-                container, reformatter, skip_frames=remaining_skip, max_frames=None
-            )
+            yield from _frames_to_rgb(raw_frames())
         finally:
             container.close()
 
