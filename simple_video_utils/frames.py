@@ -17,27 +17,6 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
 
-# rotation=90 maps to a counterclockwise transpose (np.rot90 k=1 equivalent),
-# matching ffmpeg autorotate pixel-exactly.
-_ROTATION_FILTERS = {
-    90: (("transpose", "cclock"),),
-    180: (("hflip", None), ("vflip", None)),
-    270: (("transpose", "clock"),),
-}
-
-
-def _rotation_graph(template: av.VideoFrame, rotation: int) -> av.filter.Graph:
-    """Build a filter graph rotating rgb24 frames shaped like ``template``."""
-    graph = av.filter.Graph()
-    graph.link_nodes(
-        graph.add_buffer(template=template),
-        *(graph.add(name, arg) for name, arg in _ROTATION_FILTERS[rotation]),
-        graph.add("buffersink"),
-    )
-    graph.configure()
-    return graph
-
-
 def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
     Convert decoded frames to RGB arrays in display orientation.
@@ -67,9 +46,21 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
         rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
+            # The graph is built once and reused for the whole read; the key
+            # only exists because stream reads can change geometry mid-stream,
+            # and pushing a differently-shaped frame into a configured graph
+            # is an error.
             key = (rotation, rgb.width, rgb.height)
             if key != graph_key:
-                graph = _rotation_graph(rgb, rotation)
+                graph = av.filter.Graph()
+                # rotation=90 → counterclockwise, matching ffmpeg autorotate
+                # (and np.rot90 k=1) pixel-exactly.
+                if rotation == 180:
+                    filters = [graph.add("hflip"), graph.add("vflip")]
+                else:
+                    filters = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
+                graph.link_nodes(graph.add_buffer(template=rgb), *filters, graph.add("buffersink"))
+                graph.configure()
                 graph_key = key
             graph.push(rgb)
             rgb = graph.pull()
