@@ -1,4 +1,5 @@
 from collections.abc import Generator, Iterable
+from itertools import chain, islice
 from typing import BinaryIO
 
 import av
@@ -32,40 +33,6 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
             array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
         yield array
 
-
-def _generate_frames(
-    container: av.container.InputContainer,
-    skip_frames: int = 0,
-    max_frames: int | None = None,
-) -> Generator[av.VideoFrame, None, None]:
-    """
-    Generate decoded frames from a container's current position.
-
-    Decodes frames from the container's current position and yields frames
-    after skipping the specified number of frames.
-
-    Args:
-        container: Open PyAV container (may be seeked to any position).
-        skip_frames: Number of frames to skip from current position before yielding.
-        max_frames: Maximum number of frames to yield, or None for all remaining.
-
-    Yields:
-        Decoded ``av.VideoFrame`` objects for frames after skipping.
-    """
-    frames_decoded = 0
-    frames_yielded = 0
-
-    for frame in container.decode(video=0):
-        if frames_decoded < skip_frames:
-            frames_decoded += 1
-            continue
-
-        yield frame
-        frames_yielded += 1
-
-        if max_frames is not None and frames_yielded >= max_frames:
-            break
-        frames_decoded += 1
 
 def _validate_parameters(
     start_frame: int | None,
@@ -228,8 +195,8 @@ def read_frames_exact(
         if _seek_near(target_start, fps, stream, container):
             frames = _generate_frames_by_index(container, stream, fps, target_start, target_end)
         else:
-            frame_count = (target_end - target_start + 1) if target_end is not None else None
-            frames = _generate_frames(container, target_start, frame_count)
+            stop = target_end + 1 if target_end is not None else None
+            frames = islice(container.decode(video=0), target_start, stop)
 
         yield from _frames_to_rgb(frames)
 
@@ -276,18 +243,11 @@ def read_frames_from_stream(
         container.close()
         raise
 
-    def raw_frames() -> Generator[av.VideoFrame, None, None]:
-        remaining_skip = skip_frames
-        if first_frame is not None:
-            if remaining_skip == 0:
-                yield first_frame
-            else:
-                remaining_skip -= 1
-        yield from _generate_frames(container, skip_frames=remaining_skip, max_frames=None)
-
     def frame_generator() -> Generator[np.ndarray, None, None]:
+        decoded = container.decode(video=0)
+        frames = chain([first_frame], decoded) if first_frame is not None else decoded
         try:
-            yield from _frames_to_rgb(raw_frames())
+            yield from _frames_to_rgb(islice(frames, skip_frames, None))
         finally:
             container.close()
 
