@@ -1,4 +1,7 @@
-from collections.abc import Generator
+import operator
+import sys
+from collections.abc import Generator, Iterable
+from itertools import islice
 from typing import BinaryIO
 
 import av
@@ -7,76 +10,51 @@ import numpy as np
 from simple_video_utils.metadata import VideoMetadata, _open_container, video_metadata_from_container
 
 
-def _frame_to_rgb(
-    frame: av.VideoFrame,
-    reformatter: av.video.reformatter.VideoReformatter,
-) -> np.ndarray:
+def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
-    Convert a frame to an RGB array in display orientation.
+    Convert decoded frames to RGB arrays in display orientation.
 
     PyAV decodes frames in their stored orientation and does not apply the
     container's display-matrix rotation (unlike the ffmpeg CLI, which
     autorotates). Phone-recorded videos commonly store landscape frames with
     a 90° rotation tag, so we apply it here.
 
-    A single ``reformatter`` is reused across all frames of a read so the
+    A single reformatter is reused across all frames of a read so the
     swscale conversion context is built once instead of being reallocated on
     every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
     dramatically faster full-clip decode.
     """
-    array = reformatter.reformat(frame, format='rgb24').to_ndarray()
-    rotation = frame.rotation % 360
-    if rotation and rotation % 90 == 0:
-        # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
-        # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
-        # and OpenCV reject — copy to a contiguous array.
-        array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
-    return array
+    reformatter = av.video.reformatter.VideoReformatter()
+    for frame in frames:
+        array = reformatter.reformat(frame, format='rgb24').to_ndarray()
+        rotation = frame.rotation % 360
+        if rotation and rotation % 90 == 0:
+            # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
+            # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
+            # and OpenCV reject — copy to a contiguous array.
+            array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
+        yield array
 
 
-def _generate_frames(
-    container: av.container.InputContainer,
-    reformatter: av.video.reformatter.VideoReformatter,
-    skip_frames: int = 0,
-    max_frames: int | None = None,
-) -> Generator[np.ndarray, None, None]:
-    """
-    Generate RGB frames from a container's current position.
+def _prepend(
+    first: av.VideoFrame,
+    rest: Iterable[av.VideoFrame],
+) -> Generator[av.VideoFrame, None, None]:
+    """Yield ``first`` then everything in ``rest``."""
+    yield first
+    # Unlike itertools.chain (which pins its arguments until exhaustion), drop
+    # the reference so the decoded frame is collectable once consumed.
+    del first
+    yield from rest
 
-    Decodes frames from the container's current position and yields frames
-    after skipping the specified number of frames.
-
-    Args:
-        container: Open PyAV container (may be seeked to any position).
-        reformatter: Reformatter reused for every YUV->RGB conversion in this read.
-        skip_frames: Number of frames to skip from current position before yielding.
-        max_frames: Maximum number of frames to yield, or None for all remaining.
-
-    Yields:
-        RGB numpy arrays (H, W, 3) in display orientation for frames after skipping.
-    """
-    frames_decoded = 0
-    frames_yielded = 0
-
-    for frame in container.decode(video=0):
-        if frames_decoded < skip_frames:
-            frames_decoded += 1
-            continue
-
-        yield _frame_to_rgb(frame, reformatter)
-        frames_yielded += 1
-
-        if max_frames is not None and frames_yielded >= max_frames:
-            break
-        frames_decoded += 1
 
 def _validate_parameters(
     start_frame: int | None,
     end_frame: int | None,
     start_time: float | None,
     end_time: float | None,
-) -> tuple[bool, bool]:
-    """Validate that time and frame parameters aren't mixed."""
+) -> bool:
+    """Validate parameter combinations; returns whether the range is time-based."""
     has_frame_params = start_frame is not None or end_frame is not None
     has_time_params = start_time is not None or end_time is not None
 
@@ -84,7 +62,13 @@ def _validate_parameters(
         msg = "Cannot mix frame-based and time-based parameters"
         raise ValueError(msg)
 
-    return has_frame_params, has_time_params
+    # fps-free time checks run here, before the container opens — errors raised
+    # inside `with _open_container` get wrapped as "Failed to open video".
+    if end_time is not None and (end_time < 0 or end_time < (start_time or 0.0)):
+        msg = "invalid time range"
+        raise ValueError(msg)
+
+    return has_time_params
 
 
 def _convert_time_to_frames(
@@ -93,14 +77,32 @@ def _convert_time_to_frames(
     fps: float,
 ) -> tuple[int, int | None]:
     """Convert time-based parameters to frame indices."""
-    start = int((start_time or 0.0) * fps)
+    # Clamp so a padded window (e.g. clip_start - 0.5s) degrades to "from the
+    # beginning" instead of a negative index blowing up islice downstream.
+    # Fully-negative ranges were already rejected by _validate_parameters.
+    start = max(int((start_time or 0.0) * fps), 0)
     end = int(end_time * fps) if end_time is not None else None
-
-    if end is not None and end < start:
-        msg = "invalid frame range"
-        raise ValueError(msg)
-
     return start, end
+
+
+def _nonnegative_index(value: int, name: str) -> int:
+    """
+    Validate an index eagerly, with a clear error.
+
+    islice would reject bad values only once a read is underway — after
+    av.open (leaking the container in read_frames_from_stream) or wrapped in
+    a misleading "Failed to open video" (in read_frames_exact). operator.index
+    keeps duck-typed integers (np.int64) working while rejecting floats.
+    """
+    index = operator.index(value)
+    if index < 0:
+        msg = f"{name} must be non-negative"
+        raise ValueError(msg)
+    # bound leaves room for islice's exclusive stop (end + 1)
+    if index > sys.maxsize - 1:
+        msg = f"{name} is too large"
+        raise ValueError(msg)
+    return index
 
 
 def _normalize_frame_range(
@@ -108,14 +110,14 @@ def _normalize_frame_range(
     end_frame: int | None,
 ) -> tuple[int, int | None]:
     """Normalize frame parameters with defaults and validation."""
-    start = start_frame if start_frame is not None else 0
+    start = _nonnegative_index(start_frame, "start_frame") if start_frame is not None else 0
+    end = _nonnegative_index(end_frame, "end_frame") if end_frame is not None else None
 
-    if end_frame is not None:
-        assert end_frame >= start >= 0, "invalid frame range"
-    else:
-        assert start >= 0, "start_frame must be non-negative"
+    if end is not None and end < start:
+        msg = "invalid frame range"
+        raise ValueError(msg)
 
-    return start, end_frame
+    return start, end
 
 
 def _seek_near(
@@ -148,17 +150,15 @@ def _seek_near(
     return True
 
 
-def _generate_frames_by_index(
-    container: av.container.InputContainer,
-    stream,
+def _select_frames_by_index(
+    frames: Iterable[av.VideoFrame],
+    origin: float,
     fps: float,
     target_start: int,
     target_end: int | None,
-    reformatter: av.video.reformatter.VideoReformatter,
-) -> Generator[np.ndarray, None, None]:
+) -> Generator[av.VideoFrame, None, None]:
     """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
-    origin = float((stream.start_time or 0) * stream.time_base)
-    for frame in container.decode(video=0):
+    for frame in frames:
         if frame.time is None:
             continue
         index = round((frame.time - origin) * fps)
@@ -166,7 +166,7 @@ def _generate_frames_by_index(
             continue
         if target_end is not None and index > target_end:
             break
-        yield _frame_to_rgb(frame, reformatter)
+        yield frame
 
 
 def read_frames_exact(
@@ -194,6 +194,13 @@ def read_frames_exact(
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3).
 
+    Raises:
+        ValueError: If frame and time parameters are mixed, or a range is
+            invalid (negative or inverted). Raised at call time, before the
+            file is opened. A negative start_time is clamped to 0 instead
+            (padded windows are common), as long as the range stays valid.
+        TypeError: If a frame index is not an integer (np.int64 is fine).
+
     Examples:
         # All frames
         frames = list(read_frames_exact("video.mp4"))
@@ -204,42 +211,39 @@ def read_frames_exact(
         # Time-based
         frames = list(read_frames_exact("video.mp4", start_time=1.5, end_time=3.0))
     """
-    # Validate parameters early (before opening file)
-    has_frame_params, has_time_params = _validate_parameters(
-        start_frame, end_frame, start_time, end_time
-    )
+    has_time_params = _validate_parameters(start_frame, end_frame, start_time, end_time)
+    if not has_time_params:
+        frame_range = _normalize_frame_range(start_frame, end_frame)
 
-    # Early validation for frame-based parameters (before opening file)
-    if has_frame_params:
-        _normalize_frame_range(start_frame, end_frame)
+    # Inner generator so validation above raises at call time, not first next().
+    def generate() -> Generator[np.ndarray, None, None]:
+        with _open_container(src) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = thread_type
 
-    with _open_container(src) as container:
-        stream = container.streams.video[0]
-        stream.thread_type = thread_type
+            # Get FPS - required for all operations
+            if not stream.average_rate:
+                msg = "Video has no FPS information"
+                raise ValueError(msg)
+            fps = float(stream.average_rate)
 
-        # Get FPS - required for all operations
-        if not stream.average_rate:
-            msg = "Video has no FPS information"
-            raise ValueError(msg)
-        fps = float(stream.average_rate)
+            if has_time_params:
+                target_start, target_end = _convert_time_to_frames(start_time, end_time, fps)
+            else:
+                target_start, target_end = frame_range
 
-        # Convert parameters to frame indices
-        if has_time_params:
-            target_start, target_end = _convert_time_to_frames(start_time, end_time, fps)
-        else:
-            target_start, target_end = _normalize_frame_range(start_frame, end_frame)
+            did_seek = _seek_near(target_start, fps, stream, container)
+            decoded = container.decode(video=0)
+            if did_seek:
+                origin = float((stream.start_time or 0) * stream.time_base)
+                frames = _select_frames_by_index(decoded, origin, fps, target_start, target_end)
+            else:
+                stop = target_end + 1 if target_end is not None else None
+                frames = islice(decoded, target_start, stop)
 
-        # Build the swscale conversion context once and reuse it for every frame
-        # in this read (per-frame reallocation dominated PyAV decode cost).
-        reformatter = av.video.reformatter.VideoReformatter()
+            yield from _frames_to_rgb(frames)
 
-        if _seek_near(target_start, fps, stream, container):
-            yield from _generate_frames_by_index(
-                container, stream, fps, target_start, target_end, reformatter
-            )
-        else:
-            frame_count = (target_end - target_start + 1) if target_end is not None else None
-            yield from _generate_frames(container, reformatter, target_start, frame_count)
+    return generate()
 
 
 def read_frames_from_stream(
@@ -263,11 +267,20 @@ def read_frames_from_stream(
         A tuple of (VideoMetadata, frame_generator).
         The generator yields np.ndarray frames in RGB format (H, W, 3).
 
+    Raises:
+        ValueError: If skip_frames is negative or too large. Raised at call
+            time, before the stream is opened.
+        TypeError: If skip_frames is not an integer (np.int64 is fine).
+
     Note:
         For streaming-friendly formats (WebM), frames are yielded as they're
         decoded without waiting for the complete file. For formats requiring
         seeking (MP4 with moov at end), the stream must be fully available.
+        The generator owns the container: if it is discarded without ever
+        being iterated, the container is closed only at garbage collection.
     """
+    skip_frames = _nonnegative_index(skip_frames, "skip_frames")
+
     # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
     container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
     try:
@@ -284,19 +297,16 @@ def read_frames_from_stream(
         container.close()
         raise
 
+    # Built outside frame_generator so its closure doesn't capture (and pin)
+    # the decoded first_frame (~3 MB at 1080p) for the whole read.
+    decoded = container.decode(video=0)
+    if first_frame is not None:
+        decoded = _prepend(first_frame, decoded)
+    frames = islice(decoded, skip_frames, None)
+
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
-            # Reuse one swscale context across the whole stream (see _frame_to_rgb).
-            reformatter = av.video.reformatter.VideoReformatter()
-            remaining_skip = skip_frames
-            if first_frame is not None:
-                if remaining_skip == 0:
-                    yield _frame_to_rgb(first_frame, reformatter)
-                else:
-                    remaining_skip -= 1
-            yield from _generate_frames(
-                container, reformatter, skip_frames=remaining_skip, max_frames=None
-            )
+            yield from _frames_to_rgb(frames)
         finally:
             container.close()
 
