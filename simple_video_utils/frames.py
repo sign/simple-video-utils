@@ -17,6 +17,25 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
 
+def _rotation_graph(template: av.VideoFrame, rotation: int) -> av.filter.Graph:
+    """
+    Build a filter graph rotating rgb24 frames shaped like ``template``.
+
+    rotation=90 maps to a counterclockwise transpose, matching ffmpeg
+    autorotate (and np.rot90 k=1) pixel-exactly. Graphs are stateful
+    (push/pull is a FIFO), so they must stay per-read — never share or
+    cache one across reads.
+    """
+    graph = av.filter.Graph()
+    if rotation == 180:
+        filters = [graph.add("hflip"), graph.add("vflip")]
+    else:
+        filters = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
+    graph.link_nodes(graph.add_buffer(template=template), *filters, graph.add("buffersink"))
+    graph.configure()
+    return graph
+
+
 def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
     Convert decoded frames to RGB arrays in display orientation.
@@ -46,21 +65,12 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
         rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
-            # The graph is built once and reused for the whole read; the key
-            # only exists because stream reads can change geometry mid-stream,
-            # and pushing a differently-shaped frame into a configured graph
-            # is an error.
+            # Built once and reused for the whole read; the key only exists
+            # because stream reads can change geometry mid-stream, and pushing
+            # a differently-shaped frame into a configured graph is an error.
             key = (rotation, rgb.width, rgb.height)
             if key != graph_key:
-                graph = av.filter.Graph()
-                # rotation=90 → counterclockwise, matching ffmpeg autorotate
-                # (and np.rot90 k=1) pixel-exactly.
-                if rotation == 180:
-                    filters = [graph.add("hflip"), graph.add("vflip")]
-                else:
-                    filters = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
-                graph.link_nodes(graph.add_buffer(template=rgb), *filters, graph.add("buffersink"))
-                graph.configure()
+                graph = _rotation_graph(rgb, rotation)
                 graph_key = key
             graph.push(rgb)
             rgb = graph.pull()
