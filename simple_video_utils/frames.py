@@ -1,6 +1,8 @@
 import operator
 import sys
 from collections.abc import Generator, Iterable
+from fractions import Fraction
+from functools import lru_cache
 from itertools import islice
 from typing import BinaryIO
 
@@ -17,6 +19,29 @@ from simple_video_utils.metadata import VideoMetadata, _open_container, video_me
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
 
+def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
+    """
+    Build a filter graph rotating rgb24 frames.
+
+    rotation=90 maps to a counterclockwise transpose, matching ffmpeg
+    autorotate (and np.rot90 k=1) pixel-exactly. Graphs are stateful
+    (push/pull is a FIFO), so cache only per-read (the lru_cache in
+    _frames_to_rgb) — a shared/module-level cache would interleave
+    frames across concurrent reads.
+    """
+    graph = av.filter.Graph()
+    if rotation == 180:
+        filters = [graph.add("hflip"), graph.add("vflip")]
+    else:
+        filters = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
+    # add_buffer without an explicit time_base is deprecated; the value only
+    # affects pts interpretation, never pixels, and we only take arrays.
+    source = graph.add_buffer(width=width, height=height, format="rgb24",
+                              time_base=time_base or Fraction(1, 1000))
+    graph.link_nodes(source, *filters, graph.add("buffersink"))
+    graph.configure()
+    return graph
+
 
 def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
     """
@@ -31,18 +56,31 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
     swscale conversion context is built once instead of being reallocated on
     every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
     dramatically faster full-clip decode.
+
+    Rotation runs as a libavfilter transpose/flip on the rgb24 frame — a pure
+    pixel permutation, so it stays byte-identical to np.rot90 while ffmpeg's
+    cache-blocked transpose is ~10x faster than numpy's strided copy. It is
+    applied after the rgb24 reformat, not on the decoded yuv420p frame:
+    transposing before chroma upsampling changes the interpolation and breaks
+    pixel-exactness (measured maxdiff 2-3).
     """
     reformatter = av.video.reformatter.VideoReformatter()
+    # One-slot cache: built on the first rotated frame, reused for the whole
+    # read, rebuilt only if stream geometry changes mid-read. Created here so
+    # each read gets its own graph (see _rotation_graph on why).
+    rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
     for frame in frames:
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        array = reformatter.reformat(frame, format='rgb24', threads=threads).to_ndarray()
+        rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
         if rotation and rotation % 90 == 0:
-            # rotation=90 with k=1 (counterclockwise) matches ffmpeg autorotate pixel-exactly.
-            # np.rot90 returns a non-contiguous view, which consumers like MediaPipe
-            # and OpenCV reject — copy to a contiguous array.
-            array = np.ascontiguousarray(np.rot90(array, k=rotation // 90))
-        yield array
+            graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
+            graph.push(rgb)
+            rgb = graph.pull()
+        # The frame's linesize may be padded past width*3, making to_ndarray
+        # a non-contiguous view — consumers like MediaPipe and OpenCV reject
+        # those, so copy (no-op when already contiguous).
+        yield np.ascontiguousarray(rgb.to_ndarray())
 
 
 def _prepend(
