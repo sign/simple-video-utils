@@ -37,9 +37,12 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int) -> b
         stream = output.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
         stream.width = stream.height = size
         stream.pix_fmt = "yuv420p"
+        # One reformatter per clip so the swscale context is built once, not
+        # per frame (same fix as _frames_to_rgb) — byte-identical output.
+        reformatter = av.video.reformatter.VideoReformatter()
         for frame in frames:
             video_frame = av.VideoFrame.from_ndarray(_center_crop_square(frame), format="rgb24")
-            output.mux(stream.encode(video_frame.reformat(width=size, height=size)))
+            output.mux(stream.encode(reformatter.reformat(video_frame, width=size, height=size)))
         output.mux(stream.encode())
     return buffer.getvalue()
 
