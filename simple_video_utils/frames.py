@@ -337,6 +337,23 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
     return np.concatenate(chunks)
 
 
+@lru_cache(maxsize=128)
+def _stream_hint(src: str) -> tuple[int, float]:
+    """
+    Frame count and fps for stack_frames' size_hint — header-only, no decode.
+
+    The hint tolerates being wrong, so the accurate-but-heavy video_metadata
+    (its rotation probe decodes a frame) would cost ~25% of a small clip's
+    read time for precision the hint doesn't need. Formats without a header
+    count (some webm) are the one case worth video_metadata's packet-count
+    pass — and the resolved answer is cached here either way.
+    """
+    with _open_container(src) as container:
+        stream = container.streams.video[0]
+        total, fps = stream.frames, float(stream.average_rate or 0)
+    return total or video_metadata(src).nb_frames or 0, fps
+
+
 def read_frames_batched(
     src: str,
     start_frame: int | None = None,
@@ -351,7 +368,7 @@ def read_frames_batched(
     ``stack_frames`` over ``read_frames_exact`` (same parameters), with the
     batch preallocated exactly: the requested range is converted to a frame
     count with the same helpers read_frames_exact uses, clamped to the
-    clip's cached metadata — 26-38% faster than stacking afterward.
+    clip's header frame count — 26-38% faster than stacking afterward.
     ``torch.from_numpy(...)`` wraps the result zero-copy; building the batch
     in torch directly measured 3x slower (per-op dispatch), so numpy is the
     fast path either way.
@@ -363,13 +380,13 @@ def read_frames_batched(
     # Created first so parameter validation raises before the metadata peek.
     frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type)
 
-    meta = video_metadata(src)
+    total, fps = _stream_hint(src)
     if start_time is not None or end_time is not None:
-        start, end = _convert_time_to_frames(start_time, end_time, meta.fps)
+        start, end = _convert_time_to_frames(start_time, end_time, fps)
     else:
         start, end = _normalize_frame_range(start_frame, end_frame)
-    if meta.nb_frames:
-        end = meta.nb_frames - 1 if end is None else min(end, meta.nb_frames - 1)
+    if total:
+        end = total - 1 if end is None else min(end, total - 1)
     hint = max(end - start + 1, 0) if end is not None else 0
     return stack_frames(frames, size_hint=hint)
 
