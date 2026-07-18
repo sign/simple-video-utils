@@ -671,3 +671,50 @@ class TestSelectFramesByIndex:
         selected = list(_select_frames_by_index(frames, origin=5.0, fps=10.0, target_start=1, target_end=2))
         assert selected == frames[1:3]
 
+
+class TestFpsSelection:
+    """The fps parameter drops frames onto a uniform grid — never duplicates."""
+
+    @pytest.fixture
+    def video_path(self):
+        return str(Path(__file__).parent / "assets" / "example.mp4")
+
+    def test_invalid_fps_raises_at_call_time(self):
+        with pytest.raises(ValueError, match="fps must be positive"):
+            read_frames_exact("does-not-exist.mp4", fps=0)
+        with pytest.raises(ValueError, match="fps must be positive"):
+            read_frames_batched("does-not-exist.mp4", fps=-1)
+        with pytest.raises(ValueError, match="fps must be positive"):
+            read_frames_from_stream(BytesIO(b""), fps=0)
+
+    def test_half_fps_roughly_halves_frame_count(self, video_path):
+        meta = video_metadata(video_path)
+        total = len(list(read_frames_exact(video_path)))
+        half = list(read_frames_exact(video_path, fps=meta.fps / 2))
+        assert abs(len(half) - total / 2) <= 1
+        assert half[0].shape == (meta.height, meta.width, 3)
+
+    def test_fps_above_source_keeps_every_frame(self, video_path):
+        meta = video_metadata(video_path)
+        total = len(list(read_frames_exact(video_path)))
+        assert len(list(read_frames_exact(video_path, fps=meta.fps * 2))) == total
+
+    def test_selected_frames_are_uniform_subset(self, video_path):
+        meta = video_metadata(video_path)
+        every_third = list(read_frames_exact(video_path, fps=meta.fps / 3))
+        all_frames = list(read_frames_exact(video_path))
+        for i, frame in enumerate(every_third):
+            np.testing.assert_array_equal(frame, all_frames[3 * i])
+
+    def test_batched_matches_exact(self, video_path):
+        meta = video_metadata(video_path)
+        exact = list(read_frames_exact(video_path, fps=meta.fps / 3))
+        batched = read_frames_batched(video_path, fps=meta.fps / 3)
+        np.testing.assert_array_equal(batched, np.stack(exact))
+
+    def test_stream_downsamples(self, video_path):
+        meta = video_metadata(video_path)
+        total = len(list(read_frames_exact(video_path)))
+        with open(video_path, "rb") as f:
+            _, gen = read_frames_from_stream(BytesIO(f.read()), fps=meta.fps / 2)
+        assert abs(len(list(gen)) - total / 2) <= 1

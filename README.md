@@ -39,6 +39,9 @@ frames = list(read_frames_exact("video.mp4", start_frame=0, end_frame=10))
 
 # Read from frame to end of video
 frames = list(read_frames_exact("video.mp4", start_frame=5, end_frame=None))
+
+# Downsample to a target frame rate (drops frames uniformly, never duplicates)
+frames = list(read_frames_exact("video.mp4", fps=15))
 ```
 
 ### Read Frames from Stream
