@@ -221,6 +221,40 @@ def _select_frames_by_index(
         yield frame
 
 
+def _select_frames_by_fps(
+    frames: Iterable[av.VideoFrame],
+    fps: float,
+) -> Generator[av.VideoFrame, None, None]:
+    """
+    Downsample to ~fps by keeping the first frame of each 1/fps bucket.
+
+    Drop-only: when fps meets or exceeds the source rate every frame passes
+    through unchanged — frames are never duplicated. Buckets are anchored at
+    the first frame's timestamp, so selection stays uniform across VFR gaps
+    and after seeks.
+    """
+    origin = None
+    last_bucket = None
+    for frame in frames:
+        # bind once: frame.time is a property doing Fraction arithmetic per access
+        time = frame.time
+        if time is None:
+            continue
+        if origin is None:
+            origin = time
+        # epsilon absorbs float error when a timestamp lands on a bucket edge
+        bucket = int((time - origin) * fps + 1e-6)
+        if bucket != last_bucket:
+            yield frame
+            last_bucket = bucket
+
+
+def _validate_fps(fps: float | None) -> None:
+    if fps is not None and fps <= 0:
+        msg = "fps must be positive"
+        raise ValueError(msg)
+
+
 def read_frames_exact(
     src: str,
     start_frame: int | None = None,
@@ -228,6 +262,7 @@ def read_frames_exact(
     start_time: float | None = None,
     end_time: float | None = None,
     thread_type: str = "AUTO",
+    fps: float | None = None,
 ) -> Generator[np.ndarray, None, None]:
     """
     Return frames as RGB np.ndarrays from specified range.
@@ -242,6 +277,9 @@ def read_frames_exact(
         start_time: Starting time in seconds. Mutually exclusive with start_frame.
         end_time: Ending time in seconds, or None for end of video.
         thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
+        fps: Target frame rate. Drops frames (roughly uniformly, by timestamp)
+            to approximate this rate; never duplicates, so a target at or
+            above the source rate returns every frame. None keeps all frames.
 
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3).
@@ -264,6 +302,7 @@ def read_frames_exact(
         frames = list(read_frames_exact("video.mp4", start_time=1.5, end_time=3.0))
     """
     has_time_params = _validate_parameters(start_frame, end_frame, start_time, end_time)
+    _validate_fps(fps)
     if not has_time_params:
         frame_range = _normalize_frame_range(start_frame, end_frame)
 
@@ -277,22 +316,25 @@ def read_frames_exact(
             if not stream.average_rate:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
-            fps = float(stream.average_rate)
+            source_fps = float(stream.average_rate)
 
             if has_time_params:
-                target_start, target_end = _convert_time_to_frames(start_time, end_time, fps)
+                target_start, target_end = _convert_time_to_frames(start_time, end_time, source_fps)
             else:
                 target_start, target_end = frame_range
 
-            did_seek = _seek_near(target_start, fps, stream, container)
+            did_seek = _seek_near(target_start, source_fps, stream, container)
             decoded = container.decode(video=0)
             if did_seek:
                 origin = float((stream.start_time or 0) * stream.time_base)
-                frames = _select_frames_by_index(decoded, origin, fps, target_start, target_end)
+                frames = _select_frames_by_index(decoded, origin, source_fps, target_start, target_end)
             else:
                 stop = target_end + 1 if target_end is not None else None
                 frames = islice(decoded, target_start, stop)
 
+            # at or above the source rate the filter is a pass-through — skip it
+            if fps is not None and fps < source_fps:
+                frames = _select_frames_by_fps(frames, fps)
             yield from _frames_to_rgb(frames)
 
     return generate()
@@ -361,6 +403,7 @@ def read_frames_batched(
     start_time: float | None = None,
     end_time: float | None = None,
     thread_type: str = "AUTO",
+    fps: float | None = None,
 ) -> np.ndarray:
     """
     Read a frame range as one batched (N, H, W, 3) RGB uint8 array.
@@ -378,16 +421,19 @@ def read_frames_batched(
             like np.stack, if the range contains no frames.
     """
     # Created first so parameter validation raises before the metadata peek.
-    frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type)
+    frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type, fps)
 
-    total, fps = _stream_hint(src)
+    total, source_fps = _stream_hint(src)
     if start_time is not None or end_time is not None:
-        start, end = _convert_time_to_frames(start_time, end_time, fps)
+        start, end = _convert_time_to_frames(start_time, end_time, source_fps)
     else:
         start, end = _normalize_frame_range(start_frame, end_frame)
     if total:
         end = total - 1 if end is None else min(end, total - 1)
     hint = max(end - start + 1, 0) if end is not None else 0
+    if hint and fps is not None and source_fps and fps < source_fps:
+        # bucket selection keeps ~one frame per 1/fps; hint tolerates the estimate
+        hint = int(hint * fps / source_fps) + 1
     return stack_frames(frames, size_hint=hint)
 
 
@@ -396,6 +442,7 @@ def read_frames_from_stream(
     skip_frames: int = 0,
     thread_type: str = "AUTO",
     buffer_size: int = 32768, # PyAV default buffer size, can be reduced for lower latency when realtime streaming
+    fps: float | None = None,
 ) -> tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
     """
     Read frames from a video stream (file-like object).
@@ -407,6 +454,9 @@ def read_frames_from_stream(
         buffer_size: Size of PyAV's internal read buffer in bytes. Smaller values
             reduce latency when streaming (frames are decoded sooner), but increase
             the number of read syscalls. Default is 32768 (PyAV default).
+        fps: Target frame rate. Drops frames (roughly uniformly, by timestamp)
+            to approximate this rate; never duplicates, so a target at or
+            above the source rate returns every frame. None keeps all frames.
 
     Returns:
         A tuple of (VideoMetadata, frame_generator).
@@ -425,6 +475,7 @@ def read_frames_from_stream(
         being iterated, the container is closed only at garbage collection.
     """
     skip_frames = _nonnegative_index(skip_frames, "skip_frames")
+    _validate_fps(fps)
 
     # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
     container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
@@ -448,6 +499,8 @@ def read_frames_from_stream(
     if first_frame is not None:
         decoded = _prepend(first_frame, decoded)
     frames = islice(decoded, skip_frames, None)
+    if fps is not None:
+        frames = _select_frames_by_fps(frames, fps)
 
     def frame_generator() -> Generator[np.ndarray, None, None]:
         try:
