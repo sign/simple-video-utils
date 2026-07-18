@@ -236,14 +236,12 @@ def _select_frames_by_fps(
     origin = None
     last_bucket = None
     for frame in frames:
-        # bind once: frame.time is a property doing Fraction arithmetic per access
-        time = frame.time
-        if time is None:
+        if frame.time is None:
             continue
         if origin is None:
-            origin = time
+            origin = frame.time
         # epsilon absorbs float error when a timestamp lands on a bucket edge
-        bucket = int((time - origin) * fps + 1e-6)
+        bucket = int((frame.time - origin) * fps + 1e-6)
         if bucket != last_bucket:
             yield frame
             last_bucket = bucket
@@ -332,8 +330,7 @@ def read_frames_exact(
                 stop = target_end + 1 if target_end is not None else None
                 frames = islice(decoded, target_start, stop)
 
-            # at or above the source rate the filter is a pass-through — skip it
-            if fps is not None and fps < source_fps:
+            if fps is not None:
                 frames = _select_frames_by_fps(frames, fps)
             yield from _frames_to_rgb(frames)
 
