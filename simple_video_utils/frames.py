@@ -463,6 +463,8 @@ def read_frames_from_stream(
         ValueError: If skip_frames is negative or too large. Raised at call
             time, before the stream is opened.
         TypeError: If skip_frames is not an integer (np.int64 is fine).
+        RuntimeError: If the stream cannot be opened as a video, same as the
+            file-path readers.
 
     Note:
         For streaming-friendly formats (WebM), frames are yielded as they're
@@ -475,7 +477,12 @@ def read_frames_from_stream(
     _validate_fps(fps)
 
     # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
-    container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
+    try:
+        container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
+    except Exception as e:
+        # same error contract as the file-path readers (_open_container)
+        msg = "Failed to open video"
+        raise RuntimeError(msg) from e
     try:
         for s in container.streams.video:
             s.thread_type = thread_type
