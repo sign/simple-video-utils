@@ -556,6 +556,30 @@ class TestReadFramesFromStream:
         assert meta_stream.height == meta_file.height
         assert meta_stream.fps == meta_file.fps
 
+    @staticmethod
+    def _short_h264_clip(num_frames: int) -> BytesIO:
+        buf = BytesIO()
+        with av.open(buf, mode="w", format="mp4") as container:
+            stream = container.add_stream("libx264", rate=60)
+            stream.width = stream.height = 256
+            stream.pix_fmt = "yuv420p"
+            for i in range(num_frames):
+                img = np.full((256, 256, 3), i * 30, dtype=np.uint8)
+                container.mux(stream.encode(av.VideoFrame.from_ndarray(img, format="rgb24")))
+            container.mux(stream.encode())
+        buf.seek(0)
+        return buf
+
+    # Frame-threaded H.264 decoding ("AUTO") delays output by several frames;
+    # starting a second decode() generator after the eager first-frame read
+    # raised EOFError on clips shorter than that delay (issue #18).
+    @pytest.mark.parametrize("fps", [None, 15])
+    def test_read_frames_from_stream_short_h264_clip(self, fps):
+        """Short H.264 clips must decode fully with the default thread_type."""
+        _, frames_gen = read_frames_from_stream(self._short_h264_clip(8), fps=fps)
+        expected = 2 if fps else 8
+        assert len(list(frames_gen)) == expected
+
     def test_read_frames_from_stream_webm(self):
         """Test reading frames from a WebM stream."""
         video_path = Path(__file__).parent / "assets" / "example.webm"

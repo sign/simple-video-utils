@@ -482,8 +482,12 @@ def read_frames_from_stream(
 
         # The display-matrix rotation is only exposed per-frame, and the stream may
         # not be seekable (e.g. a pipe) — so decode the first frame eagerly for the
-        # metadata and hand it back through the generator.
-        first_frame = next(container.decode(video=0), None)
+        # metadata and hand it back through the generator. The same generator must
+        # be reused for the remaining frames: a fresh decode() after the eager read
+        # hits a flushed frame-threaded decoder and raises EOFError on clips
+        # shorter than the decoder delay (issue #18).
+        decoded = container.decode(video=0)
+        first_frame = next(decoded, None)
         rotation = first_frame.rotation if first_frame is not None else 0
         meta = video_metadata_from_container(container, rotation=rotation)
     except Exception:
@@ -492,7 +496,6 @@ def read_frames_from_stream(
 
     # Built outside frame_generator so its closure doesn't capture (and pin)
     # the decoded first_frame (~3 MB at 1080p) for the whole read.
-    decoded = container.decode(video=0)
     if first_frame is not None:
         decoded = _prepend(first_frame, decoded)
     frames = islice(decoded, skip_frames, None)
