@@ -101,6 +101,12 @@ def slice_video(
     source that is already that size (and unrotated) is stream-copied instead.
     Every slice must be within the video (``0 <= start <= end <= duration``);
     an out-of-range or empty slice raises ``ValueError``.
+
+    Stream-copied clips keep the lead-in from the keyframe before ``start``
+    and a few trailing frames past ``end``; an edit list hides them, so
+    players are unaffected, but readers that enumerate raw decoded frames —
+    including ``read_frames_exact`` and ``read_frames_from_stream`` — see
+    them. Pass ``size`` to force re-encoding when exact frames matter.
     """
     meta = video_metadata(src)
     should_copy = size is None or (meta.width == meta.height == size and meta.rotation == 0)

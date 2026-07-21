@@ -516,6 +516,11 @@ class TestReadFramesFromStream:
         _, frames_gen = read_frames_from_stream(stream, skip_frames=10_000)
         assert list(frames_gen) == []
 
+    def test_read_frames_from_stream_invalid_data_raises_runtime_error(self):
+        """Undecodable input fails with the same error contract as the file-path readers."""
+        with pytest.raises(RuntimeError, match="Failed to open video"):
+            read_frames_from_stream(BytesIO(b"not a video"))
+
     def test_read_frames_from_stream_negative_skip_raises(self, video_bytes):
         """Negative skip_frames fails fast with a clear error, before opening."""
         with pytest.raises(ValueError, match="skip_frames must be non-negative"):
@@ -573,11 +578,15 @@ class TestReadFramesFromStream:
     # Frame-threaded H.264 decoding ("AUTO") delays output by several frames;
     # starting a second decode() generator after the eager first-frame read
     # raised EOFError on clips shorter than that delay (issue #18).
-    @pytest.mark.parametrize("fps", [None, 15])
-    def test_read_frames_from_stream_short_h264_clip(self, fps):
+    @pytest.mark.parametrize(("num_frames", "fps", "expected"), [
+        (8, None, 8),
+        (8, 15, 2),
+        (1, None, 1),
+        (1, 15, 1),
+    ])
+    def test_read_frames_from_stream_short_h264_clip(self, num_frames, fps, expected):
         """Short H.264 clips must decode fully with the default thread_type."""
-        _, frames_gen = read_frames_from_stream(self._short_h264_clip(8), fps=fps)
-        expected = 2 if fps else 8
+        _, frames_gen = read_frames_from_stream(self._short_h264_clip(num_frames), fps=fps)
         assert len(list(frames_gen)) == expected
 
     def test_read_frames_from_stream_webm(self):

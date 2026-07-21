@@ -16,22 +16,29 @@ class VideoMetadata(NamedTuple):
     rotation: int = 0  # display-matrix rotation in degrees; width/height already account for it
 
 
-@contextmanager
-def _open_container(source: str | io.BytesIO):
-    """Context manager for safely opening and closing PyAV containers."""
-    container = None
+def _open_video(source: str | io.BytesIO, **av_kwargs) -> av.container.InputContainer:
+    """Open a container, wrapping failures as RuntimeError('Failed to open video')."""
     try:
         # metadata_errors='replace': some files carry non-UTF-8 stream metadata
         # (e.g. handler_name in stray mp4s data tracks), which would otherwise
         # raise UnicodeDecodeError before the video stream is even reachable.
-        container = av.open(source, metadata_errors="replace")
+        return av.open(source, metadata_errors="replace", **av_kwargs)
+    except Exception as e:
+        msg = "Failed to open video"
+        raise RuntimeError(msg) from e
+
+
+@contextmanager
+def _open_container(source: str | io.BytesIO):
+    """Context manager for safely opening and closing PyAV containers."""
+    container = _open_video(source)
+    try:
         yield container
     except Exception as e:
         msg = "Failed to open video"
         raise RuntimeError(msg) from e
     finally:
-        if container:
-            container.close()
+        container.close()
 
 
 def _count_video_packets(container: av.container.InputContainer) -> int | None:
