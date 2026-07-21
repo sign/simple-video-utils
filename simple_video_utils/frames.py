@@ -12,6 +12,7 @@ import numpy as np
 from simple_video_utils.metadata import (
     VideoMetadata,
     _open_container,
+    _open_video,
     video_metadata,
     video_metadata_from_container,
 )
@@ -476,13 +477,9 @@ def read_frames_from_stream(
     skip_frames = _nonnegative_index(skip_frames, "skip_frames")
     _validate_fps(fps)
 
-    # metadata_errors='replace' tolerates non-UTF-8 stream metadata (see _open_container)
-    try:
-        container = av.open(stream, mode='r', buffer_size=buffer_size, metadata_errors="replace")
-    except Exception as e:
-        # same error contract as the file-path readers (_open_container)
-        msg = "Failed to open video"
-        raise RuntimeError(msg) from e
+    # Not _open_container: the returned generator owns the container, so it
+    # must stay open after this function returns.
+    container = _open_video(stream, buffer_size=buffer_size)
     try:
         for s in container.streams.video:
             s.thread_type = thread_type
