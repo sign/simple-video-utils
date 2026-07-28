@@ -1,3 +1,4 @@
+import hashlib
 import io
 from pathlib import Path
 
@@ -82,6 +83,17 @@ def test_copy_keeps_trailing_frames():
     with av.open(io.BytesIO(clip)) as container:
         clip_count = sum(1 for _ in container.decode(video=0))
     assert clip_count >= 21  # frames 0..20 cover [0, 0.68] at 30 fps
+
+
+@pytest.mark.parametrize("size", [None, 256])
+def test_slicing_is_reproducible(video, size):
+    # Both paths must be byte-stable: no wall-clock timestamp, encoder state, or
+    # container metadata may leak into the output across repeated runs.
+    digests = {
+        hashlib.md5(b"".join(slice_video(video, [(0.0, 0.3), (0.5, 0.8)], size=size))).hexdigest()
+        for _ in range(3)
+    }
+    assert len(digests) == 1
 
 
 def test_out_of_range_slice_raises(video):
