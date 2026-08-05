@@ -92,6 +92,17 @@ class TestVideoMetadata:
         meta = video_metadata(video)
         assert meta.nb_frames == count_frames(video)
 
+    def test_mpeg4_part2_video(self):
+        """Test metadata extraction from an MPEG-4 part 2 (mp4v) encoded video."""
+        video = str(Path(__file__).parent / "assets" / "mpeg4.mp4")
+
+        meta = video_metadata(video)
+        assert meta.width == 608
+        assert meta.height == 342
+        assert meta.fps == 25.0
+        assert meta.nb_frames == 236
+        assert meta.duration == pytest.approx(9.44)
+
     def test_invalid_utf8_metadata_video(self):
         """Test a video whose stray data streams carry non-UTF-8 handler_name metadata."""
         video = str(Path(__file__).parent / "assets" / "invalid_utf8_metadata.mp4")

@@ -445,6 +445,18 @@ class TestReadFramesExact:
         with pytest.raises(RuntimeError, match="Failed to open video"):
             list(read_frames_exact(empty))
 
+    def test_mpeg4_part2_video(self):
+        """Test frame extraction from an MPEG-4 part 2 (mp4v) encoded video."""
+        video = str(Path(__file__).parent / "assets" / "mpeg4.mp4")
+
+        frames = list(read_frames_exact(video, 0, 19))
+        assert len(frames) == 20
+        for frame in frames:
+            assert frame.shape == (342, 608, 3)
+            assert frame.dtype == np.uint8
+        # the video fades in from black; frame 14 is the first with content
+        assert frames[14].sum() > 0
+
     def test_corrupted_video_full_read_never_leaks_av_errors(self):
         """Corrupted data either raises our RuntimeError or decodes gracefully.
 
