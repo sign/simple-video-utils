@@ -1,8 +1,10 @@
+import io
 from pathlib import Path
 
+import av
 import pytest
 
-from simple_video_utils.metadata import count_frames, video_metadata, video_metadata_from_bytes
+from simple_video_utils.metadata import count_frames, keyframe_indices, video_metadata, video_metadata_from_bytes
 
 
 class TestVideoMetadata:
@@ -135,4 +137,31 @@ class TestVideoMetadata:
         assert meta.fps > 0
         assert meta.duration is not None
         assert meta.duration > 0
+
+
+class TestKeyframeIndices:
+    """Tests for keyframe_indices (the GOP structure)."""
+
+    @pytest.mark.parametrize("asset", ["example.mp4", "example-short.mp4", "mpeg4.mp4", "example.webm"])
+    def test_matches_decoded_ground_truth(self, asset):
+        """The demux-only indices must equal what a full decode reports: the
+        presentation-order positions whose frame is a keyframe."""
+        path = str(Path(__file__).parent / "assets" / asset)
+        with av.open(path) as container:
+            truth = [i for i, frame in enumerate(container.decode(video=0)) if frame.key_frame]
+
+        indices = keyframe_indices(path)
+        assert indices == truth
+        assert indices[0] == 0  # the first frame anchors the first GOP
+
+    def test_from_bytes_matches_file(self):
+        """BytesIO input (e.g. an uploaded file) yields the same indices."""
+        path = Path(__file__).parent / "assets" / "example.mp4"
+        assert keyframe_indices(io.BytesIO(path.read_bytes())) == keyframe_indices(str(path))
+
+    def test_no_video_stream_raises(self):
+        """A container without a video stream must raise, same as metadata."""
+        empty = str(Path(__file__).parent / "assets" / "empty.mp4")
+        with pytest.raises(RuntimeError, match="Failed to open video"):
+            keyframe_indices(empty)
 

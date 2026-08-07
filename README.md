@@ -28,6 +28,16 @@ print(f"{meta.width}x{meta.height} @ {meta.fps} fps, {meta.duration}s")
 # Output: VideoMetadata(width=1920, height=1080, fps=30.0, nb_frames=450, time_base='1/15360', duration=15.0)
 ```
 
+### Keyframe Indices (GOP Structure)
+
+```python
+from simple_video_utils.metadata import keyframe_indices
+
+keys = keyframe_indices("video.mp4")
+# Presentation-order frame indices of the keyframes, e.g. [0, 250, 500]
+# Demux-only (no decoding) — cheap even for long videos.
+```
+
 ### Read Frames from File
 
 ```python
