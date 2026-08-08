@@ -71,6 +71,12 @@ with open_video("video.mp4") as video:
 Every helper rewinds the container before reading, so call order doesn't
 matter. Requires seekable input; consume one frame read at a time.
 
+`open_video` sets the container's decode `thread_type` up front (default
+`"AUTO"`) — PyAV forbids changing it once a stream's codec is open, which
+happens on first metadata probe or frame read. Pass `thread_type="NONE"` if
+you fork worker processes around decoding (e.g. a DataLoader): an inherited
+AUTO-threaded decoder can deadlock post-fork.
+
 ### Read Frames from Stream
 
 ```python

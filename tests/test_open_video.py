@@ -92,3 +92,20 @@ class TestOpenVideo:
         with open_video(video_path) as video:
             video_metadata_from_container(video)     # opens the codec
             assert video.streams.video[0].thread_type.name == "AUTO"
+
+    def test_thread_type_none_survives_the_metadata_probe(self, video_path):
+        """A caller that forks worker processes around decoding (e.g. a
+        DataLoader) needs unthreaded decode to stay unthreaded even after a
+        metadata call opens the codec — same guarantee as the AUTO default,
+        for the opposite policy."""
+        with open_video(video_path, thread_type="NONE") as video:
+            video_metadata_from_container(video)     # opens the codec
+            assert video.streams.video[0].thread_type.name == "NONE"
+            frames = list(read_frames_exact(video, start_frame=0, end_frame=3))
+        expected = list(read_frames_exact(video_path, start_frame=0, end_frame=3, thread_type="NONE"))
+        assert all(np.array_equal(a, b) for a, b in zip(frames, expected, strict=True))
+
+    def test_thread_type_defaults_to_auto(self, video_path):
+        """Omitting thread_type keeps the pre-existing threaded-decode default."""
+        with open_video(video_path) as video:
+            assert video.streams.video[0].thread_type.name == "AUTO"
