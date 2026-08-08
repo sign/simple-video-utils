@@ -54,6 +54,23 @@ frames = list(read_frames_exact("video.mp4", start_frame=5, end_frame=None))
 frames = list(read_frames_exact("video.mp4", fps=15))
 ```
 
+### One Open, Many Reads
+
+```python
+from simple_video_utils.metadata import open_video, video_metadata_from_container, keyframe_indices
+from simple_video_utils.frames import read_frames_exact
+
+# Metadata + windowed frame reads from a single container open —
+# e.g. sampling indices from metadata, then decoding just that window.
+with open_video("video.mp4") as video:
+    meta = video_metadata_from_container(video)
+    keys = keyframe_indices(video)
+    frames = list(read_frames_exact(video, start_frame=10, end_frame=20))
+```
+
+Every helper rewinds the container before reading, so call order doesn't
+matter. Requires seekable input; consume one frame read at a time.
+
 ### Read Frames from Stream
 
 ```python

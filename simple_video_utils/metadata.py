@@ -29,14 +29,52 @@ def _open_video(source: str | io.BytesIO, **av_kwargs) -> av.container.InputCont
 
 
 @contextmanager
-def _open_container(source: str | io.BytesIO):
-    """Context manager for safely opening and closing PyAV containers."""
-    container = _open_video(source)
+def _open_container(source: str | io.BytesIO | av.container.InputContainer):
+    """
+    Context manager yielding an open PyAV container.
+
+    Paths and streams are opened here and closed on exit. An already-open
+    container (see open_video) is passed through instead: it is rewound so
+    every call reads from frame 0 regardless of what ran before, and left
+    open for its owner to close — so reuse requires seekable input.
+    """
+    reused = isinstance(source, av.container.InputContainer)
+    container = source if reused else _open_video(source)
     try:
+        if reused:
+            container.seek(0)
         yield container
     except Exception as e:
         msg = "Failed to open video"
         raise RuntimeError(msg) from e
+    finally:
+        if not reused:
+            container.close()
+
+
+@contextmanager
+def open_video(source: str | io.BytesIO):
+    """
+    Open a video once and reuse the container across helper calls.
+
+    The source-accepting helpers — video_metadata_from_container,
+    count_frames, keyframe_indices, and the frames module's
+    read_frames_exact / read_frames_batched — all accept the yielded
+    container, so metadata and frame reads share a single av.open instead
+    of paying one container open per call (issue #8).
+
+    Each helper rewinds the container before reading, so call order doesn't
+    matter — but the source must be seekable, and frame generators must be
+    consumed one at a time (they share the container's decode position).
+
+    Example:
+        with open_video("video.mp4") as video:
+            meta = video_metadata_from_container(video)
+            frames = list(read_frames_exact(video, start_frame=0, end_frame=10))
+    """
+    container = _open_video(source)
+    try:
+        yield container
     finally:
         container.close()
 
@@ -138,6 +176,12 @@ def video_metadata_from_container(
             decoded frame). When None, it is probed by decoding the first
             frame and rewinding — pass it explicitly for non-seekable input.
     """
+    # rotation is None ⇒ seekable (same contract as rotation probing below):
+    # rewind so a container reused via open_video reads from frame 0 even if
+    # a previous frame read left it mid-stream (packet counting would
+    # otherwise undercount).
+    if rotation is None:
+        container.seek(0)
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate else 0.0
     time_base = str(stream.time_base) if stream.time_base else None
@@ -179,7 +223,7 @@ def video_metadata_from_container(
 
 
 
-def count_frames(source: str | io.BytesIO) -> int:
+def count_frames(source: str | io.BytesIO | av.container.InputContainer) -> int:
     """
     Ground-truth frame count by decoding the entire video stream.
 
@@ -195,7 +239,7 @@ def count_frames(source: str | io.BytesIO) -> int:
         return count
 
 
-def keyframe_indices(source: str | io.BytesIO) -> list[int]:
+def keyframe_indices(source: str | io.BytesIO | av.container.InputContainer) -> list[int]:
     """
     Presentation-order frame indices of the keyframes (the GOP anchors).
 
