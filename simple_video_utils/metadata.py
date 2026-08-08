@@ -53,7 +53,7 @@ def _open_container(source: str | io.BytesIO | av.container.InputContainer):
 
 
 @contextmanager
-def open_video(source: str | io.BytesIO):
+def open_video(source: str | io.BytesIO, thread_type: str = "AUTO"):
     """
     Open a video once and reuse the container across helper calls.
 
@@ -67,6 +67,20 @@ def open_video(source: str | io.BytesIO):
     matter — but the source must be seekable, and frame generators must be
     consumed one at a time (they share the container's decode position).
 
+    Args:
+        source: Path, URL, or file-like object to open.
+        thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE",
+            or "NONE"), applied up front to every video stream. Needed here,
+            not just on read_frames_exact/read_frames_batched, because PyAV
+            forbids changing thread_type once a stream's codec is open — and
+            the metadata rotation probe opens it on first use. Whatever this
+            call sets is what the container decodes with for its whole
+            lifetime; a thread_type passed to a later read call on the same
+            container has no effect once the codec is already open. Callers
+            that fork worker processes around decoding (e.g. a DataLoader)
+            should pass "NONE" — an inherited AUTO-threaded decoder can
+            deadlock post-fork.
+
     Example:
         with open_video("video.mp4") as video:
             meta = video_metadata_from_container(video)
@@ -77,9 +91,10 @@ def open_video(source: str | io.BytesIO):
         # PyAV forbids changing thread_type once the codec opens, and the
         # metadata rotation probe opens it — set the decode threading policy
         # NOW or the container is locked into unthreaded decode for its whole
-        # lifetime (measured ~1.2x slower window reads on 256px h264).
+        # lifetime (measured ~1.2x slower window reads on 256px h264 at the
+        # AUTO default).
         for stream in container.streams.video:
-            stream.thread_type = "AUTO"
+            stream.thread_type = thread_type
         yield container
     finally:
         container.close()
