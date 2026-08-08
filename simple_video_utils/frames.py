@@ -255,7 +255,7 @@ def _validate_fps(fps: float | None) -> None:
 
 
 def read_frames_exact(
-    src: str,
+    src: str | av.container.InputContainer,
     start_frame: int | None = None,
     end_frame: int | None = None,
     start_time: float | None = None,
@@ -270,7 +270,8 @@ def read_frames_exact(
     Uses PyAV for efficient frame extraction.
 
     Args:
-        src: Path to video file or URL.
+        src: Path to video file, URL, or an open container (see
+            metadata.open_video) to reuse across metadata and frame reads.
         start_frame: Starting frame index (0-based). Mutually exclusive with start_time.
         end_frame: Ending frame index (inclusive), or None for end of video.
         start_time: Starting time in seconds. Mutually exclusive with start_frame.
@@ -309,7 +310,11 @@ def read_frames_exact(
     def generate() -> Generator[np.ndarray, None, None]:
         with _open_container(src) as container:
             stream = container.streams.video[0]
-            stream.thread_type = thread_type
+            # A reused container's codec may already be open (e.g. metadata's
+            # rotation probe decoded a frame) and PyAV forbids changing
+            # thread_type then — the value set at first decode stays in effect.
+            if not stream.codec_context.is_open:
+                stream.thread_type = thread_type
 
             # Get FPS - required for all operations
             if not stream.average_rate:
@@ -378,7 +383,7 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
 
 
 @lru_cache(maxsize=128)
-def _stream_hint(src: str) -> tuple[int, float]:
+def _stream_hint_cached(src: str) -> tuple[int, float]:
     """
     Frame count and fps for stack_frames' size_hint — header-only, no decode.
 
@@ -394,8 +399,18 @@ def _stream_hint(src: str) -> tuple[int, float]:
     return total or video_metadata(src).nb_frames or 0, fps
 
 
+def _stream_hint(src: str | av.container.InputContainer) -> tuple[int, float]:
+    if isinstance(src, str):
+        return _stream_hint_cached(src)
+    # Open containers read the header directly, uncached — caching keyed on a
+    # container would pin it and serve stale answers after it's closed.
+    stream = src.streams.video[0]
+    total, fps = stream.frames, float(stream.average_rate or 0)
+    return total or video_metadata_from_container(src).nb_frames or 0, fps
+
+
 def read_frames_batched(
-    src: str,
+    src: str | av.container.InputContainer,
     start_frame: int | None = None,
     end_frame: int | None = None,
     start_time: float | None = None,
