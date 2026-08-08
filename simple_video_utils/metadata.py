@@ -74,6 +74,12 @@ def open_video(source: str | io.BytesIO):
     """
     container = _open_video(source)
     try:
+        # PyAV forbids changing thread_type once the codec opens, and the
+        # metadata rotation probe opens it — set the decode threading policy
+        # NOW or the container is locked into unthreaded decode for its whole
+        # lifetime (measured ~1.2x slower window reads on 256px h264).
+        for stream in container.streams.video:
+            stream.thread_type = "AUTO"
         yield container
     finally:
         container.close()

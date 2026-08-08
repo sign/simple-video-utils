@@ -83,3 +83,12 @@ class TestOpenVideo:
     def test_open_failure(self):
         with pytest.raises(RuntimeError, match="Failed to open video"), open_video(str(ASSETS / "missing.mp4")):
             pass
+
+    def test_threaded_decode_survives_the_metadata_probe(self, video_path):
+        """PyAV forbids changing thread_type once the codec opens, and the
+        rotation probe opens it — open_video must set the threading policy
+        first, or every later frame read decodes unthreaded (measured ~1.2x
+        slower window reads)."""
+        with open_video(video_path) as video:
+            video_metadata_from_container(video)     # opens the codec
+            assert video.streams.video[0].thread_type.name == "AUTO"
