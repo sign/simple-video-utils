@@ -210,16 +210,23 @@ def _select_frames_by_index(
     target_start: int,
     target_end: int | None,
 ) -> Generator[av.VideoFrame, None, None]:
-    """Yield frames whose timestamp-derived index falls in [target_start, target_end]."""
-    for frame in frames:
-        if frame.time is None:
-            continue
-        index = round((frame.time - origin) * fps)
-        if index < target_start:
-            continue
-        if target_end is not None and index > target_end:
+    """
+    Yield the frames at indices [target_start, target_end] after a seek.
+
+    Only the *first* frame is located via its timestamp-derived index; the
+    rest are counted from it, like the non-seeked islice path. Re-deriving
+    the index per frame from average_rate drifts against the true cadence
+    when the header rate is slightly off, over- or under-delivering by a
+    frame every 1/|fps_true - average_rate| seconds (issue #26).
+    """
+    iterator = iter(frames)
+    for first in iterator:
+        if first.time is not None and round((first.time - origin) * fps) >= target_start:
             break
-        yield frame
+    else:
+        return
+    yield first
+    yield from islice(iterator, target_end - target_start if target_end is not None else None)
 
 
 def _select_frames_by_fps(
@@ -331,7 +338,12 @@ def read_frames_exact(
             decoded = container.decode(video=0)
             if did_seek:
                 origin = float((stream.start_time or 0) * stream.time_base)
-                frames = _select_frames_by_index(decoded, origin, source_fps, target_start, target_end)
+                # guessed_rate (av_guess_frame_rate) recovers the true cadence
+                # when the header's average_rate drifts from the actual frame
+                # timestamps (issue #26) — average_rate would locate the start
+                # frame off by one past each drift point.
+                locate_fps = float(stream.guessed_rate or stream.average_rate)
+                frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
             else:
                 stop = target_end + 1 if target_end is not None else None
                 frames = islice(decoded, target_start, stop)

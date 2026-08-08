@@ -234,6 +234,26 @@ class TestReadFramesExact:
         for got, expected in zip(by_time, frames, strict=True):
             np.testing.assert_array_equal(got, expected)
 
+    def test_seek_path_exact_with_drifting_average_rate(self):
+        """A wrong header average_rate must not change a seeked read's frames.
+
+        This clip is CFR at exactly 60 fps, but its header carries
+        average_rate = 3294/55 (~59.89). Deriving every frame's index from
+        that rate drifts against the true cadence: two frames collide on one
+        index at ~4.58s and an index is skipped at ~8.3s, so seeked windows
+        spanning those points returned 50 or 48 frames for a 49-frame
+        request — and started one frame late past each drift point (issue #26).
+        """
+        video = str(Path(__file__).parent / "assets" / "vfr_dup_index.mp4")
+        all_frames = list(read_frames_exact(video))
+        assert len(all_frames) == 549
+        # 250 spans the duplicate index at ~274; 480 spans the gap at ~500
+        for start in (250, 273, 480):
+            frames = list(read_frames_exact(video, start_frame=start, end_frame=start + 48))
+            assert len(frames) == 49
+            for got, expected in zip(frames, all_frames[start : start + 49], strict=True):
+                np.testing.assert_array_equal(got, expected)
+
     def test_seek_path_with_nonzero_stream_start_time(self, video_path, tmp_path):
         """Frame indices must be measured from the stream origin, not t=0.
 
