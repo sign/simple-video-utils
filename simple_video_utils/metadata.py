@@ -195,6 +195,26 @@ def count_frames(source: str | io.BytesIO) -> int:
         return count
 
 
+def keyframe_indices(source: str | io.BytesIO) -> list[int]:
+    """
+    Presentation-order frame indices of the keyframes (the GOP anchors).
+
+    Demux-only — packets are inspected, nothing is decoded, so this is cheap
+    even for long videos. Packets arrive in decode order; when timestamps are
+    present they are re-sorted into presentation order (B-frames reorder the
+    two). Like packet-based frame counting, this trusts the container: buggy
+    files with trailing packets that never decode can shift indices near the
+    tail.
+    """
+    with _open_container(source) as container:
+        packets = [(p.pts if p.pts is not None else p.dts, p.is_keyframe)
+                   for p in container.demux(video=0) if p.size]
+    order = range(len(packets))
+    if all(ts is not None for ts, _ in packets):
+        order = sorted(order, key=lambda j: packets[j][0])
+    return [i for i, j in enumerate(order) if packets[j][1]]
+
+
 def video_metadata_from_bytes(data: bytes) -> VideoMetadata:
     """Return key video stream metadata from video bytes."""
     with _open_container(io.BytesIO(data)) as container:
