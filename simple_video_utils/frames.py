@@ -13,6 +13,7 @@ from simple_video_utils.metadata import (
     VideoMetadata,
     _open_container,
     _open_video,
+    derived_average_rate,
     video_metadata,
     video_metadata_from_container,
 )
@@ -323,11 +324,15 @@ def read_frames_exact(
             if not stream.codec_context.is_open:
                 stream.thread_type = thread_type
 
-            # Get FPS - required for all operations
-            if not stream.average_rate:
+            # Get FPS - required for all operations. Some containers
+            # (browser-recorded WebM) omit the average rate; reconstruct it
+            # from duration and frame count before giving up.
+            source_fps = float(stream.average_rate) if stream.average_rate else None
+            if source_fps is None:
+                source_fps = derived_average_rate(container, stream)
+            if not source_fps:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
-            source_fps = float(stream.average_rate)
 
             if has_time_params:
                 target_start, target_end = _convert_time_to_frames(start_time, end_time, source_fps)
@@ -342,7 +347,7 @@ def read_frames_exact(
                 # when the header's average_rate drifts from the actual frame
                 # timestamps (issue #26) — average_rate would locate the start
                 # frame off by one past each drift point.
-                locate_fps = float(stream.guessed_rate or stream.average_rate)
+                locate_fps = float(stream.guessed_rate or stream.average_rate or source_fps)
                 frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
             else:
                 stop = target_end + 1 if target_end is not None else None

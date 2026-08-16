@@ -164,6 +164,33 @@ def _best_effort_nb_frames(
     return decoded if decoded is not None else candidate
 
 
+def derived_average_rate(
+    container: av.container.InputContainer,
+    stream: av.VideoStream,
+) -> float | None:
+    """
+    Frame rate reconstructed from duration and frame count.
+
+    Browser-recorded (MediaRecorder) WebM often carries no rate hint at all —
+    no DefaultDuration, irregular cluster timestamps — so PyAV's
+    ``stream.average_rate`` comes back None (ffprobe: ``avg_frame_rate 0/0``).
+    The duration and the packets are still in the container, so the true
+    cadence is recoverable. Requires a seekable container; rewinds it.
+    """
+    if stream.duration and stream.time_base:
+        duration = float(stream.duration * stream.time_base)
+    elif container.duration:
+        duration = container.duration / av.time_base
+    else:
+        return None
+    if duration <= 0:
+        return None
+    nb_frames = stream.frames if stream.frames > 0 else _count_video_packets(container)
+    if not nb_frames:
+        return None
+    return nb_frames / duration
+
+
 def _probe_rotation(container: av.container.InputContainer) -> int:
     """
     Read the display-matrix rotation by decoding the first frame, then rewind.
@@ -222,6 +249,10 @@ def video_metadata_from_container(
 
     # rotation is None ⇒ the container is seekable (same contract as rotation probing)
     nb_frames = _best_effort_nb_frames(container, stream, fps, duration, seekable=rotation is None)
+
+    # Same recovery as derived_average_rate, from the values already in hand.
+    if not fps and nb_frames and duration:
+        fps = nb_frames / duration
 
     if rotation is None:
         rotation = _probe_rotation(container)
