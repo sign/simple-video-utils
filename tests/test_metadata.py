@@ -4,7 +4,13 @@ from pathlib import Path
 import av
 import pytest
 
-from simple_video_utils.metadata import count_frames, keyframe_indices, video_metadata, video_metadata_from_bytes
+from simple_video_utils.metadata import (
+    count_frames,
+    keyframe_indices,
+    video_metadata,
+    video_metadata_from_bytes,
+    video_metadata_from_container,
+)
 
 
 class TestVideoMetadata:
@@ -126,6 +132,16 @@ class TestVideoMetadata:
 
         with pytest.raises(RuntimeError, match="Failed to open video"):
             video_metadata(empty)
+
+    def test_non_seekable_without_known_rotation(self, video_path):
+        """seekable=False with rotation unknown: header values, rotation 0, no rewind."""
+        with av.open(video_path) as container:
+            meta = video_metadata_from_container(container, seekable=False)
+
+        header = video_metadata(video_path)
+        assert meta.rotation == 0
+        assert meta.fps == header.fps
+        assert (meta.width, meta.height) == (header.width, header.height)
 
     def test_remote_video_url(self):
         """Test metadata extraction from a remote video URL."""

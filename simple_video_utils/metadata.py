@@ -212,6 +212,7 @@ def _probe_rotation(container: av.container.InputContainer) -> int:
 def video_metadata_from_container(
     container: av.container.InputContainer,
     rotation: int | None = None,
+    seekable: bool | None = None,
 ) -> VideoMetadata:
     """
     Extract metadata from an open PyAV container.
@@ -223,13 +224,21 @@ def video_metadata_from_container(
         container: Open PyAV container.
         rotation: Display rotation in degrees if already known (e.g. from a
             decoded frame). When None, it is probed by decoding the first
-            frame and rewinding — pass it explicitly for non-seekable input.
+            frame — seekable input only; a non-seekable container with no
+            known rotation reports 0.
+        seekable: Whether the container can rewind. Rewinding is what the
+            rotation probe, the frame-count cross-check, and the
+            missing-rate recovery need; when False the header values are
+            trusted as-is. Defaults to ``rotation is None`` — the historical
+            contract where passing a known rotation implied non-seekable
+            input.
     """
-    # rotation is None ⇒ seekable (same contract as rotation probing below):
-    # rewind so a container reused via open_video reads from frame 0 even if
-    # a previous frame read left it mid-stream (packet counting would
-    # otherwise undercount).
-    if rotation is None:
+    if seekable is None:
+        seekable = rotation is None
+    if seekable:
+        # rewind so a container reused via open_video reads from frame 0 even
+        # if a previous frame read left it mid-stream (packet counting would
+        # otherwise undercount).
         container.seek(0)
     stream = container.streams.video[0]
     fps = float(stream.average_rate) if stream.average_rate else 0.0
@@ -248,19 +257,18 @@ def video_metadata_from_container(
     else:
         duration = None
 
-    # rotation is None ⇒ the container is seekable (same contract as rotation probing)
     nb_frames = None
-    if not fps and rotation is None:
+    if not fps and seekable:
         # Recover the missing rate before _best_effort_nb_frames: deriving it
         # from the packet count afterward would make the issue-#4 cross-check
         # (round(duration × fps) vs count) circular — true by construction.
         derived_fps, nb_frames = _decoded_rate_and_count(container)
         fps = derived_fps or 0.0
     if nb_frames is None:
-        nb_frames = _best_effort_nb_frames(container, stream, fps, duration, seekable=rotation is None)
+        nb_frames = _best_effort_nb_frames(container, stream, fps, duration, seekable=seekable)
 
     if rotation is None:
-        rotation = _probe_rotation(container)
+        rotation = _probe_rotation(container) if seekable else 0
     rotation %= 360
 
     width, height = stream.width, stream.height

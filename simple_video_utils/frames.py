@@ -437,7 +437,8 @@ def _count_and_rate(src: str | av.container.InputContainer) -> tuple[int, float]
     # container would pin it and serve stale answers after it's closed.
     stream = src.streams.video[0]
     total, fps = stream.frames, float(stream.average_rate or 0)
-    return _fill_from_metadata(total, fps, lambda: video_metadata_from_container(src))
+    # open_video's contract already requires seekable input for reuse
+    return _fill_from_metadata(total, fps, lambda: video_metadata_from_container(src, seekable=True))
 
 
 def read_frames_batched(
@@ -544,7 +545,7 @@ def read_frames_from_stream(
             # needs rewinds a pipe can't do, and rewinds back to frame 0
             # when done. Gated on average_rate so normal streams don't pay
             # the recovery's extra passes.
-            meta = video_metadata_from_container(container)
+            meta = video_metadata_from_container(container, seekable=True)
             first_frame = None
             decoded = container.decode(video=0)
         else:
@@ -557,7 +558,7 @@ def read_frames_from_stream(
             decoded = container.decode(video=0)
             first_frame = next(decoded, None)
             rotation = first_frame.rotation if first_frame is not None else 0
-            meta = video_metadata_from_container(container, rotation=rotation)
+            meta = video_metadata_from_container(container, rotation=rotation, seekable=False)
     except Exception:
         container.close()
         raise
