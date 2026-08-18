@@ -324,15 +324,13 @@ def read_frames_exact(
                 stream.thread_type = thread_type
 
             # Get FPS - required for all operations. Some containers
-            # (browser-recorded WebM) omit the average rate; the metadata
-            # layer recovers the true cadence by decoding — cached per path,
-            # so repeated reads (e.g. slice_video's per-range calls) pay once.
+            # (browser-recorded WebM) omit the average rate; _stream_hint
+            # recovers the true cadence through the metadata layer — cached
+            # per path, so repeated reads (e.g. slice_video's per-range
+            # calls) pay the decode-derived rate once.
             # ponytail: a reused open_video container re-derives per call;
             # cache per container if no-rate files show up in that path.
-            source_fps = float(stream.average_rate) if stream.average_rate else None
-            if source_fps is None:
-                meta = video_metadata(src) if isinstance(src, str) else video_metadata_from_container(container)
-                source_fps = meta.fps or None
+            source_fps = float(stream.average_rate or 0) or _stream_hint(src)[1]
             if not source_fps:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
@@ -353,7 +351,7 @@ def read_frames_exact(
                 # average_rate at all, guessed_rate is garbage (the time_base
                 # reciprocal — 1000 on Matroska), so only the derived rate can
                 # locate frames.
-                locate_fps = float(stream.guessed_rate or stream.average_rate) if stream.average_rate else source_fps
+                locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
                 frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
             else:
                 stop = target_end + 1 if target_end is not None else None
@@ -419,8 +417,13 @@ def _stream_hint_cached(src: str) -> tuple[int, float]:
     with _open_container(src) as container:
         stream = container.streams.video[0]
         total, fps = stream.frames, float(stream.average_rate or 0)
+    return _resolve_hint(total, fps, lambda: video_metadata(src))
+
+
+def _resolve_hint(total: int, fps: float, get_meta) -> tuple[int, float]:
+    """Fill whatever the header didn't carry from the metadata layer."""
     if not total or not fps:
-        meta = video_metadata(src)
+        meta = get_meta()
         total, fps = total or meta.nb_frames or 0, fps or meta.fps
     return total, fps
 
@@ -432,10 +435,7 @@ def _stream_hint(src: str | av.container.InputContainer) -> tuple[int, float]:
     # container would pin it and serve stale answers after it's closed.
     stream = src.streams.video[0]
     total, fps = stream.frames, float(stream.average_rate or 0)
-    if not total or not fps:
-        meta = video_metadata_from_container(src)
-        total, fps = total or meta.nb_frames or 0, fps or meta.fps
-    return total, fps
+    return _resolve_hint(total, fps, lambda: video_metadata_from_container(src))
 
 
 def read_frames_batched(
@@ -530,11 +530,12 @@ def read_frames_from_stream(
         for s in container.streams.video:
             s.thread_type = thread_type
 
-        if seekable:
-            # A seekable stream (uploaded blob, BytesIO) gets the same
-            # metadata as a path — the rotation probe, the frame-count
-            # cross-check, and the missing-rate recovery all need rewinds a
-            # pipe can't do, and each rewinds back to frame 0 when done.
+        if seekable and not container.streams.video[0].average_rate:
+            # A no-rate file on a seekable stream (uploaded blob, BytesIO)
+            # gets the same metadata as a path — the missing-rate recovery
+            # needs rewinds a pipe can't do, and rewinds back to frame 0
+            # when done. Gated on average_rate so normal streams don't pay
+            # the recovery's extra passes.
             meta = video_metadata_from_container(container)
             first_frame = None
             decoded = container.decode(video=0)

@@ -117,18 +117,8 @@ def _count_video_packets(container: av.container.InputContainer) -> int | None:
 
 
 def _count_decoded_frames(container: av.container.InputContainer) -> int | None:
-    """
-    Ground-truth frame count by decoding the whole video stream, then rewind.
-
-    Slow — O(stream duration) — so only used when cheaper signals disagree.
-    Requires a seekable container; returns None if decoding fails.
-    """
-    try:
-        return sum(1 for _ in container.decode(video=0))
-    except (av.FFmpegError, OSError):
-        return None
-    finally:
-        container.seek(0)
+    """Ground-truth frame count — the count half of _decoded_rate_and_count."""
+    return _decoded_rate_and_count(container)[1]
 
 
 def _best_effort_nb_frames(
@@ -180,6 +170,8 @@ def _decoded_rate_and_count(
     the true cadence as N-1 intervals over that span. Slow — O(stream
     duration) — but these files are the rare exception, and video_metadata
     caches the result per path. Requires a seekable container; rewinds it.
+    Returns (None, None) if decoding fails; the rate alone is None when
+    fewer than two frames carry timestamps.
     """
     first = last = None
     count = 0
@@ -195,9 +187,9 @@ def _decoded_rate_and_count(
         return None, None
     finally:
         container.seek(0)
-    if count > 1 and last is not None and last > first:
+    if last is not None and last > first:
         return (count - 1) / (last - first), count
-    return None, count or None
+    return None, count
 
 
 def _probe_rotation(container: av.container.InputContainer) -> int:
