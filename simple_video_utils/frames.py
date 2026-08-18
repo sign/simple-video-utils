@@ -13,7 +13,6 @@ from simple_video_utils.metadata import (
     VideoMetadata,
     _open_container,
     _open_video,
-    derived_average_rate,
     video_metadata,
     video_metadata_from_container,
 )
@@ -325,11 +324,18 @@ def read_frames_exact(
                 stream.thread_type = thread_type
 
             # Get FPS - required for all operations. Some containers
-            # (browser-recorded WebM) omit the average rate; reconstruct it
-            # from duration and frame count before giving up.
+            # (browser-recorded WebM) omit the average rate; the metadata
+            # layer recovers the true cadence by decoding — cached per path,
+            # so repeated reads (e.g. slice_video's per-range calls) pay once.
+            # ponytail: a reused open_video container re-derives per call;
+            # cache per container if no-rate files show up in that path.
             source_fps = float(stream.average_rate) if stream.average_rate else None
             if source_fps is None:
-                source_fps = derived_average_rate(container, stream)
+                try:
+                    meta = video_metadata(src) if isinstance(src, str) else video_metadata_from_container(container)
+                    source_fps = meta.fps or None
+                except RuntimeError:
+                    source_fps = None
             if not source_fps:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
@@ -346,8 +352,11 @@ def read_frames_exact(
                 # guessed_rate (av_guess_frame_rate) recovers the true cadence
                 # when the header's average_rate drifts from the actual frame
                 # timestamps (issue #26) — average_rate would locate the start
-                # frame off by one past each drift point.
-                locate_fps = float(stream.guessed_rate or stream.average_rate or source_fps)
+                # frame off by one past each drift point. But when there is no
+                # average_rate at all, guessed_rate is garbage (the time_base
+                # reciprocal — 1000 on Matroska), so only the derived rate can
+                # locate frames.
+                locate_fps = float(stream.guessed_rate or stream.average_rate) if stream.average_rate else source_fps
                 frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
             else:
                 stop = target_end + 1 if target_end is not None else None
@@ -413,7 +422,10 @@ def _stream_hint_cached(src: str) -> tuple[int, float]:
     with _open_container(src) as container:
         stream = container.streams.video[0]
         total, fps = stream.frames, float(stream.average_rate or 0)
-    return total or video_metadata(src).nb_frames or 0, fps
+    if not total or not fps:
+        meta = video_metadata(src)
+        total, fps = total or meta.nb_frames or 0, fps or meta.fps
+    return total, fps
 
 
 def _stream_hint(src: str | av.container.InputContainer) -> tuple[int, float]:
@@ -423,7 +435,10 @@ def _stream_hint(src: str | av.container.InputContainer) -> tuple[int, float]:
     # container would pin it and serve stale answers after it's closed.
     stream = src.streams.video[0]
     total, fps = stream.frames, float(stream.average_rate or 0)
-    return total or video_metadata_from_container(src).nb_frames or 0, fps
+    if not total or not fps:
+        meta = video_metadata_from_container(src)
+        total, fps = total or meta.nb_frames or 0, fps or meta.fps
+    return total, fps
 
 
 def read_frames_batched(
@@ -509,6 +524,8 @@ def read_frames_from_stream(
     skip_frames = _nonnegative_index(skip_frames, "skip_frames")
     _validate_fps(fps)
 
+    seekable = callable(getattr(stream, "seekable", None)) and stream.seekable()
+
     # Not _open_container: the returned generator owns the container, so it
     # must stay open after this function returns.
     container = _open_video(stream, buffer_size=buffer_size)
@@ -516,16 +533,25 @@ def read_frames_from_stream(
         for s in container.streams.video:
             s.thread_type = thread_type
 
-        # The display-matrix rotation is only exposed per-frame, and the stream may
-        # not be seekable (e.g. a pipe) — so decode the first frame eagerly for the
-        # metadata and hand it back through the generator. The same generator must
-        # be reused for the remaining frames: a fresh decode() after the eager read
-        # hits a flushed frame-threaded decoder and raises EOFError on clips
-        # shorter than the decoder delay (issue #18).
-        decoded = container.decode(video=0)
-        first_frame = next(decoded, None)
-        rotation = first_frame.rotation if first_frame is not None else 0
-        meta = video_metadata_from_container(container, rotation=rotation)
+        if seekable:
+            # A seekable stream (uploaded blob, BytesIO) gets the same
+            # metadata as a path — the rotation probe, the frame-count
+            # cross-check, and the missing-rate recovery all need rewinds a
+            # pipe can't do, and each rewinds back to frame 0 when done.
+            meta = video_metadata_from_container(container)
+            first_frame = None
+            decoded = container.decode(video=0)
+        else:
+            # The display-matrix rotation is only exposed per-frame — decode the
+            # first frame eagerly for the metadata and hand it back through the
+            # generator. The same generator must be reused for the remaining
+            # frames: a fresh decode() after the eager read hits a flushed
+            # frame-threaded decoder and raises EOFError on clips shorter than
+            # the decoder delay (issue #18).
+            decoded = container.decode(video=0)
+            first_frame = next(decoded, None)
+            rotation = first_frame.rotation if first_frame is not None else 0
+            meta = video_metadata_from_container(container, rotation=rotation)
     except Exception:
         container.close()
         raise

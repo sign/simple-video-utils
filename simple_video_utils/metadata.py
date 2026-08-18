@@ -164,31 +164,40 @@ def _best_effort_nb_frames(
     return decoded if decoded is not None else candidate
 
 
-def derived_average_rate(
+def _decoded_rate_and_count(
     container: av.container.InputContainer,
-    stream: av.VideoStream,
-) -> float | None:
+) -> tuple[float | None, int | None]:
     """
-    Frame rate reconstructed from duration and frame count.
+    Ground-truth frame rate and count by decoding the whole video stream.
 
     Browser-recorded (MediaRecorder) WebM often carries no rate hint at all —
     no DefaultDuration, irregular cluster timestamps — so PyAV's
     ``stream.average_rate`` comes back None (ffprobe: ``avg_frame_rate 0/0``).
-    The duration and the packets are still in the container, so the true
-    cadence is recoverable. Requires a seekable container; rewinds it.
+    With no header rate, every cheap signal is suspect: packet counts include
+    trailing packets that never decode (issue #4), and container.duration
+    spans the longest stream, which audio can pad past the video. Decoding
+    sidesteps both: N frames spanning their first and last timestamps give
+    the true cadence as N-1 intervals over that span. Slow — O(stream
+    duration) — but these files are the rare exception, and video_metadata
+    caches the result per path. Requires a seekable container; rewinds it.
     """
-    if stream.duration and stream.time_base:
-        duration = float(stream.duration * stream.time_base)
-    elif container.duration:
-        duration = container.duration / av.time_base
-    else:
-        return None
-    if duration <= 0:
-        return None
-    nb_frames = stream.frames if stream.frames > 0 else _count_video_packets(container)
-    if not nb_frames:
-        return None
-    return nb_frames / duration
+    first = last = None
+    count = 0
+    try:
+        for frame in container.decode(video=0):
+            count += 1
+            if frame.time is None:
+                continue
+            if first is None:
+                first = frame.time
+            last = frame.time
+    except (av.FFmpegError, OSError):
+        return None, None
+    finally:
+        container.seek(0)
+    if count > 1 and last is not None and last > first:
+        return (count - 1) / (last - first), count
+    return None, count or None
 
 
 def _probe_rotation(container: av.container.InputContainer) -> int:
@@ -248,11 +257,15 @@ def video_metadata_from_container(
         duration = None
 
     # rotation is None ⇒ the container is seekable (same contract as rotation probing)
-    nb_frames = _best_effort_nb_frames(container, stream, fps, duration, seekable=rotation is None)
-
-    # Same recovery as derived_average_rate, from the values already in hand.
-    if not fps and nb_frames and duration:
-        fps = nb_frames / duration
+    nb_frames = None
+    if not fps and rotation is None:
+        # Recover the missing rate before _best_effort_nb_frames: deriving it
+        # from the packet count afterward would make the issue-#4 cross-check
+        # (round(duration × fps) vs count) circular — true by construction.
+        derived_fps, nb_frames = _decoded_rate_and_count(container)
+        fps = derived_fps or 0.0
+    if nb_frames is None:
+        nb_frames = _best_effort_nb_frames(container, stream, fps, duration, seekable=rotation is None)
 
     if rotation is None:
         rotation = _probe_rotation(container)
