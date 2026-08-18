@@ -331,11 +331,8 @@ def read_frames_exact(
             # cache per container if no-rate files show up in that path.
             source_fps = float(stream.average_rate) if stream.average_rate else None
             if source_fps is None:
-                try:
-                    meta = video_metadata(src) if isinstance(src, str) else video_metadata_from_container(container)
-                    source_fps = meta.fps or None
-                except RuntimeError:
-                    source_fps = None
+                meta = video_metadata(src) if isinstance(src, str) else video_metadata_from_container(container)
+                source_fps = meta.fps or None
             if not source_fps:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
@@ -524,7 +521,7 @@ def read_frames_from_stream(
     skip_frames = _nonnegative_index(skip_frames, "skip_frames")
     _validate_fps(fps)
 
-    seekable = callable(getattr(stream, "seekable", None)) and stream.seekable()
+    seekable = getattr(stream, "seekable", lambda: False)()
 
     # Not _open_container: the returned generator owns the container, so it
     # must stay open after this function returns.

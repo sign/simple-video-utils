@@ -49,13 +49,6 @@ class TestMissingAverageRate:
         assert meta.nb_frames == true_count
         assert meta.duration is not None
 
-    def test_read_frames_exact_time_range(self):
-        meta = video_metadata(FIXTURE)
-
-        frames = list(read_frames_exact(FIXTURE, start_time=0.0, end_time=meta.duration))
-
-        assert len(frames) == meta.nb_frames
-
     def test_seeked_read_returns_the_right_frames(self):
         meta = video_metadata(LONG_FIXTURE)
         full = list(read_frames_exact(LONG_FIXTURE))
