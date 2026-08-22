@@ -263,21 +263,18 @@ def _select_frames_by_fps(
 def _indexed_frames_to_rgb(
     items: Iterable[tuple[int, av.VideoFrame]],
 ) -> Generator[tuple[np.ndarray, int], None, None]:
-    """
-    Convert (index, frame) pairs to (rgb_array, index) pairs.
+    """Convert (index, frame) pairs to (rgb_array, index) pairs."""
+    it = iter(items)
+    current: tuple[int, av.VideoFrame] | None = None
 
-    _frames_to_rgb is strictly one-out-per-one-in, so the index of the frame
-    it is currently converting is always the single element in ``pending``.
-    """
-    pending: list[int] = []
+    def feed() -> Generator[av.VideoFrame, None, None]:
+        nonlocal current
+        for current in it:
+            yield current[1]
 
-    def frames() -> Generator[av.VideoFrame, None, None]:
-        for index, frame in items:
-            pending.append(index)
-            yield frame
-
-    for array in _frames_to_rgb(frames()):
-        yield array, pending.pop()
+    for rgb in _frames_to_rgb(feed()):
+        assert current is not None
+        yield rgb, current[0]
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -388,20 +385,14 @@ def read_frames_exact(
                 stop = target_end + 1 if target_end is not None else None
                 frames = islice(decoded, target_start, stop)
 
-            if return_indices:
-                # Both window paths deliver consecutive frames counted from
-                # target_start (see _select_frames_by_index), so enumeration
-                # recovers each frame's absolute index; fps selection then
-                # drops pairs, keeping index and frame aligned.
-                indexed = enumerate(frames, start=target_start)
-                if fps is not None:
-                    indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
-                yield from _indexed_frames_to_rgb(indexed)
-                return
-
+            indexed = enumerate(frames, start=target_start)
             if fps is not None:
-                frames = _select_frames_by_fps(frames, fps)
-            yield from _frames_to_rgb(frames)
+                indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
+
+            if return_indices:
+                yield from _indexed_frames_to_rgb(indexed)
+            else:
+                yield from _frames_to_rgb(frame for _, frame in indexed)
 
     return generate()
 
