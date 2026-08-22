@@ -3,7 +3,7 @@ import sys
 from collections.abc import Callable, Generator, Iterable
 from fractions import Fraction
 from functools import lru_cache
-from itertools import islice
+from itertools import islice, tee
 from typing import BinaryIO
 
 import av
@@ -264,17 +264,9 @@ def _indexed_frames_to_rgb(
     items: Iterable[tuple[int, av.VideoFrame]],
 ) -> Generator[tuple[np.ndarray, int], None, None]:
     """Convert (index, frame) pairs to (rgb_array, index) pairs."""
-    it = iter(items)
-    current: tuple[int, av.VideoFrame] | None = None
-
-    def feed() -> Generator[av.VideoFrame, None, None]:
-        nonlocal current
-        for current in it:
-            yield current[1]
-
-    for rgb in _frames_to_rgb(feed()):
-        assert current is not None
-        yield rgb, current[0]
+    frames, pairs = tee(items, 2)
+    for rgb, (index, _) in zip(_frames_to_rgb(f for _, f in frames), pairs, strict=True):
+        yield rgb, index
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -522,14 +514,10 @@ def read_frames_batched(
         return stack_frames(frames, size_hint=hint)
 
     indices: list[int] = []
-
-    def arrays() -> Generator[np.ndarray, None, None]:
-        for array, index in frames:
-            indices.append(index)
-            yield array
-
-    return stack_frames(arrays(), size_hint=hint), np.asarray(indices, dtype=np.int64)
-
+    return (
+        stack_frames((indices.append(i) or a for a, i in frames), size_hint=hint),
+        np.asarray(indices, dtype=np.int64),
+    )
 
 def read_frames_from_stream(
     stream: BinaryIO,
