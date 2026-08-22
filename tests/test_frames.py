@@ -709,6 +709,48 @@ class TestReadFramesBatched:
             read_frames_batched("does-not-exist.mp4", start_frame=0, start_time=1.0)
 
 
+class TestReturnIndices:
+    """return_indices=True pairs each returned frame with its absolute index."""
+
+    @pytest.fixture
+    def video_path(self):
+        return str(Path(__file__).parent / "assets" / "example.mp4")
+
+    def test_full_read_indices_are_arange(self, video_path):
+        frames, indices = read_frames_batched(video_path, return_indices=True)
+        assert indices.dtype == np.int64
+        assert indices.ndim == 1
+        assert len(indices) == len(frames)
+        np.testing.assert_array_equal(indices, np.arange(len(frames)))
+        np.testing.assert_array_equal(frames, read_frames_batched(video_path))
+
+    def test_window_offsets_indices(self, video_path):
+        frames, indices = read_frames_batched(video_path, start_frame=5, end_frame=20, return_indices=True)
+        assert len(frames) == 16
+        np.testing.assert_array_equal(indices, np.arange(5, 21))
+
+    def test_fps_indices_select_exact_frames(self, video_path):
+        meta = video_metadata(video_path)
+        start, end = 5, 60
+        frames, indices = read_frames_batched(
+            video_path, start_frame=start, end_frame=end, fps=meta.fps / 3, return_indices=True,
+        )
+        assert len(indices) == len(frames)
+        assert np.all(np.diff(indices) > 0)  # strictly increasing
+        assert indices[0] >= start
+        assert indices[-1] <= end
+        # the reported indices reproduce exactly the returned frames
+        all_frames = read_frames_batched(video_path)
+        np.testing.assert_array_equal(frames, all_frames[indices])
+
+    def test_exact_yields_index_pairs(self, video_path):
+        pairs = list(read_frames_exact(video_path, start_frame=3, end_frame=6, return_indices=True))
+        assert [index for _, index in pairs] == [3, 4, 5, 6]
+        plain = read_frames_exact(video_path, start_frame=3, end_frame=6)
+        for (frame, _), expected in zip(pairs, plain, strict=True):
+            np.testing.assert_array_equal(frame, expected)
+
+
 class TestSelectFramesByIndex:
     """Unit tests for the timestamp-based frame filter, using stub frames."""
 

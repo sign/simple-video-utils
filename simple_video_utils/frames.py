@@ -1,6 +1,6 @@
 import operator
 import sys
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from fractions import Fraction
 from functools import lru_cache
 from itertools import islice
@@ -230,9 +230,10 @@ def _select_frames_by_index(
 
 
 def _select_frames_by_fps(
-    frames: Iterable[av.VideoFrame],
+    frames: Iterable,
     fps: float,
-) -> Generator[av.VideoFrame, None, None]:
+    get_time: Callable = operator.attrgetter("time"),
+) -> Generator:
     """
     Downsample to ~fps by keeping the first frame of each 1/fps bucket.
 
@@ -240,19 +241,43 @@ def _select_frames_by_fps(
     through unchanged — frames are never duplicated. Buckets are anchored at
     the first frame's timestamp, so selection stays uniform across VFR gaps
     and after seeks.
+
+    ``get_time`` lets the same selection run over ``(index, frame)`` pairs
+    (the return_indices path) — items are yielded as given.
     """
     origin = None
     last_bucket = None
     for frame in frames:
-        if frame.time is None:
+        time = get_time(frame)
+        if time is None:
             continue
         if origin is None:
-            origin = frame.time
+            origin = time
         # epsilon absorbs float error when a timestamp lands on a bucket edge
-        bucket = int((frame.time - origin) * fps + 1e-6)
+        bucket = int((time - origin) * fps + 1e-6)
         if bucket != last_bucket:
             yield frame
             last_bucket = bucket
+
+
+def _indexed_frames_to_rgb(
+    items: Iterable[tuple[int, av.VideoFrame]],
+) -> Generator[tuple[np.ndarray, int], None, None]:
+    """
+    Convert (index, frame) pairs to (rgb_array, index) pairs.
+
+    _frames_to_rgb is strictly one-out-per-one-in, so the index of the frame
+    it is currently converting is always the single element in ``pending``.
+    """
+    pending: list[int] = []
+
+    def frames() -> Generator[av.VideoFrame, None, None]:
+        for index, frame in items:
+            pending.append(index)
+            yield frame
+
+    for array in _frames_to_rgb(frames()):
+        yield array, pending.pop()
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -269,7 +294,8 @@ def read_frames_exact(
     end_time: float | None = None,
     thread_type: str = "AUTO",
     fps: float | None = None,
-) -> Generator[np.ndarray, None, None]:
+    return_indices: bool = False,
+) -> Generator[np.ndarray, None, None] | Generator[tuple[np.ndarray, int], None, None]:
     """
     Return frames as RGB np.ndarrays from specified range.
 
@@ -287,9 +313,14 @@ def read_frames_exact(
         fps: Target frame rate. Drops frames (roughly uniformly, by timestamp)
             to approximate this rate; never duplicates, so a target at or
             above the source rate returns every frame. None keeps all frames.
+        return_indices: When True, yield ``(array, index)`` pairs, where
+            ``index`` is the frame's absolute 0-based position in the whole
+            video (the start offset is included, and fps drop-selection
+            reports exactly the frames it kept). Default False: plain arrays.
 
     Returns:
-        Generator yielding RGB numpy arrays (H, W, 3).
+        Generator yielding RGB numpy arrays (H, W, 3), or (array, index)
+        pairs when return_indices is True.
 
     Raises:
         ValueError: If frame and time parameters are mixed, or a range is
@@ -356,6 +387,17 @@ def read_frames_exact(
             else:
                 stop = target_end + 1 if target_end is not None else None
                 frames = islice(decoded, target_start, stop)
+
+            if return_indices:
+                # Both window paths deliver consecutive frames counted from
+                # target_start (see _select_frames_by_index), so enumeration
+                # recovers each frame's absolute index; fps selection then
+                # drops pairs, keeping index and frame aligned.
+                indexed = enumerate(frames, start=target_start)
+                if fps is not None:
+                    indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
+                yield from _indexed_frames_to_rgb(indexed)
+                return
 
             if fps is not None:
                 frames = _select_frames_by_fps(frames, fps)
@@ -448,7 +490,8 @@ def read_frames_batched(
     end_time: float | None = None,
     thread_type: str = "AUTO",
     fps: float | None = None,
-) -> np.ndarray:
+    return_indices: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Read a frame range as one batched (N, H, W, 3) RGB uint8 array.
 
@@ -460,12 +503,18 @@ def read_frames_batched(
     in torch directly measured 3x slower (per-op dispatch), so numpy is the
     fast path either way.
 
+    With ``return_indices=True`` returns ``(frames, indices)``: a 1-D int64
+    array of the same length as the batch, giving each frame's absolute
+    0-based index in the whole video (the start offset is included, and fps
+    drop-selection reports exactly the frames it kept).
+
     Raises:
         ValueError: Same call-time validation as read_frames_exact, and,
             like np.stack, if the range contains no frames.
     """
     # Created first so parameter validation raises before the metadata peek.
-    frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type, fps)
+    frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type, fps,
+                               return_indices=return_indices)
 
     total, source_fps = _count_and_rate(src)
     if start_time is not None or end_time is not None:
@@ -478,7 +527,17 @@ def read_frames_batched(
     if hint and fps is not None and source_fps and fps < source_fps:
         # bucket selection keeps ~one frame per 1/fps; hint tolerates the estimate
         hint = int(hint * fps / source_fps) + 1
-    return stack_frames(frames, size_hint=hint)
+    if not return_indices:
+        return stack_frames(frames, size_hint=hint)
+
+    indices: list[int] = []
+
+    def arrays() -> Generator[np.ndarray, None, None]:
+        for array, index in frames:
+            indices.append(index)
+            yield array
+
+    return stack_frames(arrays(), size_hint=hint), np.asarray(indices, dtype=np.int64)
 
 
 def read_frames_from_stream(
