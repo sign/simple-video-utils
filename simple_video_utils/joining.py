@@ -1,36 +1,25 @@
 """Join videos, preserving their encoded packets when they overlap."""
 
-from __future__ import annotations
-
 import io
 from collections.abc import Sequence
+from fractions import Fraction
 
 import av
 
-
-def _copy_packet(packet: av.Packet) -> av.Packet:
-    copy = av.Packet(bytes(packet))
-    copy.pts = packet.pts
-    copy.dts = packet.dts
-    copy.duration = packet.duration
-    copy.time_base = packet.time_base
-    copy.is_keyframe = packet.is_keyframe
-    return copy
+from simple_video_utils.metadata import _open_video
+from simple_video_utils.slicing import _MP4_COPY_CODECS, _copy_packet, _iter_packets, _mux_packets
 
 
-def _packets(container: av.InputContainer, time_base) -> list[av.Packet]:  # noqa: ANN001 - PyAV's time base type
-    stream = container.streams.video[0]
+def _packets(container: av.container.InputContainer, time_base: Fraction) -> list[av.Packet]:
+    """All video packets, copied and rescaled onto ``time_base``."""
     packets = []
-    for packet in container.demux(stream):
-        if packet.pts is None or packet.dts is None or not packet.size:
-            continue
-        packet = _copy_packet(packet)
-        assert packet.time_base is not None
+    for source in _iter_packets(container, container.streams.video[0]):
+        packet = _copy_packet(source)
         if packet.time_base != time_base:
             packet.pts = round(packet.pts * packet.time_base / time_base)
             packet.dts = round(packet.dts * packet.time_base / time_base)
             packet.duration = round((packet.duration or 0) * packet.time_base / time_base)
-        packet.time_base = time_base
+            packet.time_base = time_base
         packets.append(packet)
     return packets
 
@@ -45,10 +34,12 @@ def _overlap(first: list[av.Packet], second: list[av.Packet]) -> int:
 
 
 def _copy_join(videos: Sequence[bytes]) -> bytes | None:
-    containers = [av.open(io.BytesIO(video), mode="r") for video in videos]
+    """Remux without re-encoding, or None when any boundary shares no packets."""
+    containers = [_open_video(io.BytesIO(video)) for video in videos]
     try:
         stream = containers[0].streams.video[0]
-        assert stream.time_base is not None
+        if stream.codec_context.name not in _MP4_COPY_CODECS:
+            return None
         packets = _packets(containers[0], stream.time_base)
         for container in containers[1:]:
             incoming = _packets(container, stream.time_base)
@@ -60,41 +51,33 @@ def _copy_join(videos: Sequence[bytes]) -> bytes | None:
                 packet.pts += shift
                 packet.dts += shift
             packets.extend(incoming[overlap:])
-
-        output = io.BytesIO()
-        format_name = "webm" if stream.codec_context.name in {"vp8", "vp9"} else "mp4"
-        with av.open(output, mode="w", format=format_name) as destination:
-            out_stream = destination.add_stream_from_template(stream)
-            for source in packets:
-                packet = _copy_packet(source)
-                packet.stream = out_stream
-                destination.mux(packet)
-        return output.getvalue()
+        return _mux_packets(stream, packets, 0)
     finally:
         for container in containers:
             container.close()
 
 
 def _encode_join(videos: Sequence[bytes]) -> bytes:
-    inputs = [av.open(io.BytesIO(video), mode="r") for video in videos]
+    inputs = [_open_video(io.BytesIO(video)) for video in videos]
     try:
-        first = inputs[0].streams.video[0]
-        rate = first.average_rate or first.guessed_rate or 24
-        width, height = first.codec_context.width, first.codec_context.height
+        streams = [container.streams.video[0] for container in inputs]
+        first = streams[0].codec_context
+        if any((s.codec_context.width, s.codec_context.height) != (first.width, first.height)
+               for s in streams):
+            message = "videos must have the same dimensions"
+            raise ValueError(message)
+        rate = streams[0].average_rate or streams[0].guessed_rate or 24
         output = io.BytesIO()
         with av.open(output, mode="w", format="mp4") as destination:
             stream = destination.add_stream("h264", rate=rate, options={"crf": "18"})
-            stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+            stream.width, stream.height, stream.pix_fmt = first.width, first.height, "yuv420p"
             reformatter = av.video.reformatter.VideoReformatter()
-            for container in inputs:
-                source = container.streams.video[0]
-                if (source.codec_context.width, source.codec_context.height) != (width, height):
-                    message = "videos must have the same dimensions"
-                    raise ValueError(message)
+            for container, source in zip(inputs, streams, strict=True):
                 for frame in container.decode(source):
-                    frame = reformatter.reformat(frame, width=width, height=height, format="yuv420p")
-                    frame.pts = None
-                    destination.mux(stream.encode(frame))
+                    video_frame = reformatter.reformat(frame, width=first.width,
+                                                       height=first.height, format="yuv420p")
+                    video_frame.pts = None
+                    destination.mux(stream.encode(video_frame))
             destination.mux(stream.encode())
         return output.getvalue()
     finally:
@@ -105,14 +88,15 @@ def _encode_join(videos: Sequence[bytes]) -> bytes:
 def join_videos(videos: Sequence[bytes]) -> bytes:
     """Join videos in order.
 
-    Slices copied from the same encoded stream share packets around their
-    boundary. Those packets are de-duplicated and remuxed without quality loss;
-    unrelated videos are decoded and joined into an MP4 with H.264 CRF 18.
+    Clips copied from the same encoded stream share packets around their
+    boundaries; those are de-duplicated and the join is remuxed without
+    quality loss. Anything else — a boundary with no shared packets, or a
+    codec MP4 can't carry — falls back to decoding everything and encoding
+    one H.264 MP4 (CRF 18), so inputs are re-encoded at most once.
     """
     if not videos:
         message = "at least one video is required"
         raise ValueError(message)
-    joined = videos[0]
-    for video in videos[1:]:
-        joined = _copy_join((joined, video)) or _encode_join((joined, video))
-    return joined
+    if len(videos) == 1:
+        return videos[0]
+    return _copy_join(videos) or _encode_join(videos)

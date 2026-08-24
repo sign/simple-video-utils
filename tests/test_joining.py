@@ -25,15 +25,27 @@ def _frames(video: bytes) -> list[np.ndarray]:
         return [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
 
 
-@pytest.mark.parametrize(("codec", "format"), [("h264", "mpegts"), ("libvpx", "webm")])
-def test_overlapping_slices_are_joined_without_reencoding(codec, format):
-    source = _video(list(range(36)), codec=codec, format=format)
+def test_overlapping_slices_are_joined_without_reencoding():
+    source = _video(list(range(36)), format="mpegts")
 
     joined = join_videos(list(slice_video_stream(io.BytesIO(source), duration=0.5)))
     expected, actual = _frames(source), _frames(joined)
     assert len(actual) == len(expected)
     for source_frame, joined_frame in zip(expected, actual, strict=True):
         np.testing.assert_array_equal(source_frame, joined_frame)
+
+
+def test_webm_slices_join_via_reencode():
+    # slice_video_stream re-encodes WebM sources into exact windows, so those
+    # clips share no packets: joining decodes and re-encodes them, once.
+    source = _video(list(range(36)), codec="libvpx", format="webm")
+
+    joined = join_videos(list(slice_video_stream(io.BytesIO(source), duration=0.5)))
+    expected, actual = _frames(source), _frames(joined)
+    assert len(actual) == len(expected)
+    for source_frame, joined_frame in zip(expected, actual, strict=True):
+        np.testing.assert_allclose(  # atol: two lossy H.264 generations
+            joined_frame.astype(int), source_frame.astype(int), atol=6)
 
 
 def test_unrelated_videos_are_reencoded_in_order():
