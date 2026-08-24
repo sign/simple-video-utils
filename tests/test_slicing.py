@@ -138,24 +138,27 @@ def test_stream_slices_are_split_into_duration_windows():
         np.testing.assert_array_equal(frames[0], source_frames[index * 12])
 
 
-def test_stream_slices_webm_keeps_visible_keyframe_lead_in():
-    # VP8 can't be muxed into MP4, so VP8/VP9 clips come out as WebM — which
-    # has no edit list to hide the keyframe lead-in each clip must carry to be
-    # decodable: a WebM clip visibly starts at the keyframe at/before its
-    # window, not at the window boundary. Callers needing exact WebM windows
-    # must cut on decoded frames instead.
+def test_stream_slices_webm_reencodes_exact_windows():
+    # WebM has no edit list to hide the keyframe lead-in a copied clip would
+    # have to carry, so VP8/VP9 sources are decoded and re-encoded into exact
+    # MP4 windows: no lead-in, no trailing frames, window content only.
     data = _streaming_video(codec="vp8", format="webm")
     source_frames = _frames(data)
-    with av.open(io.BytesIO(data)) as container:
-        keyframes = [i for i, p in enumerate(p for p in container.demux(video=0) if p.size)
-                     if p.is_keyframe]
     clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
     assert len(clips) == 3
-    lead_ins = [max(k for k in keyframes if k <= index * 12) for index in range(3)]
-    # if keyframes ever align with every window, this test stops proving anything
-    assert any(lead_in < index * 12 for index, lead_in in enumerate(lead_ins))
-    for clip, lead_in in zip(clips, lead_ins, strict=True):
-        np.testing.assert_array_equal(_frames(clip)[0], source_frames[lead_in])
+    for index, clip in enumerate(clips):
+        frames = _frames(clip)
+        assert len(frames) == 12
+        np.testing.assert_allclose(  # atol: H.264 is lossy
+            frames[0].astype(int), source_frames[index * 12].astype(int), atol=3)
+
+
+def test_webm_file_is_reencoded_at_source_resolution(tmp_path):
+    # The copy path is off for codecs MP4 can't carry, even without ``size``:
+    # slice_video re-encodes them at the source resolution.
+    src = _write_video(tmp_path / "src.webm", codec="vp8")
+    [clip] = slice_video(src, [(0.0, 0.3)])
+    assert _dims(clip) == (320, 240)
 
 
 class _CountingReader(io.RawIOBase):
