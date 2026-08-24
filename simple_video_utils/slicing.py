@@ -13,6 +13,7 @@ import io
 import math
 from collections.abc import Iterator, Sequence
 from fractions import Fraction
+from itertools import takewhile
 from typing import BinaryIO
 
 import av
@@ -73,13 +74,25 @@ def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -
     return output.getvalue()
 
 
-def _keyframe_index(packets: list[av.Packet], start: int) -> int:
-    """Index of the last keyframe at/before ``start`` — the decode entry point."""
-    return max(
-        (index for index, packet in enumerate(packets)
-         if packet.is_keyframe and packet.pts <= start),
-        default=0,
+def _stream_pts(seconds: float, stream: av.VideoStream) -> int:
+    """``seconds`` on the stream's absolute pts timeline.
+
+    round, not int: a frame landing exactly on a boundary must not be
+    excluded by float noise in the division.
+    """
+    return round(seconds / stream.time_base) + (stream.start_time or 0)
+
+
+def _window(packets: list[av.Packet], start: int) -> list[av.Packet]:
+    """Trim ``packets`` (in place) to the keyframe lead-in needed to decode from
+    ``start`` and return the clip, or [] when nothing reaches ``start``."""
+    keyframe = next(
+        (index for index in reversed(range(len(packets)))
+         if packets[index].is_keyframe and packets[index].pts <= start),
+        0,
     )
+    del packets[:keyframe]
+    return packets if any(packet.pts >= start for packet in packets) else []
 
 
 def _iter_packets(container: av.container.InputContainer, stream: av.VideoStream) -> Iterator[av.Packet]:
@@ -104,21 +117,14 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
     lead-in. Consumers that enumerate raw decoded frames still see the
     lead-in (with pts < 0); only presentation skips it.
     """
-    with av.open(src) as source:
+    with _open_video(src) as source:
         in_stream = source.streams.video[0]
-        origin = in_stream.start_time or 0  # pts is on the stream's absolute timeline
-        # round, not int: a frame landing exactly on a boundary must not be
-        # excluded by float noise in the division
-        start_pts = round(start / in_stream.time_base) + origin
-        end_pts = round(end / in_stream.time_base) + origin
+        start_pts = _stream_pts(start, in_stream)
+        end_pts = _stream_pts(end, in_stream)
         source.seek(start_pts, stream=in_stream, backward=True)
-        packets = []
-        for packet in _iter_packets(source, in_stream):
-            packets.append(packet)
-            if packet.dts > end_pts:
-                break
-        selected = [p for p in packets[_keyframe_index(packets, start_pts):] if p.dts <= end_pts]
-        return _mux_packets(in_stream, selected, start_pts) if selected else b""
+        packets = list(takewhile(lambda p: p.dts <= end_pts, _iter_packets(source, in_stream)))
+        clip = _window(packets, start_pts)
+        return _mux_packets(in_stream, clip, start_pts) if clip else b""
 
 
 def slice_video(
@@ -126,7 +132,7 @@ def slice_video(
     slices: Sequence[tuple[float, float]],
     size: int | None = None,
 ) -> Iterator[bytes]:
-    """Yield one MP4 clip (bytes) per (start, end) second range, in order.
+    """Yield one clip (bytes; MP4, or WebM for VP8/VP9 sources) per (start, end) range, in order.
 
     Yields lazily so a long slice list never holds every clip in memory. ``size``
     center-crops each frame to a square and resizes to ``size`` x ``size``; a
@@ -135,10 +141,11 @@ def slice_video(
     an out-of-range or empty slice raises ``ValueError``.
 
     Stream-copied clips keep the lead-in from the keyframe before ``start``
-    and a few trailing frames past ``end``; an edit list hides them, so
+    and a few trailing frames past ``end``. In MP4 an edit list hides them, so
     players are unaffected, but readers that enumerate raw decoded frames —
     including ``read_frames_exact`` and ``read_frames_from_stream`` — see
-    them. Pass ``size`` to force re-encoding when exact frames matter.
+    them; WebM has no edit list, so there even players see the lead-in.
+    Pass ``size`` to force re-encoding when exact frames matter.
     """
     meta = video_metadata(src)
     should_copy = size is None or (meta.width == meta.height == size and meta.rotation == 0)
@@ -154,38 +161,38 @@ def slice_video(
         yield clip
 
 
-def slice_video_stream(stream: BinaryIO, duration: float = 0.5) -> Iterator[bytes]:
+def slice_video_stream(
+    stream: BinaryIO,
+    duration: float = 0.5,
+    buffer_size: int = 32768,  # PyAV default; reduce for lower latency on live sources
+) -> Iterator[bytes]:
     """Yield one packet-copied clip per ``duration`` seconds, as the stream arrives.
 
     Each clip is yielded as soon as its window's packets have been read, so a
-    live source produces a clip roughly every ``duration`` seconds. Nothing is
-    re-encoded: like ``slice_video``'s copy path, every clip keeps the keyframe
-    lead-in it needs to decode, hidden from playback by an edit list. Memory
-    holds only the current window plus that lead-in, never the whole stream.
+    live source produces a clip roughly every ``duration`` seconds (plus up to
+    ``buffer_size`` bytes of read-ahead — lower it for lower latency). Nothing
+    is re-encoded: every clip keeps the keyframe lead-in it needs to decode.
+    MP4 clips hide the lead-in behind an edit list; WebM clips (VP8/VP9
+    sources) have no edit list, so there it is visible content reaching back
+    to the last keyframe. Memory holds the current window plus that lead-in —
+    bounded by the source's keyframe interval, not the stream length.
     """
     if not math.isfinite(duration) or duration <= 0:
         message = "duration must be a positive finite number"
         raise ValueError(message)
-    with _open_video(stream) as container:
+    with _open_video(stream, buffer_size=buffer_size) as container:
         source = container.streams.video[0]
-        origin = source.start_time or 0
         packets: list[av.Packet] = []
         index = 0
-
-        def boundary(number: int) -> int:
-            return round(number * duration / source.time_base) + origin
-
-        start, end = boundary(0), boundary(1)
+        end = _stream_pts(duration, source)
         for packet in _iter_packets(container, source):
-            packets.append(packet)
             while packet.dts > end:
-                del packets[: _keyframe_index(packets, start)]
-                clip = [item for item in packets if item.dts <= end]
-                if any(item.pts >= start for item in clip):
+                start = _stream_pts(index * duration, source)
+                if clip := _window(packets, start):
                     yield _mux_packets(source, clip, start)
                 index += 1
-                start, end = boundary(index), boundary(index + 1)
-
-        del packets[: _keyframe_index(packets, start)]
-        if any(item.pts >= start for item in packets):
-            yield _mux_packets(source, packets, start)
+                end = _stream_pts((index + 1) * duration, source)
+            packets.append(packet)
+        start = _stream_pts(index * duration, source)
+        if clip := _window(packets, start):
+            yield _mux_packets(source, clip, start)

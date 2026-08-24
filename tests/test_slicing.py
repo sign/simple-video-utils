@@ -10,17 +10,25 @@ from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.slicing import slice_video, slice_video_stream
 
 
-def _write_video(path, width=320, height=240, frames=30, fps=30):
-    with av.open(str(path), mode="w") as container:
-        stream = container.add_stream("h264", rate=fps)
+def _encode_video(target, width=320, height=240, frames=30, fps=30, codec="h264", format=None):
+    with av.open(target, mode="w", format=format) as container:
+        stream = container.add_stream(codec, rate=fps)
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
         for i in range(frames):
             arr = np.full((height, width, 3), i * 8 % 256, dtype=np.uint8)
-            for packet in stream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")):
-                container.mux(packet)
-        for packet in stream.encode():
-            container.mux(packet)
-    return str(path)
+            container.mux(stream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")))
+        container.mux(stream.encode())
+    return target
+
+
+def _write_video(path, **kwargs):
+    return str(_encode_video(str(path), **kwargs))
+
+
+def _streaming_video(frames=36, fps=24, codec="h264", format="mpegts") -> bytes:
+    buffer = _encode_video(io.BytesIO(), width=64, height=48, frames=frames, fps=fps,
+                           codec=codec, format=format)
+    return buffer.getvalue()
 
 
 @pytest.fixture
@@ -113,18 +121,6 @@ def test_zero_length_slice_raises(video):
         list(slice_video(video, [(0.5, 0.5)], size=256))
 
 
-def _streaming_video(frames=36, fps=24) -> bytes:
-    output = io.BytesIO()
-    with av.open(output, mode="w", format="mpegts") as container:
-        stream = container.add_stream("h264", rate=fps)
-        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
-        for i in range(frames):
-            array = np.full((48, 64, 3), i * 7 % 256, dtype=np.uint8)
-            container.mux(stream.encode(av.VideoFrame.from_ndarray(array, format="rgb24")))
-        container.mux(stream.encode())
-    return output.getvalue()
-
-
 def _frames(video: bytes) -> list[np.ndarray]:
     with av.open(io.BytesIO(video)) as container:
         return [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
@@ -140,6 +136,26 @@ def test_stream_slices_are_split_into_duration_windows():
     for index, frames in enumerate(decoded):
         assert len(frames) >= 12
         np.testing.assert_array_equal(frames[0], source_frames[index * 12])
+
+
+def test_stream_slices_webm_keeps_visible_keyframe_lead_in():
+    # VP8 can't be muxed into MP4, so VP8/VP9 clips come out as WebM — which
+    # has no edit list to hide the keyframe lead-in each clip must carry to be
+    # decodable: a WebM clip visibly starts at the keyframe at/before its
+    # window, not at the window boundary. Callers needing exact WebM windows
+    # must cut on decoded frames instead.
+    data = _streaming_video(codec="vp8", format="webm")
+    source_frames = _frames(data)
+    with av.open(io.BytesIO(data)) as container:
+        keyframes = [i for i, p in enumerate(p for p in container.demux(video=0) if p.size)
+                     if p.is_keyframe]
+    clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
+    assert len(clips) == 3
+    lead_ins = [max(k for k in keyframes if k <= index * 12) for index in range(3)]
+    # if keyframes ever align with every window, this test stops proving anything
+    assert any(lead_in < index * 12 for index, lead_in in enumerate(lead_ins))
+    for clip, lead_in in zip(clips, lead_ins, strict=True):
+        np.testing.assert_array_equal(_frames(clip)[0], source_frames[lead_in])
 
 
 class _CountingReader(io.RawIOBase):
@@ -160,12 +176,13 @@ class _CountingReader(io.RawIOBase):
 
 def test_stream_clips_arrive_before_eof():
     # The point of streaming: each clip is yielded once its window's packets
-    # have arrived, not after the source is exhausted. PyAV reads the input
-    # in 32KB chunks, so the first clip must appear within one such chunk.
+    # have arrived, not after the source is exhausted. PyAV reads the input in
+    # buffer_size chunks, so read-ahead — and with it clip latency — is capped
+    # by buffer_size, not by the stream length.
     reader = _CountingReader(_streaming_video(frames=240))  # 10s at 24 fps
-    positions = [reader.pos for _ in slice_video_stream(reader, duration=0.5)]
+    positions = [reader.pos for _ in slice_video_stream(reader, duration=0.5, buffer_size=4096)]
     assert len(positions) == 20
-    assert positions[0] <= 32768
+    assert positions[0] <= 3 * 4096
     assert positions == sorted(positions)
     assert len(set(positions)) > 2
 
