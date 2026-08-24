@@ -82,7 +82,7 @@ def _keyframe_index(packets: list[av.Packet], start: int) -> int:
     )
 
 
-def _iter_packets(container: av.InputContainer, stream: av.VideoStream) -> Iterator[av.Packet]:
+def _iter_packets(container: av.container.InputContainer, stream: av.VideoStream) -> Iterator[av.Packet]:
     for packet in container.demux(stream):
         if packet.pts is not None and packet.dts is not None and packet.size:
             yield packet
