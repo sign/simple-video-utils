@@ -83,6 +83,12 @@ def _packets_for_clip(packets: list[av.Packet], start: int, end: int | None) -> 
     return selected if end is None else [packet for packet in selected if packet.dts <= end]
 
 
+def _iter_packets(container: av.InputContainer, stream: av.VideoStream) -> Iterator[av.Packet]:
+    for packet in container.demux(stream):
+        if packet.pts is not None and packet.dts is not None and packet.size:
+            yield _copy_packet(packet)
+
+
 def _copy_clip(src: str, start: float, end: float) -> bytes:
     """
     Remux [start, end] seconds without re-encoding.
@@ -109,10 +115,8 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
         end_pts = round(end / in_stream.time_base) + origin
         source.seek(start_pts, stream=in_stream, backward=True)
         packets = []
-        for packet in source.demux(in_stream):
-            if packet.pts is None or packet.dts is None or not packet.size:
-                continue
-            packets.append(_copy_packet(packet))
+        for packet in _iter_packets(source, in_stream):
+            packets.append(packet)
             if packet.dts > end_pts:
                 break
         selected = _packets_for_clip(packets, start_pts, end_pts)
@@ -164,10 +168,8 @@ def _split_stream(stream: BinaryIO, duration: float) -> Iterator[bytes]:
             return round(number * duration / float(source.time_base)) + origin
 
         start, end = boundary(0), boundary(1)
-        for packet in container.demux(source):
-            if packet.pts is None or packet.dts is None or not packet.size:
-                continue
-            packets.append(_copy_packet(packet))
+        for packet in _iter_packets(container, source):
+            packets.append(packet)
             while packet.dts > end:
                 selected = _packets_for_clip(packets, start, end)
                 if any(item.pts >= start for item in selected):
