@@ -61,24 +61,19 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
     return buffer.getvalue()
 
 
-def _copy_packet(packet: av.Packet) -> av.Packet:
-    copy = av.Packet(bytes(packet))
-    copy.pts = packet.pts
-    copy.dts = packet.dts
-    copy.duration = packet.duration
-    copy.time_base = packet.time_base
-    copy.is_keyframe = packet.is_keyframe
-    return copy
-
-
 def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -> bytes:
     output = io.BytesIO()
     with av.open(output, mode="w", format="mp4") as container:
         destination = container.add_stream_from_template(stream)
+        # mux a copy: the source packets are shared between clips (the keyframe
+        # lead-in), so rebasing them in place would corrupt the next clip
         for source in packets:
-            packet = _copy_packet(source)
-            packet.pts -= start
-            packet.dts -= start
+            packet = av.Packet(bytes(source))
+            packet.pts = source.pts - start
+            packet.dts = source.dts - start
+            packet.duration = source.duration
+            packet.time_base = source.time_base
+            packet.is_keyframe = source.is_keyframe
             packet.stream = destination
             container.mux(packet)
     return output.getvalue()
