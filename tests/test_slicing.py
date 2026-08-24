@@ -113,10 +113,10 @@ def test_zero_length_slice_raises(video):
         list(slice_video(video, [(0.5, 0.5)], size=256))
 
 
-def _streaming_video(frames=36, fps=24, codec="h264", format="mpegts") -> bytes:
+def _streaming_video(frames=36, fps=24) -> bytes:
     output = io.BytesIO()
-    with av.open(output, mode="w", format=format) as container:
-        stream = container.add_stream(codec, rate=fps)
+    with av.open(output, mode="w", format="mpegts") as container:
+        stream = container.add_stream("h264", rate=fps)
         stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
         for i in range(frames):
             array = np.full((48, 64, 3), i * 7 % 256, dtype=np.uint8)
@@ -140,6 +140,34 @@ def test_stream_slices_are_split_into_duration_windows():
     for index, frames in enumerate(decoded):
         assert len(frames) >= 12
         np.testing.assert_array_equal(frames[0], source_frames[index * 12])
+
+
+class _CountingReader(io.RawIOBase):
+    """Non-seekable reader that tracks how far the source has been read."""
+
+    def __init__(self, data):
+        self.data, self.pos = data, 0
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        chunk = self.data[self.pos : self.pos + len(buffer)]
+        buffer[: len(chunk)] = chunk
+        self.pos += len(chunk)
+        return len(chunk)
+
+
+def test_stream_clips_arrive_before_eof():
+    # The point of streaming: each clip is yielded once its window's packets
+    # have arrived, not after the source is exhausted. PyAV reads the input
+    # in 32KB chunks, so the first clip must appear within one such chunk.
+    reader = _CountingReader(_streaming_video(frames=240))  # 10s at 24 fps
+    positions = [reader.pos for _ in slice_video_stream(reader, duration=0.5)]
+    assert len(positions) == 20
+    assert positions[0] <= 32768
+    assert positions == sorted(positions)
+    assert len(set(positions)) > 2
 
 
 @pytest.mark.parametrize("duration", [0, -1, float("inf")])

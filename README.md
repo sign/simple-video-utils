@@ -102,7 +102,8 @@ clips = slice_video("video.mp4", [(0.0, 1.5), (2.0, 3.2)])
 clips = slice_video("video.mp4", [(0.0, 1.5)], size=256)
 ```
 
-Split an incoming video into packet-copied clips after it has finished uploading:
+Split an incoming video stream into packet-copied clips as it arrives —
+each clip is yielded as soon as its window has been read, without re-encoding:
 
 ```python
 from simple_video_utils.slicing import slice_video_stream
@@ -110,15 +111,6 @@ from simple_video_utils.slicing import slice_video_stream
 with open("video.mp4", "rb") as stream:
     for clip in slice_video_stream(stream, duration=0.5):
         process(clip)
-```
-
-Join clips in order. Overlapping slices from the same encoded stream are
-de-duplicated and remuxed; unrelated videos fall back to H.264 CRF 18:
-
-```python
-from simple_video_utils.joining import join_videos
-
-video = join_videos(clips)
 ```
 
 ### Remote Videos
@@ -140,3 +132,4 @@ pip install -e ".[dev]"
 pytest tests/
 ruff check .
 ```
+
