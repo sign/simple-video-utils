@@ -12,7 +12,6 @@ frames are decoded, center-cropped to a square, resized, and re-encoded.
 import io
 import math
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
 from fractions import Fraction
 from typing import BinaryIO
 
@@ -50,47 +49,34 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int) -> b
     return buffer.getvalue()
 
 
-@dataclass(frozen=True)
-class _Packet:
-    data: bytes
-    pts: int
-    dts: int
-    duration: int
-    time_base: Fraction
-    keyframe: bool
+def _copy_packet(packet: av.Packet) -> av.Packet:
+    copy = av.Packet(bytes(packet))
+    copy.pts = packet.pts
+    copy.dts = packet.dts
+    copy.duration = packet.duration
+    copy.time_base = packet.time_base
+    copy.is_keyframe = packet.is_keyframe
+    return copy
 
 
-def _packet(packet: av.Packet) -> _Packet:
-    assert packet.pts is not None
-    assert packet.dts is not None
-    assert packet.time_base is not None
-    return _Packet(
-        bytes(packet), packet.pts, packet.dts, packet.duration or 0,
-        packet.time_base, packet.is_keyframe,
-    )
-
-
-def _mux_packets(stream: av.VideoStream, packets: list[_Packet], start: int) -> bytes:
+def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -> bytes:
     output = io.BytesIO()
     format_name = "webm" if stream.codec_context.name in {"vp8", "vp9"} else "mp4"
     with av.open(output, mode="w", format=format_name) as container:
         destination = container.add_stream_from_template(stream)
         for source in packets:
-            packet = av.Packet(source.data)
-            packet.pts = source.pts - start
-            packet.dts = source.dts - start
-            packet.duration = source.duration
-            packet.time_base = source.time_base
-            packet.is_keyframe = source.keyframe
+            packet = _copy_packet(source)
+            packet.pts -= start
+            packet.dts -= start
             packet.stream = destination
             container.mux(packet)
     return output.getvalue()
 
 
-def _packets_for_clip(packets: list[_Packet], start: int, end: int | None) -> list[_Packet]:
+def _packets_for_clip(packets: list[av.Packet], start: int, end: int | None) -> list[av.Packet]:
     keyframe = max(
         (index for index, packet in enumerate(packets)
-         if packet.keyframe and packet.pts <= start),
+         if packet.is_keyframe and packet.pts <= start),
         default=0,
     )
     selected = packets[keyframe:]
@@ -126,7 +112,7 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
         for packet in source.demux(in_stream):
             if packet.pts is None or packet.dts is None or not packet.size:
                 continue
-            packets.append(_packet(packet))
+            packets.append(_copy_packet(packet))
             if packet.dts > end_pts:
                 break
         selected = _packets_for_clip(packets, start_pts, end_pts)
@@ -171,7 +157,7 @@ def _split_stream(stream: BinaryIO, duration: float) -> Iterator[bytes]:
         source = container.streams.video[0]
         assert source.time_base is not None
         origin = source.start_time or 0
-        packets: list[_Packet] = []
+        packets: list[av.Packet] = []
         index = 0
 
         def boundary(number: int) -> int:
@@ -181,7 +167,7 @@ def _split_stream(stream: BinaryIO, duration: float) -> Iterator[bytes]:
         for packet in container.demux(source):
             if packet.pts is None or packet.dts is None or not packet.size:
                 continue
-            packets.append(_packet(packet))
+            packets.append(_copy_packet(packet))
             while packet.dts > end:
                 selected = _packets_for_clip(packets, start, end)
                 if any(item.pts >= start for item in selected):
