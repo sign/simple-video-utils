@@ -1,11 +1,10 @@
-import asyncio
 import io
 
 import av
 import numpy as np
 import pytest
 
-from simple_video_utils.streaming import slice_video_stream
+from simple_video_utils.slicing import slice_video_stream
 
 
 def _streaming_video(frames=36, fps=24, codec="h264", format="mpegts") -> bytes:
@@ -29,14 +28,7 @@ def test_clips_are_split_into_duration_windows():
     data = _streaming_video()
     source_frames = _frames(data)
 
-    async def run():
-        async def chunks():
-            yield data[:len(data) * 3 // 4]
-            yield data[len(data) * 3 // 4:]
-
-        return [clip async for clip in slice_video_stream(chunks(), duration=0.5)]
-
-    clips = asyncio.run(run())
+    clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
     decoded = [_frames(clip) for clip in clips]
     assert len(decoded) == 3
     assert [frames[0].shape[:2] for frames in decoded] == [(48, 64)] * 3
@@ -47,11 +39,5 @@ def test_clips_are_split_into_duration_windows():
 
 @pytest.mark.parametrize("duration", [0, -1, float("inf")])
 def test_duration_must_be_positive_and_finite(duration):
-    async def chunks():
-        yield b"video"
-
-    async def run():
-        with pytest.raises(ValueError, match="duration"):
-            await anext(slice_video_stream(chunks(), duration=duration))
-
-    asyncio.run(run())
+    with pytest.raises(ValueError, match="duration"):
+        list(slice_video_stream(io.BytesIO(b"video"), duration=duration))

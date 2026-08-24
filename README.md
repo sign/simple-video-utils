@@ -105,10 +105,11 @@ clips = slice_video("video.mp4", [(0.0, 1.5)], size=256)
 Split an incoming video into packet-copied clips after it has finished uploading:
 
 ```python
-from simple_video_utils.streaming import slice_video_stream
+from simple_video_utils.slicing import slice_video_stream
 
-async for clip in slice_video_stream(request.stream(), duration=0.5):
-    await process(clip)
+with open("video.mp4", "rb") as stream:
+    for clip in slice_video_stream(stream, duration=0.5):
+        process(clip)
 ```
 
 Join clips in order. Overlapping slices from the same encoded stream are

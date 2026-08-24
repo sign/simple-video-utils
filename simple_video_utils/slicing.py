@@ -10,8 +10,11 @@ frames are decoded, center-cropped to a square, resized, and re-encoded.
 """
 
 import io
+import math
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
+from typing import BinaryIO
 
 import av
 import numpy as np
@@ -120,3 +123,79 @@ def slice_video(
             msg = f"slice ({start}, {end}) has no frames"
             raise ValueError(msg)
         yield clip
+
+
+@dataclass(frozen=True)
+class _Packet:
+    data: bytes
+    pts: int
+    dts: int
+    duration: int
+    time_base: Fraction
+    keyframe: bool
+
+
+def _mux_packets(stream: av.VideoStream, packets: list[_Packet], start: int) -> bytes:
+    output = io.BytesIO()
+    format_name = "webm" if stream.codec_context.name in {"vp8", "vp9"} else "mp4"
+    with av.open(output, mode="w", format=format_name) as container:
+        destination = container.add_stream_from_template(stream)
+        for source in packets:
+            packet = av.Packet(source.data)
+            packet.pts = source.pts - start
+            packet.dts = source.dts - start
+            packet.duration = source.duration
+            packet.time_base = source.time_base
+            packet.is_keyframe = source.keyframe
+            packet.stream = destination
+            container.mux(packet)
+    return output.getvalue()
+
+
+def _packets_for_clip(packets: list[_Packet], start: int, end: int | None) -> list[_Packet]:
+    keyframe = max(
+        (index for index, packet in enumerate(packets)
+         if packet.keyframe and packet.pts <= start),
+        default=0,
+    )
+    selected = packets[keyframe:]
+    return selected if end is None else [packet for packet in selected if packet.dts <= end]
+
+
+def _split_stream(stream: BinaryIO, duration: float) -> Iterator[bytes]:
+    with av.open(stream, metadata_errors="replace") as container:
+        source = container.streams.video[0]
+        assert source.time_base is not None
+        origin = source.start_time or 0
+        packets: list[_Packet] = []
+        index = 0
+
+        def boundary(number: int) -> int:
+            return round(number * duration / float(source.time_base)) + origin
+
+        start, end = boundary(0), boundary(1)
+        for packet in container.demux(source):
+            if packet.pts is None or packet.dts is None or not packet.size:
+                continue
+            packets.append(_Packet(
+                bytes(packet), packet.pts, packet.dts, packet.duration or 0,
+                packet.time_base, packet.is_keyframe,
+            ))
+            while packet.dts > end:
+                selected = _packets_for_clip(packets, start, end)
+                if any(item.pts >= start for item in selected):
+                    yield _mux_packets(source, selected, start)
+                index += 1
+                start, end = boundary(index), boundary(index + 1)
+
+        selected = _packets_for_clip(packets, start, None)
+        if any(item.pts >= start for item in selected):
+            yield _mux_packets(source, selected, start)
+
+
+def slice_video_stream(stream: BinaryIO, duration: float = 0.5) -> Iterator[bytes]:
+    """Yield packet-copied clips from a video stream after EOF."""
+    if not math.isfinite(duration) or duration <= 0:
+        message = "duration must be a positive finite number"
+        raise ValueError(message)
+    yield from _split_stream(stream, duration)
