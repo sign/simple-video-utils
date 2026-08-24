@@ -113,6 +113,16 @@ with open("video.mp4", "rb") as stream:
         process(clip)
 ```
 
+Join clips in order. Overlapping slices from the same encoded stream are
+de-duplicated and remuxed losslessly; anything else is decoded and encoded
+once as H.264 MP4:
+
+```python
+from simple_video_utils.joining import join_videos
+
+video = join_videos(clips)
+```
+
 ### Remote Videos
 
 ```python
