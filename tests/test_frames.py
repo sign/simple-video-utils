@@ -15,14 +15,21 @@ from simple_video_utils.frames import (
 )
 from simple_video_utils.metadata import video_metadata
 
+ASSETS = Path(__file__).parent / "assets"
+
+
+@pytest.fixture
+def video_path():
+    return str(ASSETS / "example.mp4")
+
+
+@pytest.fixture
+def video_bytes(video_path):
+    return Path(video_path).read_bytes()
+
 
 class TestReadFramesExact:
     """Tests for the read_frames_exact function using example.mp4."""
-
-    @pytest.fixture
-    def video_path(self):
-        """Path to the example video file."""
-        return str(Path(__file__).parent / "assets" / "example.mp4")
 
     def test_invalid_frame_range_negative_start(self):
         """Test that negative start frame raises ValueError at call time."""
@@ -420,16 +427,6 @@ class TestReadFramesExact:
 class TestReadFramesFromStream:
     """Tests for streaming video input via read_frames_from_stream."""
 
-    @pytest.fixture
-    def video_path(self):
-        """Path to the example video file."""
-        return str(Path(__file__).parent / "assets" / "example.mp4")
-
-    @pytest.fixture
-    def video_bytes(self, video_path):
-        """Load example video as bytes."""
-        return Path(video_path).read_bytes()
-
     def test_read_frames_from_stream_basic(self, video_bytes):
         """Test reading frames from a BytesIO stream."""
         stream = BytesIO(video_bytes)
@@ -636,10 +633,6 @@ class TestReadFramesBatched:
 class TestReturnIndices:
     """return_indices=True pairs each returned frame with its absolute index."""
 
-    @pytest.fixture
-    def video_path(self):
-        return str(Path(__file__).parent / "assets" / "example.mp4")
-
     def test_full_read_indices_are_arange(self, video_path):
         frames, indices = read_frames_batched(video_path, return_indices=True)
         assert indices.dtype == np.int64
@@ -705,10 +698,6 @@ class TestSelectFramesByIndex:
 
 class TestFpsSelection:
     """The fps parameter drops frames onto a uniform grid — never duplicates."""
-
-    @pytest.fixture
-    def video_path(self):
-        return str(Path(__file__).parent / "assets" / "example.mp4")
 
     def test_invalid_fps_raises_at_call_time(self):
         with pytest.raises(ValueError, match="fps must be positive"):
