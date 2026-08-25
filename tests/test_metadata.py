@@ -20,10 +20,11 @@ class TestVideoMetadata:
         """Load example video as bytes."""
         return Path(video_path).read_bytes()
 
-    def test_video_metadata(self, video_path):
-        """Test that we can read video metadata."""
+    def test_video_metadata_from_file_and_bytes(self, video_path, video_bytes):
+        """File and byte inputs produce the same valid metadata."""
         meta = video_metadata(video_path)
 
+        assert video_metadata_from_bytes(video_bytes) == meta
         assert meta.width > 0
         assert meta.height > 0
         assert meta.fps > 0
@@ -33,29 +34,6 @@ class TestVideoMetadata:
         assert isinstance(meta.height, int)
         assert isinstance(meta.fps, float)
         assert isinstance(meta.duration, float)
-
-    def test_video_metadata_from_bytes(self, video_bytes):
-        """Test metadata extraction from video bytes."""
-        meta = video_metadata_from_bytes(video_bytes)
-
-        assert meta.width > 0
-        assert meta.height > 0
-        assert meta.fps > 0
-        assert meta.duration is not None
-        assert meta.duration > 0
-        assert isinstance(meta.width, int)
-        assert isinstance(meta.height, int)
-        assert isinstance(meta.fps, float)
-
-    def test_video_metadata_from_bytes_matches_file(self, video_bytes, video_path):
-        """Test that bytes-based metadata matches file-based metadata."""
-        meta_bytes = video_metadata_from_bytes(video_bytes)
-        meta_file = video_metadata(video_path)
-
-        assert meta_bytes.width == meta_file.width
-        assert meta_bytes.height == meta_file.height
-        assert meta_bytes.fps == meta_file.fps
-        assert meta_bytes.duration == meta_file.duration
 
     def test_bad_color_space_video(self):
         """Test metadata extraction from a video with unusual color space."""
@@ -164,4 +142,3 @@ class TestKeyframeIndices:
         empty = str(Path(__file__).parent / "assets" / "empty.mp4")
         with pytest.raises(RuntimeError, match="Failed to open video"):
             keyframe_indices(empty)
-
