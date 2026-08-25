@@ -5,11 +5,6 @@ Lightweight utilities for extracting frames and metadata from videos. Built for 
 ![Python](https://img.shields.io/badge/python-3.10+-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
-## Goal
-
-Provide simple, efficient tools for video processing in sign language research and applications. 
-Uses PyAV for fast frame extraction with support for multiple formats (MP4, WebM) and remote URLs.
-
 ## Installation
 
 ```bash
@@ -142,4 +137,3 @@ pip install -e ".[dev]"
 pytest tests/
 ruff check .
 ```
-
