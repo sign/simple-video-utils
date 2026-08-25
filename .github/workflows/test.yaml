@@ -9,6 +9,26 @@ on:
 
 
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          activate-environment: true
+
+      - name: Install dependencies
+        run: uv pip install ".[dev]"
+
+      - name: Lint code
+        run: uv run ruff check .
+
   test:
     name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
@@ -22,9 +42,6 @@ jobs:
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Verify ffprobe
-        run: ffprobe -version
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
