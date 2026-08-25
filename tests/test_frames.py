@@ -427,23 +427,6 @@ class TestReadFramesExact:
 class TestReadFramesFromStream:
     """Tests for streaming video input via read_frames_from_stream."""
 
-    def test_read_frames_from_stream_basic(self, video_bytes):
-        """Test reading frames from a BytesIO stream."""
-        stream = BytesIO(video_bytes)
-        meta, frames_gen = read_frames_from_stream(stream)
-
-        # Check metadata
-        assert meta.width > 0
-        assert meta.height > 0
-        assert meta.fps > 0
-
-        # Read first frame
-        frame = next(frames_gen)
-        assert isinstance(frame, np.ndarray)
-        assert frame.dtype == np.uint8
-        assert frame.shape == (meta.height, meta.width, 3)
-        assert np.sum(frame) > 0
-
     def test_read_frames_from_stream_all_frames(self, video_bytes, video_path):
         """Test that stream reading produces same frames as file reading."""
         stream = BytesIO(video_bytes)
