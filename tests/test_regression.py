@@ -72,24 +72,6 @@ def ffmpeg_decode(src: str) -> np.ndarray:
     return np.frombuffer(result.stdout, dtype=np.uint8).reshape(-1, meta.height, meta.width, 3)
 
 
-def ffmpeg_read_frames_exact(
-    src: str,
-    start_frame: int,
-    end_frame: int | None = None,
-) -> np.ndarray:
-    """
-    Return frames [start_frame, end_frame] inclusive as RGB np.ndarrays using ffmpeg.
-    If end_frame is None, reads from start_frame to the end of the video.
-    """
-    if end_frame is not None:
-        assert end_frame >= start_frame >= 0, "invalid frame range"
-    else:
-        assert start_frame >= 0, "start_frame must be non-negative"
-
-    stop = None if end_frame is None else end_frame + 1
-    return ffmpeg_decode(src)[start_frame:stop]
-
-
 class TestRegressionAgainstFFmpeg:
     """Regression tests comparing PyAV implementation against ffmpeg/ffprobe."""
 
@@ -115,93 +97,22 @@ class TestRegressionAgainstFFmpeg:
         if pyav_meta.nb_frames is not None and ffprobe_meta.nb_frames is not None:
             assert abs(pyav_meta.nb_frames - ffprobe_meta.nb_frames) <= 1, "Frame count mismatch"
 
-    def test_frames_match_ffmpeg_from_start(self, video_path):
-        """Test that frames extracted from start match ffmpeg output."""
-        start_frame = 0
-        end_frame = 10
-
-        # Extract using ffmpeg (ground truth)
-        ffmpeg_frames = list(ffmpeg_read_frames_exact(video_path, start_frame, end_frame))
-
-        # Extract using our implementation
+    @pytest.mark.parametrize(("start_frame", "end_frame"), [(0, 10), (50, 60), (42, 42)])
+    def test_frames_match_ffmpeg(self, video_path, start_frame, end_frame):
+        """Test that frame-index extraction matches ffmpeg output."""
+        ffmpeg_frames = ffmpeg_decode(video_path)[start_frame : end_frame + 1]
         pyav_frames = list(pyav_read_frames_exact(video_path, start_frame=start_frame, end_frame=end_frame))
 
-        # Should have same number of frames
-        assert len(pyav_frames) == len(ffmpeg_frames), (
-            f"Frame count mismatch: PyAV={len(pyav_frames)}, FFmpeg={len(ffmpeg_frames)}"
-        )
-
-        # Every frame should be identical (pixel-perfect)
-        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames, strict=False)):
-            np.testing.assert_array_equal(
-                pyav_frame,
-                ffmpeg_frame,
-                err_msg=f"Frame {i} differs between PyAV and FFmpeg",
-            )
-
-    def test_frames_match_ffmpeg_with_seeking(self, video_path):
-        """Test that frames extracted with seeking match ffmpeg output."""
-        start_frame = 50
-        end_frame = 60
-
-        ffmpeg_frames = list(ffmpeg_read_frames_exact(video_path, start_frame, end_frame))
-        pyav_frames = list(pyav_read_frames_exact(video_path, start_frame=start_frame, end_frame=end_frame))
-
-        assert len(pyav_frames) == len(ffmpeg_frames), (
-            f"Frame count mismatch: PyAV={len(pyav_frames)}, FFmpeg={len(ffmpeg_frames)}"
-        )
-
-        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames, strict=True)):
-            np.testing.assert_array_equal(
-                pyav_frame,
-                ffmpeg_frame,
-                err_msg=f"Frame {start_frame + i} differs between PyAV and FFmpeg",
-            )
+        np.testing.assert_array_equal(pyav_frames, ffmpeg_frames)
 
     def test_frames_match_ffmpeg_time_based(self, video_path):
         """Test that time-based extraction matches ffmpeg frame-based output."""
-        # Get FPS to convert time to frames
-        meta = pyav_video_metadata(video_path)
-        fps = meta.fps
-
-        # Test 1-2 seconds
         start_time = 1.0
         end_time = 2.0
+        fps = pyav_video_metadata(video_path).fps
         start_frame = int(start_time * fps)
         end_frame = int(end_time * fps)
-
-        # Extract using ffmpeg with frame indices (ground truth)
-        ffmpeg_frames = list(ffmpeg_read_frames_exact(video_path, start_frame, end_frame))
-
-        # Extract using our time-based implementation
+        ffmpeg_frames = ffmpeg_decode(video_path)[start_frame : end_frame + 1]
         pyav_frames = list(pyav_read_frames_exact(video_path, start_time=start_time, end_time=end_time))
 
-        # Should have same number of frames
-        assert len(pyav_frames) == len(ffmpeg_frames), (
-            f"Frame count mismatch: PyAV={len(pyav_frames)}, FFmpeg={len(ffmpeg_frames)}"
-        )
-
-        # Every frame should be identical
-        for i, (pyav_frame, ffmpeg_frame) in enumerate(zip(pyav_frames, ffmpeg_frames, strict=False)):
-            actual_frame_num = start_frame + i
-            np.testing.assert_array_equal(
-                pyav_frame,
-                ffmpeg_frame,
-                err_msg=f"Frame {actual_frame_num} ({start_time + i/fps:.3f}s) differs between PyAV and FFmpeg",
-            )
-
-    def test_single_frame_matches_ffmpeg(self, video_path):
-        """Test that single frame extraction matches ffmpeg."""
-        frame_idx = 42
-
-        ffmpeg_frames = list(ffmpeg_read_frames_exact(video_path, frame_idx, frame_idx))
-        assert len(ffmpeg_frames) == 1
-
-        pyav_frames = list(pyav_read_frames_exact(video_path, start_frame=frame_idx, end_frame=frame_idx))
-        assert len(pyav_frames) == 1
-
-        np.testing.assert_array_equal(
-            pyav_frames[0],
-            ffmpeg_frames[0],
-            err_msg=f"Frame {frame_idx} differs between PyAV and FFmpeg",
-        )
+        np.testing.assert_array_equal(pyav_frames, ffmpeg_frames)
