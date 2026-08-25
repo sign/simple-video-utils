@@ -118,103 +118,27 @@ class TestReadFramesExact:
             # At least some frames should be different
             assert max(differences) > 0, "All consecutive frames are identical"
 
-    def test_large_frame_range(self, video_path):
-        """Test reading a larger range of frames."""
-        # Get video metadata first to know how many frames we have
-        meta = video_metadata(video_path)
-        max_frames = meta.nb_frames or 30  # Default to 30 if unknown
+    @pytest.mark.parametrize(("start_frame", "end_frame"), [(0, 20), (0, None), (5, None)])
+    def test_frame_ranges_match_full_decode(
+        self, video_path, start_frame, end_frame,
+    ):
+        """Bounded and open-ended ranges match the same full decode."""
+        all_frames = list(read_frames_exact(video_path))
+        frames = list(read_frames_exact(video_path, start_frame, end_frame))
+        stop = None if end_frame is None else end_frame + 1
+        expected = all_frames[start_frame:stop]
 
-        if max_frames and max_frames > 10:
-            end_frame = min(max_frames - 1, 20)  # Read up to frame 20 or video end
-            frames = list(read_frames_exact(video_path, 0, end_frame))
+        assert len(frames) == len(expected) > 0
+        assert all(frame.shape == expected[0].shape for frame in frames)
+        np.testing.assert_array_equal(frames, expected)
 
-            expected_count = end_frame + 1
-            assert len(frames) == expected_count
+    def test_default_end_matches_explicit_last_frame(self, video_path):
+        """The default end and the final explicit frame select the same frames."""
+        all_frames = list(read_frames_exact(video_path))
+        frames = list(read_frames_exact(video_path, 0, len(all_frames) - 1))
 
-            # All frames should have same dimensions
-            shapes = [frame.shape for frame in frames]
-            assert all(shape == shapes[0] for shape in shapes)
-
-    def test_end_frame_none_from_start(self, video_path):
-        """Test reading from start to end of video with end_frame=None."""
-        # Read entire video from start
-        frames_all = list(read_frames_exact(video_path, 0, None))
-
-        # Read first few frames with explicit end_frame
-        frames_partial = list(read_frames_exact(video_path, 0, 5))
-
-        # All frames should be valid
-        assert len(frames_all) > 0
-        assert len(frames_all) >= len(frames_partial)
-
-        # First frames should match
-        for i in range(min(len(frames_all), len(frames_partial))):
-            np.testing.assert_array_equal(frames_all[i], frames_partial[i])
-
-    def test_end_frame_none_from_middle(self, video_path):
-        """Test reading from middle to end of video with end_frame=None."""
-        start_frame = 5
-
-        # Read from middle to end with end_frame=None
-        frames_to_end = list(read_frames_exact(video_path, start_frame, None))
-
-        # Should get some frames
-        assert len(frames_to_end) > 0
-
-        # Each frame should be valid
-        for frame in frames_to_end:
-            assert isinstance(frame, np.ndarray)
-            assert frame.dtype == np.uint8
-            assert len(frame.shape) == 3
-            assert frame.shape[2] == 3
-
-    def test_start_frame_zero_no_seeking(self, video_path):
-        """Test that start_frame=0 optimization works correctly."""
-        # These should produce identical results
-        frames_with_end = list(read_frames_exact(video_path, 0, 5))
-        frames_without_end = list(read_frames_exact(video_path, 0, None))[:6]  # Take first 6 frames
-
-        # Compare first 6 frames
-        assert len(frames_with_end) == 6  # frames 0-5 inclusive
-        assert len(frames_without_end) >= 6
-
-        for i in range(6):
-            np.testing.assert_array_equal(frames_with_end[i], frames_without_end[i])
-
-    def test_end_frame_none_consistency(self, video_path):
-        """Test that end_frame=None gives consistent results."""
-        # Read twice with end_frame=None
-        frames1 = list(read_frames_exact(video_path, 0, None))
-        frames2 = list(read_frames_exact(video_path, 0, None))
-
-        # Should get same number of frames
-        assert len(frames1) == len(frames2)
-
-        # Frames should be identical
-        for f1, f2 in zip(frames1, frames2, strict=False):
-            np.testing.assert_array_equal(f1, f2)
-
-    def test_end_frame_none_vs_explicit_end(self, video_path):
-        """Test end_frame=None vs explicit end_frame for entire video."""
-        # Get video metadata to find total frames
-        meta = video_metadata(video_path)
-        total_frames = meta.nb_frames
-
-        if total_frames and total_frames > 10:
-            # Read with end_frame=None
-            frames_none = list(read_frames_exact(video_path, 0, None))
-
-            # Read with explicit end_frame (assuming we know total frames)
-            frames_explicit = list(read_frames_exact(video_path, 0, total_frames - 1))
-
-            # Should get same number of frames (or close due to container metadata)
-            # Allow small difference due to potential metadata inaccuracy
-            assert abs(len(frames_none) - len(frames_explicit)) <= 1
-
-            # First several frames should match
-            min_len = min(len(frames_none), len(frames_explicit))
-            for i in range(min(min_len, 10)):  # Compare first 10 frames
-                np.testing.assert_array_equal(frames_none[i], frames_explicit[i])
+        assert len(frames) == len(all_frames)
+        np.testing.assert_array_equal(frames, all_frames)
 
     def test_seek_path_matches_full_decode(self, video_path):
         """Starts past the 3s seek threshold must yield the exact target frames.
