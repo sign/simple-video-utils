@@ -1,4 +1,3 @@
-import hashlib
 import io
 from pathlib import Path
 
@@ -97,28 +96,18 @@ def test_copy_keeps_trailing_frames():
 def test_slicing_is_reproducible(video, size):
     # Both paths must be byte-stable: no wall-clock timestamp, encoder state, or
     # container metadata may leak into the output across repeated runs.
-    digests = {
-        hashlib.md5(b"".join(slice_video(video, [(0.0, 0.3), (0.5, 0.8)], size=size))).hexdigest()
+    outputs = {
+        tuple(slice_video(video, [(0.0, 0.3), (0.5, 0.8)], size=size))
         for _ in range(3)
     }
-    assert len(digests) == 1
+    assert len(outputs) == 1
 
 
-def test_out_of_range_slice_raises(video):
-    # Source is 1s; slices past the end, before 0, or reversed are errors.
-    for bad in [(5.0, 5.5), (-0.1, 0.3), (0.5, 0.2)]:
-        with pytest.raises(ValueError, match="out of range"):
-            list(slice_video(video, [bad]))
-        with pytest.raises(ValueError, match="out of range"):
-            list(slice_video(video, [bad], size=256))
-
-
-def test_zero_length_slice_raises(video):
-    # A clip needs positive duration; start == end is out of range in both paths.
+@pytest.mark.parametrize("bad", [(5.0, 5.5), (-0.1, 0.3), (0.5, 0.2), (0.5, 0.5)])
+@pytest.mark.parametrize("size", [None, 256])
+def test_out_of_range_slice_raises(video, bad, size):
     with pytest.raises(ValueError, match="out of range"):
-        list(slice_video(video, [(0.5, 0.5)]))
-    with pytest.raises(ValueError, match="out of range"):
-        list(slice_video(video, [(0.5, 0.5)], size=256))
+        list(slice_video(video, [bad], size=size))
 
 
 def _frames(video: bytes) -> list[np.ndarray]:
