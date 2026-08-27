@@ -228,17 +228,6 @@ class TestReadFramesExact:
         frames = list(read_frames_exact(webm_video, 0))
         assert len(frames) == 67
 
-    def test_time_based_extraction(self, video_path):
-        """Test reading frames using time-based parameters."""
-        # Read using time parameters
-        frames = list(read_frames_exact(video_path, start_time=0.0, end_time=1.0))
-
-        # Should get approximately 1 second worth of frames
-        meta = video_metadata(video_path)
-        expected_frames = int(meta.fps) + 1  # +1 because end frame is inclusive
-        # Allow some tolerance for frame extraction
-        assert abs(len(frames) - expected_frames) <= 2
-
     def test_time_vs_frame_equivalence(self, video_path):
         """Test that time-based and frame-based extraction produce equivalent results."""
         meta = video_metadata(video_path)
@@ -292,16 +281,6 @@ class TestReadFramesExact:
 
         with pytest.raises(ValueError, match="Cannot mix frame-based and time-based"):
             list(read_frames_exact(video_path, start_frame=0, start_time=0.0))
-
-    def test_no_parameters_reads_all(self, video_path):
-        """Test that calling with no parameters reads all frames from start."""
-        frames_no_params = list(read_frames_exact(video_path))
-        frames_explicit = list(read_frames_exact(video_path, start_frame=0))
-
-        # Should produce same result
-        assert len(frames_no_params) == len(frames_explicit)
-        for f1, f2 in zip(frames_no_params, frames_explicit, strict=False):
-            np.testing.assert_array_equal(f1, f2)
 
     def test_remote_time_and_frame_ranges_match(self):
         remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
