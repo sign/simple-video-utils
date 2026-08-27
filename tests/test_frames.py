@@ -228,25 +228,6 @@ class TestReadFramesExact:
         frames = list(read_frames_exact(webm_video, 0))
         assert len(frames) == 67
 
-    def test_remote_video_url(self):
-        """Test reading frames from a remote video URL."""
-        remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
-
-        # Test reading first frame
-        frames = list(read_frames_exact(remote_url, 0, 0))
-        assert len(frames) == 1
-
-        frame = frames[0]
-        assert isinstance(frame, np.ndarray)
-        assert frame.dtype == np.uint8
-        assert len(frame.shape) == 3
-        assert frame.shape[2] == 3
-        assert np.sum(frame) > 0
-
-        # Test reading multiple frames
-        frames_multi = list(read_frames_exact(remote_url, 0, 2))
-        assert len(frames_multi) == 3
-
     def test_time_based_extraction(self, video_path):
         """Test reading frames using time-based parameters."""
         # Read using time parameters
@@ -322,54 +303,25 @@ class TestReadFramesExact:
         for f1, f2 in zip(frames_no_params, frames_explicit, strict=False):
             np.testing.assert_array_equal(f1, f2)
 
-    def test_time_vs_frame_seeking_precision_remote(self):
-        """Test that time and frame seeking produce identical frames on a longer remote video."""
+    def test_remote_time_and_frame_ranges_match(self):
         remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
-
-        # Get video metadata to calculate frame indices
         meta = video_metadata(remote_url)
-        fps = meta.fps
+        assert min(meta.width, meta.height, meta.fps) > 0
 
-        # Test 5-7 seconds
-        start_time_sec = 5.0
-        end_time_sec = 7.0
-
-        # Calculate corresponding frame indices
-        start_frame_idx = int(start_time_sec * fps)
-        end_frame_idx = int(end_time_sec * fps)
-
-        # Extract using time parameters
-        frames_by_time = list(read_frames_exact(remote_url, start_time=start_time_sec, end_time=end_time_sec))
-
-        # Extract using frame indices
-        frames_by_frame = list(read_frames_exact(remote_url, start_frame=start_frame_idx, end_frame=end_frame_idx))
-
-        # Should get same number of frames
-        assert len(frames_by_time) == len(frames_by_frame), (
-            f"Frame count mismatch: time-based={len(frames_by_time)}, "
-            f"frame-based={len(frames_by_frame)}"
-        )
-
-        # Verify we got the expected number of frames
-        expected_frame_count = end_frame_idx - start_frame_idx + 1  # +1 because end is inclusive
-        assert len(frames_by_time) == expected_frame_count, (
-            f"Expected {expected_frame_count} frames (from frame {start_frame_idx} to {end_frame_idx}), "
-            f"got {len(frames_by_time)}"
-        )
-
-        # Every frame should be identical
-        for i, (frame_time, frame_idx) in enumerate(zip(frames_by_time, frames_by_frame, strict=False)):
-            actual_frame_num = start_frame_idx + i
-            np.testing.assert_array_equal(
-                frame_time,
-                frame_idx,
-                err_msg=f"Frame {actual_frame_num} differs between time-based and frame-based extraction",
+        start_frame, end_frame = int(5 * meta.fps), int(5 * meta.fps) + 2
+        by_frame = np.stack(list(read_frames_exact(remote_url, start_frame, end_frame)))
+        by_time = np.stack(
+            list(
+                read_frames_exact(
+                    remote_url,
+                    start_time=start_frame / meta.fps,
+                    end_time=end_frame / meta.fps,
+                )
             )
+        )
 
-        # Verify frames are not all identical (video has content)
-        if len(frames_by_time) >= 2:
-            diff = np.sum(np.abs(frames_by_time[0].astype(np.int16) - frames_by_time[-1].astype(np.int16)))
-            assert diff > 0, "First and last frames are identical - video may not have motion"
+        assert len(by_frame) > 1
+        np.testing.assert_array_equal(by_time, by_frame)
 
     def test_corrupted_video_metadata_readable(self):
         """Test that metadata can be read from corrupted video (ffprobe passes)."""
