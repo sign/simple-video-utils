@@ -19,13 +19,8 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Extract release version
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-
       - name: Update version in pyproject.toml
-        run: |
-          sed -i 's/^version = .*/version = "${{ env.version }}"/' pyproject.toml
+        run: sed -i "s/^version = .*/version = \"${GITHUB_REF_NAME}\"/" pyproject.toml
 
       - name: Install build dependencies
         run: pip install build
