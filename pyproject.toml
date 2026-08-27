@@ -20,11 +20,6 @@ dev = [
     "pytest-xdist", # For parallel test execution
 ]
 
-[tool.setuptools]
-packages = [
-    "simple_video_utils",
-]
-
 [tool.ruff]
 line-length = 120
 
