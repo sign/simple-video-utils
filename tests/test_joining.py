@@ -35,7 +35,7 @@ def test_overlapping_slices_are_joined_without_reencoding():
     source = _video(list(range(36)), format="mpegts")
 
     # a generator, as in the README — join_videos must accept one
-    joined = join_videos(slice_video_stream(io.BytesIO(source), duration=0.5))
+    joined = join_videos(clip.data for clip in slice_video_stream(io.BytesIO(source), duration=0.5))
     expected, actual = _frames(source), _frames(joined)
     assert len(actual) == len(expected)
     for source_frame, joined_frame in zip(expected, actual, strict=True):
@@ -47,7 +47,7 @@ def test_webm_slices_join_via_reencode():
     # clips share no packets: joining decodes and re-encodes them, once.
     source = _video(list(range(36)), codec="libvpx", format="webm")
 
-    joined = join_videos(list(slice_video_stream(io.BytesIO(source), duration=0.5)))
+    joined = join_videos([clip.data for clip in slice_video_stream(io.BytesIO(source), duration=0.5)])
     expected, actual = _frames(source), _frames(joined)
     assert len(actual) == len(expected)
     for source_frame, joined_frame in zip(expected, actual, strict=True):
@@ -86,7 +86,7 @@ def test_identical_clips_merge_into_one():
     # Overlaps merge on the source timeline rather than repeating: a clip
     # fully contained in the previous ones adds nothing.
     source = _video(list(range(36)), format="mpegts")
-    clip = next(slice_video_stream(io.BytesIO(source), duration=0.5))
+    clip = next(slice_video_stream(io.BytesIO(source), duration=0.5)).data
     assert len(_frames(join_videos([clip, clip]))) == len(_frames(clip))
 
 

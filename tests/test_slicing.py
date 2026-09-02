@@ -119,8 +119,9 @@ def test_stream_slices_are_split_into_duration_windows():
     data = _streaming_video()
     source_frames = _frames(data)
     clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
-    decoded = [_frames(clip) for clip in clips]
+    decoded = [_frames(clip.data) for clip in clips]
     assert len(decoded) == 3
+    assert [clip.start for clip in clips] == [0.0, 0.5, 1.0]
     assert [frames[0].shape[:2] for frames in decoded] == [(48, 64)] * 3
     for index, frames in enumerate(decoded):
         assert len(frames) >= 12
@@ -135,8 +136,9 @@ def test_stream_slices_webm_reencodes_exact_windows():
     source_frames = _frames(data)
     clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
     assert len(clips) == 3
+    assert [clip.start for clip in clips] == [0.0, 0.5, 1.0]
     for index, clip in enumerate(clips):
-        frames = _frames(clip)
+        frames = _frames(clip.data)
         assert len(frames) == 12
         np.testing.assert_allclose(  # atol: H.264 is lossy
             frames[0].astype(int), source_frames[index * 12].astype(int), atol=3)
