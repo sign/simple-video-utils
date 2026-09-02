@@ -14,7 +14,7 @@ import math
 from collections.abc import Iterator, Sequence
 from fractions import Fraction
 from itertools import takewhile
-from typing import BinaryIO
+from typing import BinaryIO, NamedTuple
 
 import av
 import numpy as np
@@ -30,6 +30,18 @@ from simple_video_utils.metadata import _open_video, video_metadata
 # MP4 (faststart/fragmented) or MPEG-TS: opens without seeking and always
 # takes the lossless copy path.
 _MP4_COPY_CODECS = {"h264", "hevc", "av1", "mpeg4"}
+
+
+class Clip(NamedTuple):
+    """One window of a sliced stream, and where it sits on the source timeline.
+
+    ``start`` is what a consumer cannot recover on its own: windows that yield
+    no packets are skipped, so counting the clips it receives does not tell it
+    how far into the video each one begins.
+    """
+
+    start: float  # seconds from the start of the stream
+    data: bytes
 
 
 def _center_crop_square(frame: np.ndarray) -> np.ndarray:
@@ -172,7 +184,7 @@ def slice_video(
 
 
 def _copy_windows(container: av.container.InputContainer, source: av.VideoStream,
-                  duration: float) -> Iterator[bytes]:
+                  duration: float) -> Iterator[Clip]:
     """Packet-copied windows: lossless, keyframe lead-in hidden by an edit list."""
     packets: list[av.Packet] = []
     index = 0
@@ -181,13 +193,13 @@ def _copy_windows(container: av.container.InputContainer, source: av.VideoStream
         while packet.dts > end:
             start = _stream_pts(index * duration, source)
             if clip := _window(packets, start):
-                yield _mux_packets(source, clip, start)
+                yield Clip(index * duration, _mux_packets(source, clip, start))
             index += 1
             end = _stream_pts((index + 1) * duration, source)
         packets.append(packet)
     start = _stream_pts(index * duration, source)
     if clip := _window(packets, start):
-        yield _mux_packets(source, clip, start)
+        yield Clip(index * duration, _mux_packets(source, clip, start))
 
 
 def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int) -> bytes:
@@ -209,7 +221,7 @@ def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: i
 
 
 def _encode_windows(container: av.container.InputContainer, source: av.VideoStream,
-                    duration: float) -> Iterator[bytes]:
+                    duration: float) -> Iterator[Clip]:
     """Frame-exact windows for codecs MP4 can't carry: decode and re-encode."""
     frames: list[av.VideoFrame] = []
     index = 0
@@ -217,21 +229,23 @@ def _encode_windows(container: av.container.InputContainer, source: av.VideoStre
     for frame in container.decode(source):
         while frame.pts >= end:
             if frames:
-                yield _encode_window(frames, source, _stream_pts(index * duration, source))
+                yield Clip(index * duration,
+                           _encode_window(frames, source, _stream_pts(index * duration, source)))
                 frames = []
             index += 1
             end = _stream_pts((index + 1) * duration, source)
         frames.append(frame)
     if frames:
-        yield _encode_window(frames, source, _stream_pts(index * duration, source))
+        yield Clip(index * duration,
+                   _encode_window(frames, source, _stream_pts(index * duration, source)))
 
 
 def slice_video_stream(
     stream: BinaryIO,
     duration: float = 0.5,
     buffer_size: int = 32768,  # PyAV default; reduce for lower latency on live sources
-) -> Iterator[bytes]:
-    """Yield one MP4 clip per ``duration`` seconds, as the stream arrives.
+) -> Iterator[Clip]:
+    """Yield one ``Clip`` per ``duration`` seconds, as the stream arrives.
 
     Each clip is yielded as soon as its window has been read, so a live source
     produces a clip roughly every ``duration`` seconds (plus up to
@@ -241,6 +255,10 @@ def slice_video_stream(
     Anything else (e.g. VP8/VP9 WebM) is decoded and re-encoded into exact
     windows instead — see ``_MP4_COPY_CODECS``. Memory holds one window plus,
     when copying, the lead-in back to the last keyframe.
+
+    Each clip carries its ``start`` on the source timeline, which a consumer
+    cannot derive from the order it receives them: a window with no packets
+    yields nothing while the timeline still advances past it.
     """
     if not math.isfinite(duration) or duration <= 0:
         message = "duration must be a positive finite number"
