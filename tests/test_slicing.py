@@ -102,12 +102,11 @@ class _Pipe:
         return self._buffer.read(size)
 
 
-@pytest.mark.parametrize("size", [None, 320])  # re-encoded, and stream-copied (source is 320 wide, not square)
-def test_clips_are_streamable(tmp_path, size):
-    # Faststart puts moov before mdat, so a reader that cannot seek demuxes the
-    # clip as the bytes arrive instead of failing once its probe buffer is full.
-    square = _write_video(tmp_path / "square.mp4", width=320, height=320, frames=30)
-    [clip] = slice_video(square, [(0.0, 1.0)], size=size)
+@pytest.mark.parametrize("size", [None, 256])  # stream-copied, and re-encoded (the 320x240 source is not square)
+def test_clips_are_streamable(video, size):
+    # moov before mdat, so a reader that cannot seek demuxes the clip as the
+    # bytes arrive instead of failing once its probe buffer is full.
+    [clip] = slice_video(video, [(0.0, 1.0)], size=size)
     assert clip.index(b"moov") < clip.index(b"mdat")
     with av.open(_Pipe(clip)) as container:
         assert sum(1 for _ in container.decode(video=0)) == 30

@@ -8,7 +8,7 @@ from fractions import Fraction
 import av
 
 from simple_video_utils.metadata import _open_video
-from simple_video_utils.slicing import _MP4_COPY_CODECS, _iter_packets, _mux_mp4, _mux_packets
+from simple_video_utils.slicing import _MP4_COPY_CODECS, _faststart, _iter_packets, _mux_packets
 
 
 def _packets(container: av.container.InputContainer, time_base: Fraction) -> list[av.Packet]:
@@ -66,8 +66,8 @@ def _encode_join(videos: Sequence[bytes]) -> bytes:
             message = "videos must have the same dimensions"
             raise ValueError(message)
         rate = first.average_rate or first.guessed_rate or 30
-
-        def write(destination: av.container.OutputContainer) -> None:
+        output = io.BytesIO()
+        with av.open(output, mode="w", format="mp4") as destination:
             stream = destination.add_stream("h264", rate=rate, options={"crf": "18"})
             stream.width, stream.height, stream.pix_fmt = first.width, first.height, "yuv420p"
             reformatter = av.video.reformatter.VideoReformatter()
@@ -85,8 +85,7 @@ def _encode_join(videos: Sequence[bytes]) -> bytes:
                     index += 1
                     destination.mux(stream.encode(video_frame))
             destination.mux(stream.encode())
-
-        return _mux_mp4(write)
+        return _faststart(output.getvalue())
 
 
 def join_videos(videos: Iterable[bytes]) -> bytes:
