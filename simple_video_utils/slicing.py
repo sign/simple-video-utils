@@ -56,14 +56,8 @@ def _center_crop_square(frame: np.ndarray) -> np.ndarray:
 
 
 def _mux_mp4(write: Callable[[av.container.OutputContainer], None]) -> bytes:
-    """Run ``write`` against an MP4 muxer and return the file as streamable bytes.
-
-    libav writes ``moov`` last, so a reader that cannot seek (a pipe) has to
-    buffer the whole clip before it finds the stream headers, and fails once
-    the clip outgrows its probe buffer. ``faststart`` moves ``moov`` to the
-    front on close by rewriting the file through its path — it cannot target
-    a BytesIO, hence the temp file. Fragmented MP4 would need no rewrite but
-    drops the edit list that hides a copied clip's keyframe lead-in.
+    """Run ``write`` against an MP4 muxer; return streamable bytes (``moov`` first).
+    faststart needs a real path — libav rewrites the file on close — hence the temp file.
     """
     with tempfile.NamedTemporaryFile(suffix=".mp4") as file:
         with av.open(file.name, mode="w", format="mp4", options={"movflags": "+faststart"}) as container:
