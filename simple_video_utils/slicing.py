@@ -7,11 +7,14 @@ lossless. The file still carries the lead-in from the keyframe at/before
 starts at ``start``; a few frames past ``end`` may remain visible (B-frame
 reordering). Otherwise
 frames are decoded, center-cropped to a square, resized, and re-encoded.
+
+Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
+— a pipe, a socket — can demux it without seeking.
 """
 
-import io
 import math
-from collections.abc import Iterator, Sequence
+import tempfile
+from collections.abc import Callable, Iterator, Sequence
 from fractions import Fraction
 from itertools import takewhile
 from typing import BinaryIO, NamedTuple
@@ -52,13 +55,24 @@ def _center_crop_square(frame: np.ndarray) -> np.ndarray:
     return frame[top : top + side, left : left + side]
 
 
+def _mux_mp4(write: Callable[[av.container.OutputContainer], None]) -> bytes:
+    """Run ``write`` against an MP4 muxer; return streamable bytes (``moov`` first).
+    faststart needs a real path — libav rewrites the file on close — hence the temp file.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as file:
+        with av.open(file.name, mode="w", format="mp4", options={"movflags": "+faststart"}) as container:
+            write(container)
+        file.seek(0)
+        return file.read()
+
+
 def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None) -> bytes:
     frames = list(read_frames_exact(src, start_time=start, end_time=end))
     if not frames:
         return b""
     height, width = (size, size) if size else frames[0].shape[:2]
-    buffer = io.BytesIO()
-    with av.open(buffer, mode="w", format="mp4") as output:
+
+    def write(output: av.container.OutputContainer) -> None:
         stream = output.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
         stream.width, stream.height = width, height
         stream.pix_fmt = "yuv420p"
@@ -70,12 +84,12 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
             video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
             output.mux(stream.encode(reformatter.reformat(video_frame, width=width, height=height)))
         output.mux(stream.encode())
-    return buffer.getvalue()
+
+    return _mux_mp4(write)
 
 
 def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -> bytes:
-    output = io.BytesIO()
-    with av.open(output, mode="w", format="mp4") as container:
+    def write(container: av.container.OutputContainer) -> None:
         destination = container.add_stream_from_template(stream)
         # mux a copy: the source packets are shared between clips (the keyframe
         # lead-in), so rebasing them in place would corrupt the next clip
@@ -88,7 +102,8 @@ def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -
             packet.is_keyframe = source.is_keyframe
             packet.stream = destination
             container.mux(packet)
-    return output.getvalue()
+
+    return _mux_mp4(write)
 
 
 def _stream_pts(seconds: float, stream: av.VideoStream) -> int:
@@ -203,8 +218,7 @@ def _copy_windows(container: av.container.InputContainer, source: av.VideoStream
 
 
 def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int) -> bytes:
-    output = io.BytesIO()
-    with av.open(output, mode="w", format="mp4") as container:
+    def write(container: av.container.OutputContainer) -> None:
         # rate is nominal metadata; the rebased frame pts carry the real timing,
         # so a source without an average_rate only gets a mislabeled fps
         stream = container.add_stream("h264", rate=source.average_rate or 30)
@@ -217,7 +231,8 @@ def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: i
             video_frame.pict_type = 0  # let the encoder choose frame types
             container.mux(stream.encode(video_frame))
         container.mux(stream.encode())
-    return output.getvalue()
+
+    return _mux_mp4(write)
 
 
 def _encode_windows(container: av.container.InputContainer, source: av.VideoStream,
