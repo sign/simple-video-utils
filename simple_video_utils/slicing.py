@@ -14,7 +14,6 @@ Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
 
 import io
 import math
-import struct
 from collections.abc import Iterator, Sequence
 from fractions import Fraction
 from itertools import takewhile
@@ -56,45 +55,11 @@ def _center_crop_square(frame: np.ndarray) -> np.ndarray:
     return frame[top : top + side, left : left + side]
 
 
-def _boxes(data: bytes | bytearray, lo: int, hi: int) -> Iterator[tuple[bytes, int, int, int]]:
-    """(type, start, header size, end) of each MP4 box in ``data[lo:hi]``."""
-    while lo + 8 <= hi:
-        size, kind = struct.unpack_from(">I4s", data, lo)
-        header = 8
-        if size == 1:  # 64-bit size follows the type
-            size, header = struct.unpack_from(">Q", data, lo + 8)[0], 16
-        elif size == 0:  # box runs to the end
-            size = hi - lo
-        yield kind, lo, header, lo + size
-        lo += size
-
-
-_OFFSET_PARENTS = {b"moov", b"trak", b"mdia", b"minf", b"stbl"}  # the path down to stco/co64
-
-
-def _faststart(mp4: bytes) -> bytes:
-    """Move ``moov`` in front of ``mdat`` so a reader that cannot seek finds the headers first
-    (qt-faststart, in memory: libav's own ``faststart`` needs a real file). Chunk offsets all
-    point into ``mdat``, so each grows by the length of the box now ahead of it."""
-    top = {kind: (lo, hi) for kind, lo, _, hi in _boxes(mp4, 0, len(mp4))}
-    (mdat, _), (moov_lo, moov_hi) = top[b"mdat"], top[b"moov"]
-    if moov_lo < mdat:
-        return mp4
-    moov = bytearray(mp4[moov_lo:moov_hi])
-
-    def shift(lo: int, hi: int) -> None:
-        for kind, at, header, end in _boxes(moov, lo, hi):
-            if kind in _OFFSET_PARENTS:
-                shift(at + header, end)
-            elif kind in (b"stco", b"co64"):
-                fmt = ">I" if kind == b"stco" else ">Q"
-                count = struct.unpack_from(">I", moov, at + header + 4)[0]  # after version/flags
-                for i in range(count):
-                    entry = at + header + 8 + i * struct.calcsize(fmt)
-                    struct.pack_into(fmt, moov, entry, struct.unpack_from(fmt, moov, entry)[0] + len(moov))
-
-    shift(0, len(moov))
-    return mp4[:mdat] + bytes(moov) + mp4[mdat:moov_lo] + mp4[moov_hi:]
+def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
+    """An MP4 muxer that puts ``moov`` first: libav reserves the room up front and seeks back into it
+    on close (``faststart`` would need a real file). The room bounds the sample tables: ~13 bytes
+    per sample for H.264 plus ~700 fixed, so 32 per sample plus 4 KiB is a comfortable ceiling."""
+    return av.open(buffer, mode="w", format="mp4", options={"moov_size": str(4096 + 32 * samples)})
 
 
 def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None) -> bytes:
@@ -103,7 +68,7 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
         return b""
     height, width = (size, size) if size else frames[0].shape[:2]
     buffer = io.BytesIO()
-    with av.open(buffer, mode="w", format="mp4") as output:
+    with _mp4(buffer, len(frames)) as output:
         stream = output.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
         stream.width, stream.height = width, height
         stream.pix_fmt = "yuv420p"
@@ -115,12 +80,12 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
             video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
             output.mux(stream.encode(reformatter.reformat(video_frame, width=width, height=height)))
         output.mux(stream.encode())
-    return _faststart(buffer.getvalue())
+    return buffer.getvalue()
 
 
 def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -> bytes:
     output = io.BytesIO()
-    with av.open(output, mode="w", format="mp4") as container:
+    with _mp4(output, len(packets)) as container:
         destination = container.add_stream_from_template(stream)
         # mux a copy: the source packets are shared between clips (the keyframe
         # lead-in), so rebasing them in place would corrupt the next clip
@@ -133,7 +98,7 @@ def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -
             packet.is_keyframe = source.is_keyframe
             packet.stream = destination
             container.mux(packet)
-    return _faststart(output.getvalue())
+    return output.getvalue()
 
 
 def _stream_pts(seconds: float, stream: av.VideoStream) -> int:
@@ -249,7 +214,7 @@ def _copy_windows(container: av.container.InputContainer, source: av.VideoStream
 
 def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int) -> bytes:
     output = io.BytesIO()
-    with av.open(output, mode="w", format="mp4") as container:
+    with _mp4(output, len(frames)) as container:
         # rate is nominal metadata; the rebased frame pts carry the real timing,
         # so a source without an average_rate only gets a mislabeled fps
         stream = container.add_stream("h264", rate=source.average_rate or 30)
@@ -262,7 +227,7 @@ def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: i
             video_frame.pict_type = 0  # let the encoder choose frame types
             container.mux(stream.encode(video_frame))
         container.mux(stream.encode())
-    return _faststart(output.getvalue())
+    return output.getvalue()
 
 
 def _encode_windows(container: av.container.InputContainer, source: av.VideoStream,

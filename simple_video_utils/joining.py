@@ -8,7 +8,7 @@ from fractions import Fraction
 import av
 
 from simple_video_utils.metadata import _open_video
-from simple_video_utils.slicing import _MP4_COPY_CODECS, _faststart, _iter_packets, _mux_packets
+from simple_video_utils.slicing import _MP4_COPY_CODECS, _iter_packets, _mux_packets
 
 
 def _packets(container: av.container.InputContainer, time_base: Fraction) -> list[av.Packet]:
@@ -85,7 +85,7 @@ def _encode_join(videos: Sequence[bytes]) -> bytes:
                     index += 1
                     destination.mux(stream.encode(video_frame))
             destination.mux(stream.encode())
-        return _faststart(output.getvalue())
+        return output.getvalue()
 
 
 def join_videos(videos: Iterable[bytes]) -> bytes:
