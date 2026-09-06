@@ -97,6 +97,9 @@ clips = slice_video("video.mp4", [(0.0, 1.5), (2.0, 3.2)])
 clips = slice_video("video.mp4", [(0.0, 1.5)], size=256)
 ```
 
+Clips are streamable MP4 (`moov` first), so a consumer can demux them from a
+pipe or socket without seeking.
+
 Split an incoming video stream into packet-copied clips as it arrives —
 each clip is yielded as soon as its window has been read, without re-encoding.
 Each carries its `start` on the source timeline, which counting the clips does

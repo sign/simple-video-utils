@@ -7,6 +7,9 @@ lossless. The file still carries the lead-in from the keyframe at/before
 starts at ``start``; a few frames past ``end`` may remain visible (B-frame
 reordering). Otherwise
 frames are decoded, center-cropped to a square, resized, and re-encoded.
+
+Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
+— a pipe, a socket — can demux it without seeking.
 """
 
 import io
@@ -52,13 +55,20 @@ def _center_crop_square(frame: np.ndarray) -> np.ndarray:
     return frame[top : top + side, left : left + side]
 
 
+def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
+    """An MP4 muxer that puts ``moov`` first: libav reserves the room up front and seeks back into it
+    on close (``faststart`` would need a real file). The room bounds the sample tables: ~13 bytes
+    per sample for H.264 plus ~700 fixed, so 32 per sample plus 4 KiB is a comfortable ceiling."""
+    return av.open(buffer, mode="w", format="mp4", options={"moov_size": str(4096 + 32 * samples)})
+
+
 def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None) -> bytes:
     frames = list(read_frames_exact(src, start_time=start, end_time=end))
     if not frames:
         return b""
     height, width = (size, size) if size else frames[0].shape[:2]
     buffer = io.BytesIO()
-    with av.open(buffer, mode="w", format="mp4") as output:
+    with _mp4(buffer, len(frames)) as output:
         stream = output.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
         stream.width, stream.height = width, height
         stream.pix_fmt = "yuv420p"
@@ -75,7 +85,7 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
 
 def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int) -> bytes:
     output = io.BytesIO()
-    with av.open(output, mode="w", format="mp4") as container:
+    with _mp4(output, len(packets)) as container:
         destination = container.add_stream_from_template(stream)
         # mux a copy: the source packets are shared between clips (the keyframe
         # lead-in), so rebasing them in place would corrupt the next clip
@@ -204,7 +214,7 @@ def _copy_windows(container: av.container.InputContainer, source: av.VideoStream
 
 def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int) -> bytes:
     output = io.BytesIO()
-    with av.open(output, mode="w", format="mp4") as container:
+    with _mp4(output, len(frames)) as container:
         # rate is nominal metadata; the rebased frame pts carry the real timing,
         # so a source without an average_rate only gets a mislabeled fps
         stream = container.add_stream("h264", rate=source.average_rate or 30)

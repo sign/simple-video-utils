@@ -92,6 +92,26 @@ def test_copy_keeps_trailing_frames():
     assert clip_count >= 21  # frames 0..20 cover [0, 0.68] at 30 fps
 
 
+class _Pipe:
+    """A read-only, unseekable file object: what a demuxer sees on a pipe or socket."""
+
+    def __init__(self, data: bytes):
+        self._buffer = io.BytesIO(data)
+
+    def read(self, size=-1):
+        return self._buffer.read(size)
+
+
+@pytest.mark.parametrize("size", [None, 256])  # stream-copied, and re-encoded (the 320x240 source is not square)
+def test_clips_are_streamable(video, size):
+    # moov before mdat, so a reader that cannot seek demuxes the clip as the
+    # bytes arrive instead of failing once its probe buffer is full.
+    [clip] = slice_video(video, [(0.0, 1.0)], size=size)
+    assert clip.index(b"moov") < clip.index(b"mdat")
+    with av.open(_Pipe(clip)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 30
+
+
 @pytest.mark.parametrize("size", [None, 256])
 def test_slicing_is_reproducible(video, size):
     # Both paths must be byte-stable: no wall-clock timestamp, encoder state, or
