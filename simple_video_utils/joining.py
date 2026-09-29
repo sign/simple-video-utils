@@ -30,9 +30,9 @@ def _packets(container: av.container.InputContainer, time_base: Fraction) -> lis
 def _overlap(first: list[av.Packet], second: list[av.Packet]) -> int:
     """Number of encoded packets shared by ``first``'s tail and ``second``'s head."""
     limit = min(len(first), len(second))
-    tail = [bytes(packet) for packet in first[len(first) - limit :]]
+    tail = [bytes(packet) for packet in first[len(first) - limit:]]
     head = [bytes(packet) for packet in second[:limit]]
-    return next((size for size in range(limit, 0, -1) if tail[limit - size :] == head[:size]), 0)
+    return next((size for size in range(limit, 0, -1) if tail[limit - size:] == head[:size]), 0)
 
 
 def _copy_join(videos: Sequence[bytes]) -> bytes | None:
