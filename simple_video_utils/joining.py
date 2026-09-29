@@ -1,11 +1,15 @@
 """Join videos, preserving their encoded packets when they overlap."""
 
 import io
+import json
 from collections.abc import Iterable, Sequence
 from contextlib import ExitStack
 from fractions import Fraction
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import av
+import numpy as np
 
 from simple_video_utils.metadata import _open_video
 from simple_video_utils.slicing import _MP4_COPY_CODECS, _iter_packets, _mux_packets
@@ -26,9 +30,9 @@ def _packets(container: av.container.InputContainer, time_base: Fraction) -> lis
 def _overlap(first: list[av.Packet], second: list[av.Packet]) -> int:
     """Number of encoded packets shared by ``first``'s tail and ``second``'s head."""
     limit = min(len(first), len(second))
-    tail = [bytes(packet) for packet in first[len(first) - limit:]]
+    tail = [bytes(packet) for packet in first[len(first) - limit :]]
     head = [bytes(packet) for packet in second[:limit]]
-    return next((size for size in range(limit, 0, -1) if tail[limit - size:] == head[:size]), 0)
+    return next((size for size in range(limit, 0, -1) if tail[limit - size :] == head[:size]), 0)
 
 
 def _copy_join(videos: Sequence[bytes]) -> bytes | None:
@@ -106,3 +110,106 @@ def join_videos(videos: Iterable[bytes]) -> bytes:
     if len(videos) == 1:
         return videos[0]
     return _copy_join(videos) or _encode_join(videos)
+
+
+def _gapped_tracks(video: av.container.InputContainer) -> tuple[Fraction, int, list[tuple[int, int, av.VideoStream]]]:
+    metadata = {key.lower(): value for key, value in video.metadata.items()}
+    if not video.streams.video or "source_fps" not in metadata or "source_frames" not in metadata:
+        message = "video needs tracks, source_fps and source_frames metadata"
+        raise ValueError(message)
+    rate = Fraction(metadata["source_fps"])
+    total = int(metadata["source_frames"])
+    if rate <= 0 or total < 0:
+        message = "source_fps must be positive and source_frames nonnegative"
+        raise ValueError(message)
+
+    clips = []
+    for stream in video.streams.video:
+        title = stream.metadata.get("title", "")
+        try:
+            start, end = map(int, title.split("-"))
+        except ValueError as exc:
+            message = f"invalid track title: {title!r}"
+            raise ValueError(message) from exc
+        clips.append((start, end, stream))
+    clips.sort(key=lambda clip: clip[0])
+    if any(
+        start < 0 or end <= start or end > total or (i and start < clips[i - 1][1])
+        for i, (start, end, _) in enumerate(clips)
+    ):
+        message = "track ranges must be disjoint and within source_frames"
+        raise ValueError(message)
+    return rate, total, clips
+
+
+def merge_video_tracks(source: str | Path, output: str | Path, *, gap_frame: np.ndarray | None = None) -> None:
+    """Merge frame-range-named video tracks into an MP4 on the source timeline.
+
+    The source must carry source_fps and source_frames metadata. Tracks have
+    titles like "191-212" (end exclusive). Clips are centered on a canvas
+    sized to the largest track (or to gap_frame, if supplied). gap_frame
+    must be large enough for every track and be uint8 RGB. Output metadata
+    contains the ordered clip payloads.
+    """
+    with av.open(str(source)) as video:
+        rate, total, clips = _gapped_tracks(video)
+
+        width = max(stream.width for _, _, stream in clips)
+        height = max(stream.height for _, _, stream in clips)
+        if gap_frame is None:
+            gap_frame = np.zeros((height, width, 3), dtype=np.uint8)
+        elif (
+            gap_frame.ndim != 3
+            or gap_frame.shape[2] != 3
+            or gap_frame.dtype != np.uint8
+            or gap_frame.shape[0] < height
+            or gap_frame.shape[1] < width
+        ):
+            message = "gap_frame must be uint8 RGB and at least as large as every track"
+            raise ValueError(message)
+        height, width = gap_frame.shape[:2]
+        if width % 2 or height % 2:
+            message = "output dimensions must be even for H.264"
+            raise ValueError(message)
+
+        payloads = [
+            {"start_frame": start, "end_frame": end, "payload": json.loads(stream.metadata.get("PAYLOAD", "{}"))}
+            for start, end, stream in clips
+        ]
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(dir=output.parent) as directory:
+            artifact = Path(directory) / output.name
+            with av.open(str(artifact), mode="w", format="mp4") as destination:
+                destination.metadata["comment"] = json.dumps(payloads)
+                stream = destination.add_stream("libx264", rate=rate, options={"crf": "18"})
+                stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+                index = 0
+
+                def encode(rgb: np.ndarray) -> None:
+                    nonlocal index
+                    frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                    frame.pts = index
+                    frame.time_base = Fraction(1) / rate
+                    destination.mux(stream.encode(frame))
+                    index += 1
+
+                for start, end, clip in clips:
+                    while index < start:
+                        encode(gap_frame)
+                    video.seek(0)
+                    count = 0
+                    for frame in video.decode(clip):
+                        rgb = frame.to_ndarray(format="rgb24")
+                        canvas = np.zeros_like(gap_frame)
+                        left, top = (width - clip.width) // 2, (height - clip.height) // 2
+                        canvas[top : top + clip.height, left : left + clip.width] = rgb
+                        encode(canvas)
+                        count += 1
+                    if count != end - start:
+                        message = f"track {start}-{end} declares {end - start} frames, decoded {count}"
+                        raise ValueError(message)
+                while index < total:
+                    encode(gap_frame)
+                destination.mux(stream.encode())
+            artifact.replace(output)
