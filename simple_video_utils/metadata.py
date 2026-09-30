@@ -1,10 +1,12 @@
 import io
 import ssl
+import sys
 from contextlib import contextmanager
 from functools import lru_cache
 from typing import NamedTuple
 
 import av
+import certifi
 
 
 class VideoMetadata(NamedTuple):
@@ -24,11 +26,12 @@ def _open_video(source: str | io.BytesIO, **av_kwargs) -> av.container.InputCont
         # metadata_errors. Older versions need it to open those same files.
         if int(av.__version__.split(".", 1)[0]) < 19:
             av_kwargs.setdefault("metadata_errors", "replace")
-        elif isinstance(source, str) and source.startswith("https://"):
+        elif sys.platform == "linux" and isinstance(source, str) and source.startswith("https://"):
             # PyAV 19's Linux wheels need an explicit trust store for HTTPS.
-            # Use Python's system/SSL_CERT_FILE roots; preserve caller options.
-            if ca_file := ssl.get_default_verify_paths().cafile:
-                av_kwargs["options"] = {"ca_file": ca_file, **av_kwargs.get("options", {})}
+            # Prefer system/SSL_CERT_FILE roots, falling back for Python builds
+            # with no default CA file. Preserve caller options.
+            ca_file = ssl.get_default_verify_paths().cafile or certifi.where()
+            av_kwargs["options"] = {"ca_file": ca_file, **av_kwargs.get("options", {})}
         return av.open(source, **av_kwargs)
     except Exception as e:
         msg = "Failed to open video"

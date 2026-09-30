@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11" # av 18 dropped 3.10
 dependencies = [
     "av>=18.0.0", # reformat(threads=) needs 17.0; 18.0 fixes reformat crashes on unsupported color primaries
+    "certifi", # HTTPS trust roots when Python has no default CA file (e.g. standalone builds)
     "numpy",
 ]
 

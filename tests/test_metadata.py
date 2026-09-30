@@ -1,4 +1,5 @@
 import io
+import ssl
 from pathlib import Path
 
 import av
@@ -105,8 +106,13 @@ class TestVideoMetadata:
         with pytest.raises(RuntimeError, match="Failed to open video"):
             video_metadata(empty)
 
-    def test_remote_video_url(self):
+    @pytest.mark.parametrize("missing_ca_file", [False, True])
+    def test_remote_video_url(self, monkeypatch, missing_ca_file):
         """Test metadata extraction from a remote video URL."""
+        if missing_ca_file:
+            paths = ssl.get_default_verify_paths()._replace(cafile=None)
+            monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: paths)
+        video_metadata.cache_clear()
         remote_url = "https://www.papytane.com/mp4/accrobra.mp4"
 
         meta = video_metadata(remote_url)
