@@ -10,12 +10,20 @@ on:
 
 jobs:
   test:
-    name: Test (Python ${{ matrix.python-version }})
+    name: Test (Python ${{ matrix.python-version }}, PyAV ${{ matrix.pyav }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        include:
+          - python-version: "3.11"
+            pyav: "18"
+          - python-version: "3.12"
+            pyav: "18"
+          - python-version: "3.12"
+            pyav: "19"
+          - python-version: "3.13"
+            pyav: "19"
 
     steps:
       - uses: actions/checkout@v6
@@ -34,7 +42,7 @@ jobs:
           activate-environment: true
 
       - name: Install dependencies
-        run: uv pip install ".[dev]"
+        run: uv pip install ".[dev]" "av==${{ matrix.pyav }}.*"
 
       - name: Test Code
-        run: uv run pytest -n auto --dist loadscope
+        run: python -m pytest -n auto --dist loadscope

@@ -4,7 +4,7 @@
 whose paint timing was jittered on a 120Hz grid (a rAF-driven pump on a
 ProMotion display does this naturally): no DefaultDuration, irregular cluster
 timestamps, so ffprobe reports ``avg_frame_rate 0/0`` and PyAV's
-``stream.average_rate`` is None.
+``stream.average_rate`` is unset (None before PyAV 19, a falsy AVRational since).
 
 ``no_average_rate_5s.webm`` is synthetic (PyAV-muxed VP8, 100 frames jittered
 on the same 120Hz grid, DefaultDuration overwritten with an EBML Void): the
@@ -34,7 +34,7 @@ def _decoded_ground_truth(path: str) -> tuple[float, int]:
     """True cadence and count, independent of the code under test."""
     with av.open(path) as container:
         # the fixtures must actually exercise the fallback
-        assert container.streams.video[0].average_rate is None
+        assert not container.streams.video[0].average_rate
         times = [frame.time for frame in container.decode(video=0)]
     return (len(times) - 1) / (times[-1] - times[0]), len(times)
 

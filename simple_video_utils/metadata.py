@@ -19,10 +19,11 @@ class VideoMetadata(NamedTuple):
 def _open_video(source: str | io.BytesIO, **av_kwargs) -> av.container.InputContainer:
     """Open a container, wrapping failures as RuntimeError('Failed to open video')."""
     try:
-        # metadata_errors='replace': some files carry non-UTF-8 stream metadata
-        # (e.g. handler_name in stray mp4s data tracks), which would otherwise
-        # raise UnicodeDecodeError before the video stream is even reachable.
-        return av.open(source, metadata_errors="replace", **av_kwargs)
+        # PyAV 19 handles non-UTF-8 metadata with surrogateescape and removed
+        # metadata_errors. Older versions need it to open those same files.
+        if int(av.__version__.split(".", 1)[0]) < 19:
+            av_kwargs.setdefault("metadata_errors", "replace")
+        return av.open(source, **av_kwargs)
     except Exception as e:
         msg = "Failed to open video"
         raise RuntimeError(msg) from e
@@ -162,7 +163,7 @@ def _decoded_rate_and_count(
 
     Browser-recorded (MediaRecorder) WebM often carries no rate hint at all —
     no DefaultDuration, irregular cluster timestamps — so PyAV's
-    ``stream.average_rate`` comes back None (ffprobe: ``avg_frame_rate 0/0``).
+    ``stream.average_rate`` is unset (ffprobe: ``avg_frame_rate 0/0``).
     With no header rate, every cheap signal is suspect: packet counts include
     trailing packets that never decode (issue #4), and container.duration
     spans the longest stream, which audio can pad past the video. Decoding
