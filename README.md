@@ -123,6 +123,18 @@ from simple_video_utils.joining import join_videos
 video = join_videos(clips)
 ```
 
+Store clips of one source video as separate tracks of a Matroska file, each at its
+own size and at its source time, then merge them back onto the full source
+timeline with gaps filled (black by default):
+
+```python
+from simple_video_utils.joining import VideoTrack, merge_video_tracks, write_video_tracks
+
+tracks = [VideoTrack(start_frame=191, end_frame=212, width=320, height=320, frames=crops, payload={"signer_id": 0})]
+write_video_tracks(tracks, "clips.mkv", fps=25, source_frames=600)
+merge_video_tracks("clips.mkv", "merged.mp4")
+```
+
 ### Remote Videos
 
 ```python
