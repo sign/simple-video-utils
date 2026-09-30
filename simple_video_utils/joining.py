@@ -4,6 +4,7 @@ import io
 import json
 from collections.abc import Iterable, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -112,8 +113,83 @@ def join_videos(videos: Iterable[bytes]) -> bytes:
     return _copy_join(videos) or _encode_join(videos)
 
 
+GAPPED_TRACKS_TAG = "gapped_tracks"
+GAPPED_TRACKS_VERSION = "1"
+
+
+@dataclass
+class VideoTrack:
+    """One clip of a source video: frames [start_frame, end_frame) as uint8 RGB of height x width."""
+
+    start_frame: int
+    end_frame: int
+    width: int
+    height: int
+    frames: Iterable[np.ndarray]
+    payload: dict | None = None
+
+
+def _track_packets(stream: av.VideoStream, track: VideoTrack) -> Iterable[av.Packet]:
+    count = 0
+    for rgb in track.frames:
+        if rgb.shape != (track.height, track.width, 3) or rgb.dtype != np.uint8:
+            message = f"track {track.start_frame}-{track.end_frame} frames must be uint8 RGB of its height x width"
+            raise ValueError(message)
+        padded = np.pad(rgb, ((0, stream.height - track.height), (0, stream.width - track.width), (0, 0)))
+        frame = av.VideoFrame.from_ndarray(padded, format="rgb24")
+        # each track sits at its source time, so a player shows the clip where it happened
+        frame.pts = track.start_frame + count
+        yield from stream.encode(frame)
+        count += 1
+    if count != track.end_frame - track.start_frame:
+        expected = track.end_frame - track.start_frame
+        message = f"track {track.start_frame}-{track.end_frame} declares {expected} frames, got {count}"
+        raise ValueError(message)
+    yield from stream.encode()
+
+
+def write_video_tracks(
+    tracks: Sequence[VideoTrack], output: str | Path, *, fps: float | Fraction, source_frames: int
+) -> None:
+    """Write each clip as its own H.264 track of a Matroska file that merge_video_tracks reads back.
+
+    Tracks are titled "start-end" (end exclusive) and carry their payload as JSON. The file carries
+    source_fps, source_frames and a gapped_tracks version tag. Odd sizes are padded right and bottom
+    to even for H.264.
+    """
+    if not tracks:
+        message = "at least one track is required"
+        raise ValueError(message)
+    rate = Fraction(fps).limit_denominator(1000)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with TemporaryDirectory(dir=output.parent) as directory:
+        artifact = Path(directory) / output.name
+        with av.open(str(artifact), mode="w", format="matroska") as container:
+            container.metadata[GAPPED_TRACKS_TAG] = GAPPED_TRACKS_VERSION
+            container.metadata["source_fps"] = str(rate)
+            container.metadata["source_frames"] = str(source_frames)
+
+            # matroska writes its header on the first packet, so every track is registered before any is encoded
+            streams = []
+            for track in tracks:
+                stream = container.add_stream("libx264", rate=rate)
+                stream.width, stream.height = track.width + track.width % 2, track.height + track.height % 2
+                stream.pix_fmt = "yuv420p"
+                stream.metadata["title"] = f"{track.start_frame}-{track.end_frame}"
+                stream.metadata["payload"] = json.dumps(track.payload or {})
+                streams.append(stream)
+            for stream, track in zip(streams, tracks, strict=True):
+                for packet in _track_packets(stream, track):
+                    container.mux(packet)
+        artifact.replace(output)
+
+
 def _gapped_tracks(video: av.container.InputContainer) -> tuple[Fraction, int, list[tuple[int, int, av.VideoStream]]]:
     metadata = {key.lower(): value for key, value in video.metadata.items()}
+    if metadata.get(GAPPED_TRACKS_TAG) != GAPPED_TRACKS_VERSION:
+        message = f"video is not written by write_video_tracks (no {GAPPED_TRACKS_TAG}={GAPPED_TRACKS_VERSION} tag)"
+        raise ValueError(message)
     if not video.streams.video or "source_fps" not in metadata or "source_frames" not in metadata:
         message = "video needs tracks, source_fps and source_frames metadata"
         raise ValueError(message)
