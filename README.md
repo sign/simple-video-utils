@@ -135,6 +135,25 @@ write_video_tracks(tracks, "clips.mkv", fps=25, source_frames=600)
 merge_video_tracks("clips.mkv", "merged.mp4")
 ```
 
+To crop directly from a source file, specify frame ranges and rectangles. This
+keeps decoded frames in PyAV/FFmpeg, without converting them to RGB arrays:
+
+```python
+from simple_video_utils.joining import VideoCrop, write_video_crops
+
+crops = [VideoCrop(start_frame=191, end_frame=212, x=40, y=60, width=319, height=241, payload={"signer_id": 0})]
+write_video_crops("original.mp4", crops, "clips.mkv")
+```
+
+End frames are exclusive. Ranges must be disjoint and within the source, but
+may be supplied in any order. Rectangles use stored pixel coordinates, before
+display rotation. Crops are re-encoded as H.264 at CRF 18; odd sizes receive
+black padding on the right and bottom. The source is decoded once in frame
+order, including gaps, with bounded memory. The format uses the source's
+nominal frame rate, so variable-rate inputs are placed on a uniform cadence.
+`VideoTrack.frames` also accepts native `av.VideoFrame` objects for callers
+that already have a decoding pipeline.
+
 ### Remote Videos
 
 ```python

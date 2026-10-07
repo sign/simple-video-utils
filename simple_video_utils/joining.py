@@ -6,13 +6,14 @@ from collections.abc import Iterable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from fractions import Fraction
+from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import av
 import numpy as np
 
-from simple_video_utils.metadata import _open_video
+from simple_video_utils.metadata import _open_video, video_metadata_from_container
 from simple_video_utils.slicing import _MP4_COPY_CODECS, _iter_packets, _mux_packets
 
 
@@ -119,26 +120,126 @@ GAPPED_TRACKS_VERSION = "1"
 
 @dataclass
 class VideoTrack:
-    """One clip of a source video: frames [start_frame, end_frame) as uint8 RGB of height x width."""
+    """One clip: frames [start_frame, end_frame) as uint8 RGB arrays or PyAV video frames."""
 
     start_frame: int
     end_frame: int
     width: int
     height: int
-    frames: Iterable[np.ndarray]
+    frames: Iterable[np.ndarray | av.VideoFrame]
     payload: dict | None = None
 
 
-def _track_packets(stream: av.VideoStream, track: VideoTrack) -> Iterable[av.Packet]:
-    count = 0
-    for rgb in track.frames:
-        if rgb.shape != (track.height, track.width, 3) or rgb.dtype != np.uint8:
-            message = f"track {track.start_frame}-{track.end_frame} frames must be uint8 RGB of its height x width"
+@dataclass
+class VideoCrop:
+    """A source-frame range [start_frame, end_frame) and a crop in stored pixel coordinates."""
+
+    start_frame: int
+    end_frame: int
+    x: int
+    y: int
+    width: int
+    height: int
+    payload: dict | None = None
+
+
+def _crop_frames(frames: Iterable[av.VideoFrame], crop: VideoCrop) -> Iterable[av.VideoFrame]:
+    graph = None
+    for frame in frames:
+        if graph is None:
+            graph = av.filter.Graph()
+            # Subsampled chroma cannot represent odd crop origins exactly.
+            filters = []
+            if any(value % 2 for value in (crop.x, crop.y, crop.width, crop.height)):
+                filters.append(graph.add("format", "pix_fmts=yuv444p"))
+            graph.link_nodes(
+                graph.add_buffer(template=frame),
+                *filters,
+                graph.add("crop", f"{crop.width}:{crop.height}:{crop.x}:{crop.y}:exact=1"),
+                graph.add("buffersink"),
+            )
+            graph.configure()
+        graph.push(frame)
+        yield graph.pull()
+
+
+def write_video_crops(source: str | Path, crops: Sequence[VideoCrop], output: str | Path) -> None:
+    """Crop source ranges into gapped H.264 Matroska tracks without converting frames to RGB.
+
+    Crops use stored coordinates (before display rotation), have exclusive end frames,
+    and must be disjoint and within the source. Odd sizes are padded right and bottom.
+    Decoding runs once in presentation order, including intervening gaps, and only crop
+    frames are filtered and re-encoded. Memory is bounded independently of clip length.
+    The output uses the source's nominal frame rate, as does merge_video_tracks.
+    """
+    with _open_video(str(source)) as video:
+        stream = video.streams.video[0]
+        metadata = video_metadata_from_container(video)
+        rate = Fraction(stream.average_rate) if stream.average_rate else Fraction(metadata.fps).limit_denominator(1000)
+        if metadata.nb_frames is None:
+            message = "source frame count is unavailable"
             raise ValueError(message)
-        padded = np.pad(rgb, ((0, stream.height - track.height), (0, stream.width - track.width), (0, 0)))
-        frame = av.VideoFrame.from_ndarray(padded, format="rgb24")
+        _validate_track_ranges(((crop.start_frame, crop.end_frame) for crop in crops), metadata.nb_frames)
+        for crop in crops:
+            if (
+                crop.x < 0 or crop.y < 0 or crop.width <= 0 or crop.height <= 0
+                or crop.x + crop.width > stream.width or crop.y + crop.height > stream.height
+            ):
+                message = "crop must have positive dimensions and lie within the stored source frame"
+                raise ValueError(message)
+        decoded = video.decode(stream)
+        tracks = []
+        previous_end = 0
+        for crop in sorted(crops, key=lambda crop: crop.start_frame):
+            frames = islice(decoded, crop.start_frame - previous_end, crop.end_frame - previous_end)
+            tracks.append(VideoTrack(
+                crop.start_frame, crop.end_frame, crop.width, crop.height, _crop_frames(frames, crop), crop.payload
+            ))
+            previous_end = crop.end_frame
+        write_video_tracks(tracks, output, fps=rate, source_frames=metadata.nb_frames)
+
+
+def _validate_track_ranges(ranges: Iterable[tuple[int, int]], total: int) -> None:
+    previous_end = 0
+    for start, end in sorted(ranges):
+        if start < previous_end or end <= start or end > total:
+            message = "track ranges must be disjoint and within source_frames"
+            raise ValueError(message)
+        previous_end = end
+
+
+def _track_packets(stream: av.VideoStream, track: VideoTrack, rate: Fraction) -> Iterable[av.Packet]:
+    count = 0
+    padding = None
+    for item in track.frames:
+        if isinstance(item, av.VideoFrame):
+            frame = item
+            valid = (frame.width, frame.height) == (track.width, track.height)
+        else:
+            valid = item.shape == (track.height, track.width, 3) and item.dtype == np.uint8
+            if valid:
+                padded = np.pad(item, ((0, stream.height - track.height), (0, stream.width - track.width), (0, 0)))
+                frame = av.VideoFrame.from_ndarray(padded, format="rgb24")
+        if not valid:
+            message = f"track {track.start_frame}-{track.end_frame} needs frames matching its dimensions"
+            raise ValueError(message)
+        frame.time_base = Fraction(1) / rate
+        if isinstance(item, av.VideoFrame) and (track.width % 2 or track.height % 2):
+            # pad rounds subsampled input sizes down; 4:4:4 retains the last odd row/column.
+            frame = frame.reformat(format="yuv444p")
+            if padding is None:
+                padding = av.filter.Graph()
+                padding.link_nodes(
+                    padding.add_buffer(template=frame),
+                    padding.add("pad", f"{stream.width}:{stream.height}:0:0:black"),
+                    padding.add("buffersink"),
+                )
+                padding.configure()
+            padding.push(frame)
+            frame = padding.pull()
         # each track sits at its source time, so a player shows the clip where it happened
         frame.pts = track.start_frame + count
+        frame.pict_type = 0
         yield from stream.encode(frame)
         count += 1
     if count != track.end_frame - track.start_frame:
@@ -155,12 +256,19 @@ def write_video_tracks(
 
     Tracks are titled "start-end" (end exclusive) and carry their payload as JSON. The file carries
     source_fps, source_frames and a gapped_tracks version tag. Odd sizes are padded right and bottom
-    to even for H.264.
+    to even for H.264. Ranges must be disjoint and within source_frames; tracks may be in any order.
     """
     if not tracks:
         message = "at least one track is required"
         raise ValueError(message)
-    rate = Fraction(fps).limit_denominator(1000)
+    rate = Fraction(fps) if not isinstance(fps, float) else Fraction(fps).limit_denominator(1000)
+    if rate <= 0 or source_frames < 0:
+        message = "source_fps must be positive and source_frames nonnegative"
+        raise ValueError(message)
+    _validate_track_ranges(((track.start_frame, track.end_frame) for track in tracks), source_frames)
+    if any(track.width <= 0 or track.height <= 0 for track in tracks):
+        message = "track dimensions must be positive"
+        raise ValueError(message)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=output.parent) as directory:
@@ -173,14 +281,14 @@ def write_video_tracks(
             # matroska writes its header on the first packet, so every track is registered before any is encoded
             streams = []
             for track in tracks:
-                stream = container.add_stream("libx264", rate=rate)
+                stream = container.add_stream("libx264", rate=rate, options={"crf": "18"})
                 stream.width, stream.height = track.width + track.width % 2, track.height + track.height % 2
                 stream.pix_fmt = "yuv420p"
                 stream.metadata["title"] = f"{track.start_frame}-{track.end_frame}"
                 stream.metadata["payload"] = json.dumps(track.payload or {})
                 streams.append(stream)
             for stream, track in zip(streams, tracks, strict=True):
-                for packet in _track_packets(stream, track):
+                for packet in _track_packets(stream, track, rate):
                     container.mux(packet)
         artifact.replace(output)
 
@@ -209,12 +317,7 @@ def _gapped_tracks(video: av.container.InputContainer) -> tuple[Fraction, int, l
             raise ValueError(message) from exc
         clips.append((start, end, stream))
     clips.sort(key=lambda clip: clip[0])
-    if any(
-        start < 0 or end <= start or end > total or (i and start < clips[i - 1][1])
-        for i, (start, end, _) in enumerate(clips)
-    ):
-        message = "track ranges must be disjoint and within source_frames"
-        raise ValueError(message)
+    _validate_track_ranges(((start, end) for start, end, _ in clips), total)
     return rate, total, clips
 
 
@@ -273,7 +376,8 @@ def merge_video_tracks(source: str | Path, output: str | Path, *, gap_frame: np.
                 for start, end, clip in clips:
                     while index < start:
                         encode(gap_frame)
-                    video.seek(0)
+                    # A container-wide seek uses the first track, which may start after this clip.
+                    video.seek(clip.start_time or 0, stream=clip)
                     count = 0
                     for frame in video.decode(clip):
                         rgb = frame.to_ndarray(format="rgb24")
