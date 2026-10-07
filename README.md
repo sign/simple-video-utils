@@ -123,6 +123,28 @@ from simple_video_utils.joining import join_videos
 video = join_videos(clips)
 ```
 
+Store source-file crops as separate H.264 Matroska tracks, then merge them onto
+the source timeline with gaps filled:
+
+```python
+from simple_video_utils.tracks import VideoCrop, merge_video_tracks, write_video_crops
+
+crops = [VideoCrop(start_frame=191, end_frame=212, x=40, y=60, width=319, height=241, payload={"signer_id": 0})]
+write_video_crops("original.mp4", crops, "clips.mkv")
+merge_video_tracks("clips.mkv", "merged.mp4")  # gap_color="white" is also supported
+```
+
+Ranges are half-open, disjoint, and within the source; input order is arbitrary.
+Rectangles use stored pixel coordinates before display rotation. Odd sizes are
+padded right and bottom to even. Each track keeps its size, source-time position,
+and JSON payload. Merge centers tracks on the largest track's canvas, restores
+the complete source timeline, and saves the ordered payloads in the MP4 comment.
+
+Both paths keep frames in PyAV/FFmpeg, with no RGB arrays, and encode at CRF 18.
+Extraction decodes in frame order, including gaps, with bounded memory. The format
+uses the nominal source frame rate, so variable-rate input is placed on a uniform
+cadence. Both outputs are written atomically.
+
 ### Remote Videos
 
 ```python
