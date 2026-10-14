@@ -6,7 +6,9 @@ import av
 import numpy as np
 import pytest
 
+from simple_video_utils import frames as frames_module
 from simple_video_utils.frames import read_frames_batched, read_frames_exact
+from simple_video_utils.metadata import count_frames, open_video
 
 ASSETS = Path(__file__).parent / "assets"
 FPS = 10
@@ -75,11 +77,28 @@ def test_each_frame_carries_its_chapter_payload(chapter_video):
 
 
 def test_a_frame_range_follows_the_source_timeline(chapter_video):
-    # 3 s or more in, a read seeks first, on the file's own source times
+    # a read seeks to its first frame's keyframe, on the file's own source times
     frames = read_frames_exact(chapter_video, start_frame=38, end_frame=46, return_indices=True)
     assert [index for _, index in frames] == [38, 39, 45, 46]
-    frames = read_frames_exact(chapter_video, start_frame=50, return_indices=True)
+    frames = list(read_frames_exact(chapter_video, start_frame=50, return_indices=True))
     assert [index for _, index in frames] == [*range(50, 55), *range(60, 70)]
+    # the non-reference frames before it, which the read skips, change none of its frames
+    whole = list(read_frames_exact(chapter_video))
+    assert all(np.array_equal(frame, whole[INDICES.index(index)]) for frame, index in frames)
+
+
+def test_a_range_read_leaves_a_reused_container_decoding_every_frame(chapter_video):
+    with open_video(chapter_video) as video:
+        # past the last frame, the whole last chapter is the run up to the range, its non-reference frames skipped
+        assert list(read_frames_exact(video, start_frame=75)) == []
+        assert count_frames(video) == len(INDICES)
+
+
+def test_batching_reads_the_frame_count_from_the_header(chapter_video, monkeypatch):
+    # Matroska stores no frame count: its duration stands in, and nothing reads the whole file to count frames
+    monkeypatch.setattr(frames_module, "video_metadata", lambda src: pytest.fail("counted the file's frames"))
+    frames_module._count_and_rate_cached.cache_clear()
+    assert read_frames_batched(chapter_video, start_frame=45, end_frame=54).shape == (10, 32, 32, 3)
 
 
 def test_batching_frames_of_different_sizes_needs_a_size(chapter_video):

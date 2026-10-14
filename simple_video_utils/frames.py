@@ -1,4 +1,5 @@
 import json
+import math
 import operator
 import sys
 from collections.abc import Callable, Generator, Iterable
@@ -25,6 +26,8 @@ from simple_video_utils.metadata import (
 # hardware-dependent (thread dispatch cost vs single-core throughput), so this
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
+# decoded formats that `size` scales plane by plane before converting to rgb24
+_PLANAR_SCALE_FORMATS = frozenset({"yuv420p", "yuvj420p"})
 
 def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
     """
@@ -75,6 +78,8 @@ def _frames_to_rgb(
     pixel-exactness (measured maxdiff 2-3).
     """
     reformatter = av.video.reformatter.VideoReformatter()
+    # a second context for the scaling step, so neither is rebuilt between the two steps of every frame
+    scaler = av.video.reformatter.VideoReformatter()
     # One-slot cache: built on the first rotated frame, reused for the whole
     # read, rebuilt only if stream geometry changes mid-read. Created here so
     # each read gets its own graph (see _rotation_graph on why).
@@ -89,8 +94,17 @@ def _frames_to_rgb(
             width, height = size[::-1] if rotation in (90, 270) else size
             # area averaging keeps a downscale from aliasing; bicubic is the sharper upscale
             interpolation = "AREA" if width * height < frame.width * frame.height else "BICUBIC"
-            rgb = reformatter.reformat(frame, format='rgb24', width=width, height=height,
-                                       interpolation=interpolation, threads=threads)
+            if frame.format.name in _PLANAR_SCALE_FORMATS:
+                # scale the 4:2:0 planes, then convert the scaled frame: a third of the CPU of scaling straight to
+                # rgb24 (measured 61 vs 161 us a frame to 256 x 256), with chroma at 4:2:0 of the output size, as
+                # an encode at that size keeps it
+                scaled = scaler.reformat(frame, width=width, height=height, interpolation=interpolation,
+                                         threads=threads)
+                threads = 1 if width * height < _SINGLE_THREAD_MAX_PIXELS else 0
+                rgb = reformatter.reformat(scaled, format='rgb24', threads=threads)
+            else:
+                rgb = reformatter.reformat(frame, format='rgb24', width=width, height=height,
+                                           interpolation=interpolation, threads=threads)
         if rotation and rotation % 90 == 0:
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
@@ -128,6 +142,30 @@ def _frames_on_timeline(
             return
         if index >= start:
             yield index, frame
+
+
+def _decode_from(
+    container: av.container.InputContainer, stream: av.VideoStream, start: float
+) -> Generator[av.VideoFrame, None, None]:
+    """
+    Decode ``stream``, but not the non-reference frames shown before ``start`` seconds.
+
+    No frame refers to them, so the frames from ``start`` on decode the same, and a read that
+    seeks to the keyframe before its range skips much of the run up to it. Frames must be
+    located by their timestamps, as the skipped ones never come out.
+    """
+    codec = stream.codec_context
+    start_pts = start / stream.time_base
+    try:
+        for packet in container.demux(stream):
+            lead_in = packet.pts is not None and packet.pts < start_pts
+            # the decoder reads skip_frame per packet, frame threads included
+            if lead_in != (codec.skip_frame == "NONREF"):
+                codec.skip_frame = "NONREF" if lead_in else "DEFAULT"
+            yield from packet.decode()
+    finally:
+        # a reused container's next read must decode everything
+        codec.skip_frame = "DEFAULT"
 
 
 def _with_chapters(
@@ -255,7 +293,7 @@ def _seek_near(
     fps: float,
     stream,
     container,
-    from_zero: bool = False,
+    chapter_file: bool = False,
 ) -> bool:
     """
     Seek toward the target position if it is far enough from the start.
@@ -271,12 +309,18 @@ def _seek_near(
     seek_buffer_seconds = 1.0  # Seek 1 second before target
 
     target_time = target_start_frame / fps
+    if chapter_file:
+        # a chapter file's timestamps are the source times frames are indexed by, and its Matroska cues land a
+        # seek on the keyframe at or before it: half a frame past the target keeps the target's own keyframe
+        if not target_start_frame:
+            return False
+        container.seek(int((target_start_frame + 0.5) / fps / float(stream.time_base)), stream=stream)
+        return True
     if target_time < min_seek_seconds:
         return False
 
-    # stream timestamps don't have to start at 0 — seek on the stream's timeline, unless they are
-    # already the source times frames are indexed by, as in a chapter file
-    origin = 0 if from_zero else stream.start_time or 0
+    # stream timestamps don't have to start at 0 — seek on the stream's timeline
+    origin = stream.start_time or 0
     seek_timestamp = int((target_time - seek_buffer_seconds) / float(stream.time_base)) + origin
     container.seek(seek_timestamp, stream=stream)
     return True
@@ -379,7 +423,8 @@ def read_frames_exact(
             video (the start offset is included, and fps drop-selection
             reports exactly the frames it kept). Default False: plain arrays.
         size: (width, height) every frame is scaled to, up or down, in display
-            orientation. None keeps each frame's own size, which may change from
+            orientation; a 4:2:0 frame's planes are scaled before it is converted
+            to RGB. None keeps each frame's own size, which may change from
             frame to frame, as at a chapter boundary of a chapter file.
         return_chapters: When True, also yield each frame's chapter payload: the
             JSON object in the ``payload`` tag of the chapter holding the frame
@@ -446,8 +491,11 @@ def read_frames_exact(
                 target_start, target_end = frame_range
 
             chapters = _chapters(container)
-            did_seek = _seek_near(target_start, source_fps, stream, container, from_zero=bool(chapters))
-            decoded = container.decode(video=0)
+            did_seek = _seek_near(target_start, source_fps, stream, container, chapter_file=bool(chapters))
+            if chapters:
+                decoded = _decode_from(container, stream, start=(target_start - 0.5) / source_fps)
+            else:
+                decoded = container.decode(video=0)
             if chapters:
                 indexed = _frames_on_timeline(decoded, source_fps, target_start, target_end)
             elif did_seek:
@@ -537,8 +585,25 @@ def _count_and_rate_cached(src: str) -> tuple[int, float]:
     """
     with _open_container(src) as container:
         stream = container.streams.video[0]
-        total, fps = stream.frames, float(stream.average_rate or 0)
+        fps = float(stream.average_rate or 0)
+        total = _header_frames(container, stream, fps)
     return _fill_from_metadata(total, fps, lambda: video_metadata(src))
+
+
+def _header_frames(container: av.container.InputContainer, stream: av.VideoStream, fps: float) -> int:
+    """
+    The header's frame count, or one estimated from its duration when it has none, as Matroska.
+
+    Only a size hint: counting the packets instead, as video_metadata does, reads the whole
+    file, and measured up to 0.9 s on a chapter export's first batched read.
+    """
+    if stream.frames or not fps:
+        return stream.frames
+    if stream.duration and stream.time_base:
+        seconds = float(stream.duration * stream.time_base)
+    else:
+        seconds = (container.duration or 0) / av.time_base
+    return math.ceil(seconds * fps)
 
 
 def _fill_from_metadata(total: int, fps: float, get_meta) -> tuple[int, float]:
@@ -555,8 +620,8 @@ def _count_and_rate(src: str | av.container.InputContainer) -> tuple[int, float]
     # Open containers read the header directly, uncached — caching keyed on a
     # container would pin it and serve stale answers after it's closed.
     stream = src.streams.video[0]
-    total, fps = stream.frames, float(stream.average_rate or 0)
-    return _fill_from_metadata(total, fps, lambda: video_metadata_from_container(src))
+    fps = float(stream.average_rate or 0)
+    return _fill_from_metadata(_header_frames(src, stream, fps), fps, lambda: video_metadata_from_container(src))
 
 
 def read_frames_batched(
@@ -577,7 +642,8 @@ def read_frames_batched(
     ``stack_frames`` over ``read_frames_exact`` (same parameters), with the
     batch preallocated exactly: the requested range is converted to a frame
     count with the same helpers read_frames_exact uses, clamped to the
-    clip's header frame count — 26-38% faster than stacking afterward.
+    clip's frame count from its header or duration — 26-38% faster than
+    stacking afterward.
     ``torch.from_numpy(...)`` wraps the result zero-copy; building the batch
     in torch directly measured 3x slower (per-op dispatch), so numpy is the
     fast path either way.

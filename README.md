@@ -52,6 +52,9 @@ frames = list(read_frames_exact("video.mp4", fps=15))
 frames = list(read_frames_exact("video.mp4", size=(256, 256)))
 ```
 
+`size` scales a 4:2:0 frame's planes before converting it to RGB, so its colour stays at 4:2:0 of the new size, as an
+encode at that size would keep it. That takes a third of the CPU of scaling straight to RGB.
+
 ### Chapter Files
 
 A chapter file keeps its clips as the chapters of one video track: each clip at its source time, with gaps between
@@ -64,6 +67,10 @@ A chapter file's frame sides must be multiples of 16, which is the H.264 macrobl
 previous chapter's size when two sizes cover the same macroblocks and differ only in their crop, as 470 and 472 do. It
 then returns the top-left of the frame and drops its right and bottom edge. Every FFmpeg-based reader reads such a
 file this way, this one included.
+
+A range read seeks to the keyframe at or before its first frame and skips decoding the non-reference frames before it,
+which no other frame refers to. `thread_type="AUTO"` reads a 15-frame clip fastest, `"SLICE"` takes a quarter less CPU
+for nearly the same speed, and `"NONE"` takes the least CPU, for loaders whose worker processes already fill the cores.
 
 ```python
 from simple_video_utils.frames import read_frames_batched, read_frames_exact
