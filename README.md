@@ -60,11 +60,16 @@ clips, and at its own frame size. Frames come at their chapter's size, which can
 `return_chapters=True` adds each frame's chapter payload: the JSON object in the chapter's `payload` tag, `{}` for a
 chapter without one, or `None` outside every chapter.
 
+A chapter file's frame sides must be multiples of 16, which is the H.264 macroblock size. FFmpeg's decoder can keep the
+previous chapter's size when two sizes cover the same macroblocks and differ only in their crop, as 470 and 472 do. It
+then returns the top-left of the frame and drops its right and bottom edge. Every FFmpeg-based reader reads such a
+file this way, this one included.
+
 ```python
 from simple_video_utils.frames import read_frames_batched, read_frames_exact
 
 for frame, payload in read_frames_exact("clips.mkv", return_chapters=True):
-    ...  # e.g. 768x768 frames, then 354x354 ones from the next chapter
+    ...  # e.g. 768x768 frames, then 352x352 ones from the next chapter
 
 # frames of different sizes batch only once scaled to one size; without size, read_frames_batched raises
 frames, indices, payloads = read_frames_batched(

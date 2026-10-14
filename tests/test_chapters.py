@@ -10,7 +10,8 @@ from simple_video_utils.frames import read_frames_batched, read_frames_exact
 
 ASSETS = Path(__file__).parent / "assets"
 FPS = 10
-# source frames [start, end) and the square side of each chapter: the file starts 3 s in, with gaps between them
+# source frames [start, end) and the square side of each chapter, on whole 16-px macroblocks as an export writes it:
+# the file starts 3 s in, with gaps between the chapters
 CHAPTERS = [(30, 40, 64), (45, 55, 32), (60, 70, 48)]
 INDICES = [*range(30, 40), *range(45, 55), *range(60, 70)]
 
