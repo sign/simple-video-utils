@@ -47,6 +47,29 @@ frames = list(read_frames_exact("video.mp4", start_frame=5, end_frame=None))
 
 # Downsample to a target frame rate (drops frames uniformly, never duplicates)
 frames = list(read_frames_exact("video.mp4", fps=15))
+
+# Scale every frame to one (width, height), up or down, in display orientation
+frames = list(read_frames_exact("video.mp4", size=(256, 256)))
+```
+
+### Chapter Files
+
+A chapter file keeps its clips as the chapters of one video track: each clip at its source time, with gaps between
+clips, and at its own frame size. Frames come at their chapter's size, which can change from frame to frame, unless
+`size` scales them to one. Frame indices and ranges follow the source timeline, as the chapters' own frame numbers do.
+`return_chapters=True` adds each frame's chapter payload: the JSON object in the chapter's `payload` tag, `{}` for a
+chapter without one, or `None` outside every chapter.
+
+```python
+from simple_video_utils.frames import read_frames_batched, read_frames_exact
+
+for frame, payload in read_frames_exact("clips.mkv", return_chapters=True):
+    ...  # e.g. 768x768 frames, then 354x354 ones from the next chapter
+
+# frames of different sizes batch only once scaled to one size; without size, read_frames_batched raises
+frames, indices, payloads = read_frames_batched(
+    "clips.mkv", size=(256, 256), return_indices=True, return_chapters=True,
+)
 ```
 
 ### One Open, Many Reads
