@@ -25,6 +25,8 @@ from simple_video_utils.metadata import (
 # hardware-dependent (thread dispatch cost vs single-core throughput), so this
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
+# decoded formats that `size` scales plane by plane before converting to rgb24
+_PLANAR_SCALE_FORMATS = frozenset({"yuv420p", "yuvj420p"})
 
 def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
     """
@@ -50,9 +52,12 @@ def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction 
     return graph
 
 
-def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
+def _frames_to_rgb(
+    frames: Iterable[av.VideoFrame], size: tuple[int, int] | None = None
+) -> Generator[np.ndarray, None, None]:
     """
-    Convert decoded frames to RGB arrays in display orientation.
+    Convert decoded frames to RGB arrays in display orientation, each at its own
+    size or, given ``size`` as (width, height), scaled to it.
 
     PyAV decodes frames in their stored orientation and does not apply the
     container's display-matrix rotation (unlike the ffmpeg CLI, which
@@ -72,14 +77,33 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
     pixel-exactness (measured maxdiff 2-3).
     """
     reformatter = av.video.reformatter.VideoReformatter()
+    # a second context for the scaling step, so neither is rebuilt between the two steps of every frame
+    scaler = av.video.reformatter.VideoReformatter()
     # One-slot cache: built on the first rotated frame, reused for the whole
     # read, rebuilt only if stream geometry changes mid-read. Created here so
     # each read gets its own graph (see _rotation_graph on why).
     rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
     for frame in frames:
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
+        if size is None:
+            rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
+        else:
+            # scaled before the rotation, which swaps a quarter turn's sides
+            width, height = size[::-1] if rotation in (90, 270) else size
+            # area averaging keeps a downscale from aliasing; bicubic is the sharper upscale
+            interpolation = "AREA" if width * height < frame.width * frame.height else "BICUBIC"
+            if frame.format.name in _PLANAR_SCALE_FORMATS:
+                # scale the 4:2:0 planes, then convert the scaled frame: a third of the CPU of scaling straight to
+                # rgb24 (measured 61 vs 161 us a frame to 256 x 256), with chroma at 4:2:0 of the output size, as
+                # an encode at that size keeps it
+                scaled = scaler.reformat(frame, width=width, height=height, interpolation=interpolation,
+                                         threads=threads)
+                threads = 1 if width * height < _SINGLE_THREAD_MAX_PIXELS else 0
+                rgb = reformatter.reformat(scaled, format='rgb24', threads=threads)
+            else:
+                rgb = reformatter.reformat(frame, format='rgb24', width=width, height=height,
+                                           interpolation=interpolation, threads=threads)
         if rotation and rotation % 90 == 0:
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
@@ -93,12 +117,13 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
 def _to_rgb(
     indexed: Iterable[tuple[int, av.VideoFrame]],
     chapters: list[Chapter],
+    size: tuple[int, int] | None,
     return_indices: bool,
     return_chapters: bool,
 ) -> Generator:
     """RGB arrays of (index, frame) pairs, each followed by its index and its chapter payload when asked for."""
     items, frames = tee(_with_chapters(indexed, chapters), 2)
-    for array, (index, _, payload) in zip(_frames_to_rgb(f for _, f, _ in frames), items, strict=True):
+    for array, (index, _, payload) in zip(_frames_to_rgb((f for _, f, _ in frames), size=size), items, strict=True):
         extras = (index,) * return_indices + (payload,) * return_chapters
         yield (array, *extras) if extras else array
 
@@ -288,6 +313,12 @@ def _validate_fps(fps: float | None) -> None:
         raise ValueError(msg)
 
 
+def _validate_size(size: tuple[int, int] | None) -> None:
+    if size is not None and (len(size) != 2 or any(operator.index(side) <= 0 for side in size)):
+        msg = "size must be two positive integers, (width, height)"
+        raise ValueError(msg)
+
+
 def read_frames_exact(
     src: str | av.container.InputContainer,
     start_frame: int | None = None,
@@ -297,6 +328,7 @@ def read_frames_exact(
     thread_type: str = "AUTO",
     fps: float | None = None,
     return_indices: bool = False,
+    size: tuple[int, int] | None = None,
     return_chapters: bool = False,
 ) -> Generator[np.ndarray, None, None] | Generator[tuple, None, None]:
     """
@@ -320,6 +352,10 @@ def read_frames_exact(
             ``index`` is the frame's absolute 0-based position in the whole
             video (the start offset is included, and fps drop-selection
             reports exactly the frames it kept). Default False: plain arrays.
+        size: (width, height) every frame is scaled to, up or down, in display
+            orientation; a 4:2:0 frame's planes are scaled before it is converted
+            to RGB. None keeps each frame's own size, which may change from
+            frame to frame, as at a chapter boundary of a chapter file.
         return_chapters: When True, also yield each frame's chapter payload: the
             JSON object in the ``payload`` tag of the chapter holding the frame
             ({} for a chapter without one), or None outside every chapter.
@@ -355,6 +391,7 @@ def read_frames_exact(
     """
     has_time_params = _validate_parameters(start_frame, end_frame, start_time, end_time)
     _validate_fps(fps)
+    _validate_size(size)
     if not has_time_params:
         frame_range = _normalize_frame_range(start_frame, end_frame)
 
@@ -413,7 +450,7 @@ def read_frames_exact(
             if fps is not None:
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
 
-            yield from _to_rgb(indexed, chapters if return_chapters else [], return_indices, return_chapters)
+            yield from _to_rgb(indexed, chapters if return_chapters else [], size, return_indices, return_chapters)
 
     return generate()
 
@@ -430,13 +467,21 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
     chunks grow geometrically and one concatenation assembles them.
 
     Raises:
-        ValueError: If the iterable is empty, like np.stack.
+        ValueError: If the iterable is empty, like np.stack, or its arrays differ
+            in shape, as frames of different sizes do.
     """
     chunk = size_hint or 64
     chunks = []
     buf = None
     count = 0
+    shape = None
     for array in frames:
+        if shape is None:
+            shape = array.shape
+        elif array.shape != shape:
+            msg = (f"frame {sum(map(len, chunks)) + count} has shape {array.shape}, not {shape} like the first; "
+                   "pass size=(width, height) to batch frames of different sizes")
+            raise ValueError(msg)
         if buf is None:
             buf = np.empty((chunk, *array.shape), array.dtype)
             chunk *= 2
@@ -503,6 +548,7 @@ def read_frames_batched(
     thread_type: str = "AUTO",
     fps: float | None = None,
     return_indices: bool = False,
+    size: tuple[int, int] | None = None,
     return_chapters: bool = False,
 ) -> np.ndarray | tuple:
     """
@@ -524,13 +570,17 @@ def read_frames_batched(
     With ``return_chapters=True`` a list of each frame's chapter payload, as
     read_frames_exact gives it, follows the frames (and indices).
 
+    ``size`` is read_frames_exact's: frames of different sizes, as from the
+    chapters of a chapter file, batch only when ``size`` scales them to one.
+
     Raises:
         ValueError: Same call-time validation as read_frames_exact, and,
-            like np.stack, if the range contains no frames.
+            like np.stack, if the range contains no frames or frames of
+            different sizes.
     """
     # Created first so parameter validation raises before the metadata peek.
     frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type, fps,
-                               return_indices=return_indices, return_chapters=return_chapters)
+                               return_indices=return_indices, size=size, return_chapters=return_chapters)
 
     total, source_fps = _count_and_rate(src)
     if start_time is not None or end_time is not None:

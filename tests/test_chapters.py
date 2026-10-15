@@ -87,6 +87,20 @@ def test_a_frame_range_follows_the_source_timeline(chapter_video):
     assert all(np.array_equal(frame, whole[INDICES.index(index)]) for frame, index in frames)
 
 
+def test_size_scales_every_chapter_s_frames_to_one_size(chapter_video):
+    frames = list(read_frames_exact(chapter_video, size=(48, 40)))
+    assert {frame.shape for frame in frames} == {(40, 48, 3)}
+    assert [float(frame.mean()) for frame in frames] == pytest.approx([level(index) for index in INDICES], abs=2)
+
+
+def test_batching_frames_of_different_sizes_needs_a_size(chapter_video):
+    with pytest.raises(ValueError, match="size="):
+        read_frames_batched(chapter_video)
+    frames, payloads = read_frames_batched(chapter_video, size=(32, 32), return_chapters=True)
+    assert frames.shape == (30, 32, 32, 3)
+    assert [payload["side"] for payload in payloads] == [side for side in SIDES for _ in range(10)]
+
+
 def test_a_range_read_leaves_a_reused_container_decoding_every_frame(chapter_video):
     with open_video(chapter_video) as video:
         # past the last frame, the whole last chapter is the run up to the range, its non-reference frames skipped

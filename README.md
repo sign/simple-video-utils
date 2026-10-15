@@ -47,7 +47,15 @@ frames = list(read_frames_exact("video.mp4", start_frame=5, end_frame=None))
 
 # Downsample to a target frame rate (drops frames uniformly, never duplicates)
 frames = list(read_frames_exact("video.mp4", fps=15))
+
+# Scale every frame to one (width, height), up or down, in display orientation
+frames = list(read_frames_exact("video.mp4", size=(256, 256)))
 ```
+
+`size` scales the planes of a 4:2:0 frame before converting it to RGB. Its colour then stays at 4:2:0 of the new
+size, as an encode at that size would keep it, and the read takes a third of the CPU of scaling straight to RGB.
+Frames of different sizes, such as a chapter file's, batch in `read_frames_batched` only once `size` scales them to
+one size.
 
 ### Chapter Files
 
