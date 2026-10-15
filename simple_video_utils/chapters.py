@@ -127,8 +127,10 @@ def _milliseconds(frame: int, rate: Fraction) -> int:
 def _graph(stream: av.VideoStream, filters: str) -> av.filter.Graph:
     """A clip's filter chain, inside FFmpeg."""
     graph = av.filter.Graph()
-    # ponytail: split on "," and each filter's first "=", so no filter's arguments may hold a ","
-    chain = [graph.add(name, args or None) for name, _, args in (f.partition("=") for f in filters.split(","))]
+    # ponytail: split on "," and each filter's first "=", so no filter's arguments may hold a ","; spaces around a
+    # filter and empty ones, as FFmpeg allows, are dropped
+    parts = (part.strip() for part in filters.split(","))
+    chain = [graph.add(name, args or None) for name, _, args in (part.partition("=") for part in parts if part)]
     graph.link_nodes(graph.add_buffer(template=stream), *chain, graph.add("buffersink"))
     graph.configure()
     return graph
