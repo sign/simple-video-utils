@@ -183,3 +183,26 @@ def test_source_keyframes_and_full_range_do_not_change_chapter_encoding(tmp_path
         rgb = frame.to_ndarray(format="rgb24")
         assert rgb[:, :2].max() <= 2
         np.testing.assert_allclose(rgb[:, 8:], 192, atol=2)
+
+
+def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path):
+    source = tmp_path / "vertical-colour.mkv"
+    frame = av.VideoFrame(width=64, height=48, format="yuv420p")
+    for index, plane in enumerate(frame.planes):
+        values = np.full((plane.height, plane.line_size), 128, dtype=np.uint8)
+        if index == 1:
+            values[:] = 80 + np.arange(plane.height)[:, None] * 4
+        plane.update(values)
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=25)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    output = tmp_path / "cropped.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, (10, 7, 42, 39))], crf=0)
+    with av.open(str(output)) as container:
+        plane = next(container.decode(video=0)).planes[1]
+        chroma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+    # Source rows 7/8 straddle chroma values 92/96: the new grid starts halfway, at 94.
+    expected = np.repeat((94 + np.arange(plane.height) * 4)[:, None], plane.width, axis=1)
+    np.testing.assert_allclose(chroma, expected, atol=1)
