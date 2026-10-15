@@ -160,8 +160,12 @@ def test_square_cuts_the_crop_out_to_whole_macroblocks_and_bars_it_by_whole_macr
     assert square(box=[3.0, 3.0, 9.0, 9.0], frame_size=(160, 120)).crop == [0, 0, 16, 16]
     # a square larger than max_side is scaled down to it, not rounded
     assert square(box=[0.0, 0.0, 1920.0, 1080.0], frame_size=(1920, 1080))[2:] == (1920, MAX_SIDE)
+    # a box running off the frame's left and top edges is cut at them
+    assert square(box=[-5.0, -20.0, 30.0, 40.0], frame_size=(160, 120)).crop == [0, 0, 32, 48]
     with pytest.raises(ValueError, match="empty crop"):
         square(box=[170.0, 0.0, 180.0, 10.0], frame_size=(160, 120))
+    with pytest.raises(ValueError, match="empty crop"):
+        square(box=[-40.0, -40.0, -20.0, -20.0], frame_size=(160, 120))
 
 
 def test_write_chapters_writes_each_clip_as_a_square_chapter_at_its_source_time(tmp_path):
