@@ -12,8 +12,8 @@ import numpy as np
 from simple_video_utils.chapters import Chapter, _decode_from, _frames_on_timeline, _with_chapters, list_chapters
 from simple_video_utils.metadata import (
     VideoMetadata,
-    _open_container,
     _open_video,
+    open_container,
     video_metadata,
     video_metadata_from_container,
 )
@@ -130,7 +130,7 @@ def _validate_parameters(
         raise ValueError(msg)
 
     # fps-free time checks run here, before the container opens — errors raised
-    # inside `with _open_container` get wrapped as "Failed to open video".
+    # inside `with open_container` get wrapped as "Failed to open video".
     if end_time is not None and (end_time < 0 or end_time < (start_time or 0.0)):
         msg = "invalid time range"
         raise ValueError(msg)
@@ -360,7 +360,7 @@ def read_frames_exact(
 
     # Inner generator so validation above raises at call time, not first next().
     def generate() -> Generator[np.ndarray, None, None]:
-        with _open_container(src) as container:
+        with open_container(src) as container:
             stream = container.streams.video[0]
             # A reused container's codec may already be open (e.g. metadata's
             # rotation probe decoded a frame) and PyAV forbids changing
@@ -470,7 +470,7 @@ def _count_and_rate_cached(src: str) -> tuple[int, float]:
     straight from the header, or video_metadata's decode-derived recovery
     when the header carries none.
     """
-    with _open_container(src) as container:
+    with open_container(src) as container:
         stream = container.streams.video[0]
         total, fps = stream.frames, float(stream.average_rate or 0)
     return _fill_from_metadata(total, fps, lambda: video_metadata(src))
@@ -603,7 +603,7 @@ def read_frames_from_stream(
 
     seekable = getattr(stream, "seekable", lambda: False)()
 
-    # Not _open_container: the returned generator owns the container, so it
+    # Not open_container: the returned generator owns the container, so it
     # must stay open after this function returns.
     container = _open_video(stream, buffer_size=buffer_size)
     try:

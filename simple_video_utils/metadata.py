@@ -39,7 +39,7 @@ def _open_video(source: str | io.BytesIO, **av_kwargs) -> av.container.InputCont
 
 
 @contextmanager
-def _open_container(source: str | io.BytesIO | av.container.InputContainer):
+def open_container(source: str | io.BytesIO | av.container.InputContainer):
     """
     Context manager yielding an open PyAV container.
 
@@ -298,7 +298,7 @@ def count_frames(source: str | io.BytesIO | av.container.InputContainer) -> int:
     best-effort answer and usually matches; use this when you need certainty
     regardless of what the container header claims.
     """
-    with _open_container(source) as container:
+    with open_container(source) as container:
         count = _count_decoded_frames(container)
         if count is None:
             msg = "Failed to decode video"
@@ -317,7 +317,7 @@ def keyframe_indices(source: str | io.BytesIO | av.container.InputContainer) -> 
     files with trailing packets that never decode can shift indices near the
     tail.
     """
-    with _open_container(source) as container:
+    with open_container(source) as container:
         packets = [(p.pts if p.pts is not None else p.dts, p.is_keyframe)
                    for p in container.demux(video=0) if p.size]
     order = range(len(packets))
@@ -328,12 +328,12 @@ def keyframe_indices(source: str | io.BytesIO | av.container.InputContainer) -> 
 
 def video_metadata_from_bytes(data: bytes) -> VideoMetadata:
     """Return key video stream metadata from video bytes."""
-    with _open_container(io.BytesIO(data)) as container:
+    with open_container(io.BytesIO(data)) as container:
         return video_metadata_from_container(container)
 
 
 @lru_cache(maxsize=8)
 def video_metadata(url_or_path: str) -> VideoMetadata:
     """Return key video stream metadata."""
-    with _open_container(url_or_path) as container:
+    with open_container(url_or_path) as container:
         return video_metadata_from_container(container)
