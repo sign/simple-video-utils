@@ -2,7 +2,7 @@
 
 Lightweight utilities for extracting frames and metadata from videos. Built for sign language processing workflows.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue)
+![Python](https://img.shields.io/badge/python-3.12+-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 ## Installation
@@ -122,6 +122,42 @@ from simple_video_utils.joining import join_videos
 
 video = join_videos(clips)
 ```
+
+### Chapters: Crops and Trims in One File
+
+```python
+import json
+
+from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.frames import read_frames_exact
+
+write_chapters("video.mp4", "chapters.mkv", [
+    ChapterClip(30, 60, (100, 50, 500, 354), payload={"signer": "Alice"}),
+    ChapterClip(90, 120, (200, 80, 440, 400)),
+])
+
+for chapter in list_chapters("chapters.mkv"):
+    start_seconds = chapter["start"] * chapter["time_base"]
+    tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+    source_clip = json.loads(tags["payload"])
+
+for frame in read_frames_exact("chapters.mkv"):
+    process(frame)  # each chapter can have a different frame shape
+```
+
+Trims use source frame indices with an **exclusive** end; boxes are integer
+`(left, top, right, bottom)` coordinates in the encoded frame, before display
+rotation. Clips play consecutively in the supplied order. Each chapter's JSON
+`payload` stores the source frame range, box and optional caller payload.
+`list_chapters` yields PyAV's chapter dictionaries, including their time base.
+
+Requires PyAV 19 or newer. Output is one video track in Matroska, encoded as
+H.264 at `crf=23` by default, using the source pixel format. Crop width and height must be multiples of 16;
+other sizes raise `ValueError` rather than being rounded or padded. Output follows
+the source's nominal frame rate; audio and display rotation are omitted. There
+is no resizing or square-crop constraint.
+Use the frame generator when chapter sizes differ, since a NumPy batch needs
+frames of the same shape. Each trim currently decodes its source lead-in again.
 
 ### Remote Videos
 
