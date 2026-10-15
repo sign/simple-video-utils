@@ -13,12 +13,18 @@ from simple_video_utils.metadata import _open_video
 
 @dataclass(frozen=True)
 class ChapterClip:
-    """Source frames [start_frame, end_frame), cropped to (left, top, right, bottom)."""
+    """Source frames [start_frame, end_frame), cropped to (left, top, right, bottom), then resized to resolution."""
 
     start_frame: int
     end_frame: int
     box: tuple[int, int, int, int]
     payload: dict | None = None
+    resolution: tuple[int, int] | None = None
+
+    @property
+    def size(self) -> tuple[int, int]:
+        left, top, right, bottom = self.box
+        return self.resolution or (right - left, bottom - top)
 
 
 def list_chapters(src: str | Path) -> Iterator[dict]:
@@ -28,7 +34,7 @@ def list_chapters(src: str | Path) -> Iterator[dict]:
 
 
 def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip], *, crf: int = 23) -> None:
-    """Write valid, in-bounds clips consecutively at the source's nominal frame rate.
+    """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
     Output must not exist. Coordinates refer to encoded pixels, before rotation.
     Each chapter stores its source specification in a JSON ``payload`` tag.
@@ -39,8 +45,8 @@ def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip
         chapters = []
         offset = 0
         for clip in clips:
-            left, top, right, bottom = clip.box
-            if (right - left) % 16 or (bottom - top) % 16:
+            width, height = clip.size
+            if width % 16 or height % 16:
                 message = "H.264 chapter width and height must be multiples of 16"
                 raise ValueError(message)
             end = offset + clip.end_frame - clip.start_frame
@@ -51,30 +57,41 @@ def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip
             offset = end
         with open(out, "xb") as file, av.open(file, mode="w", format="matroska") as destination:
             destination.set_chapters(chapters)
-            track = destination.add_stream("libx264", rate=rate)
-            track.width = clips[0].box[2] - clips[0].box[0]
-            track.height = clips[0].box[3] - clips[0].box[1]
-            track.pix_fmt = stream.pix_fmt
+            width, height = clips[0].size
+            # The muxer takes the header (avcC) from the first clip's packets.
+            track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
             for chapter, clip in zip(chapters, clips, strict=True):
                 _write_clip(stream, track, clip, chapter["start"], crf)
 
 
 def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip, start: int, crf: int) -> None:
-    rate = track.average_rate
+    rate = source.average_rate
     # shortcut: decode each trim's lead-in; seek when long sources need faster exports.
     source.container.seek(0, stream=source)
     graph = av.filter.Graph()
     left, top, right, bottom = clip.box
+    x, y = max(0, -left), max(0, -top)
+    padding = []
+    if x or y or right > source.width or bottom > source.height:
+        padding = [
+            # Full-resolution chroma keeps odd padding offsets exact before converting back.
+            graph.add("format", "yuv444p"),
+            graph.add("pad", f"{max(source.width, right) + x}:{max(source.height, bottom) + y}:{x}:{y}:black"),
+        ]
+    width, height = clip.size
     graph.link_nodes(
         graph.add_buffer(template=source),
-        graph.add("crop", f"{right - left}:{bottom - top}:{left}:{top}:exact=1"),
+        *padding,
+        graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
+        graph.add("scale", f"{width}:{height}"),
+        graph.add("format", source.pix_fmt),
         graph.add("buffersink"),
     )
     graph.configure()
     # Each size needs its own encoder; H.264 keyframes carry the new dimensions.
     encoder = av.CodecContext.create("libx264", "w")
-    encoder.width, encoder.height = right - left, bottom - top
-    encoder.pix_fmt = track.pix_fmt
+    encoder.width, encoder.height = width, height
+    encoder.pix_fmt = source.pix_fmt
     encoder.time_base, encoder.framerate = 1 / rate, rate
     encoder.options = {"crf": str(crf)}
     frames = islice(source.container.decode(source), clip.start_frame, clip.end_frame)

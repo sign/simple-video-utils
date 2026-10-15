@@ -134,6 +134,7 @@ from simple_video_utils.frames import read_frames_exact
 write_chapters("video.mp4", "chapters.mkv", [
     ChapterClip(30, 60, (100, 50, 500, 354), payload={"signer": "Alice"}),
     ChapterClip(90, 120, (200, 80, 440, 400)),
+    ChapterClip(150, 180, (-20, 0, 300, 250), resolution=(256, 192)),
 ])
 
 for chapter in list_chapters("chapters.mkv"):
@@ -145,15 +146,17 @@ for frame in read_frames_exact("chapters.mkv"):
     process(frame)  # each chapter can have a different frame shape
 ```
 
-Pass nonempty, in-bounds clips from a video with a nominal frame rate and an
+Pass nonempty clips from a video with a nominal frame rate and an
 H.264-compatible pixel format. Trims use source frame indices with an exclusive
 end; boxes are integer `(left, top, right, bottom)` encoded-pixel coordinates.
+Box areas outside the source frame become black. `resolution=(width, height)`
+resizes the crop to exactly that size; the default keeps the box size.
 Clips play consecutively, and chapter payload tags retain their source specs.
 
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
-at `crf=23`, using the source frame rate and pixel format. Crop width and height
-must be multiples of 16, otherwise `ValueError` is raised. The destination must
-not already exist. Each trim decodes its source lead-in again.
+at `crf=23`, using the source frame rate and pixel format. Each chapter's output
+width and height must be multiples of 16, otherwise `ValueError` is raised. The
+destination must not already exist. Each trim decodes its source lead-in again.
 
 `list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
 for frames; its generator accommodates chapters with different dimensions.
