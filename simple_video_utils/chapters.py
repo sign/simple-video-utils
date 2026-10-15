@@ -286,7 +286,7 @@ def _encode(
     return k
 
 
-def _frames_on_timeline(
+def frames_on_timeline(
     frames: Iterable[av.VideoFrame], fps: float, start: int, end: int | None
 ) -> Generator[tuple[int, av.VideoFrame], None, None]:
     """
@@ -305,7 +305,7 @@ def _frames_on_timeline(
             yield index, frame
 
 
-def _decode_from(
+def decode_from(
     container: av.container.InputContainer, stream: av.VideoStream, start: float
 ) -> Generator[av.VideoFrame, None, None]:
     """
@@ -329,7 +329,7 @@ def _decode_from(
         codec.skip_frame = "DEFAULT"
 
 
-def _with_chapters(
+def with_chapters(
     items: Iterable[tuple[int, av.VideoFrame]], chapters: list[Chapter]
 ) -> Generator[tuple[int, av.VideoFrame, dict | None], None, None]:
     """Each (index, frame) with the payload of the chapter holding the frame's timestamp, {} for a chapter without
