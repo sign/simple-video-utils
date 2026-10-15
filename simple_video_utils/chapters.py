@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 import av
 
-from simple_video_utils.metadata import _open_container, video_metadata
+from simple_video_utils.metadata import open_container, video_metadata
 
 # a crop's edges and a square's side and bars lie on whole H.264 macroblocks: the source's macroblocks then land whole
 # in the chapter, and FFmpeg's decoder can keep the previous chapter's size when two sizes cover the same macroblocks
@@ -59,7 +59,7 @@ class ChapterClip(NamedTuple):
 
 def list_chapters(src: str | Path | av.container.InputContainer) -> list[Chapter]:
     """Every chapter of ``src`` by start time."""
-    with _open_container(str(src) if isinstance(src, Path) else src) as container:
+    with open_container(str(src) if isinstance(src, Path) else src) as container:
         found = []
         for chapter in container.chapters():
             tags = {key.lower(): value for key, value in chapter["metadata"].items()}
