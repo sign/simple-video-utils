@@ -89,7 +89,8 @@ def test_batching_frames_of_different_sizes_needs_a_size(chapter_video):
 
 def test_write_chapters_writes_each_clip_through_its_filters(tmp_path):
     source = write_source(tmp_path / "source.mp4", frames=8, fps=3)
-    clips = [ChapterClip(0, 3, "crop=32:48:0:32,pad=48:48:16:0"), ChapterClip(5, 8, "crop=32:48:16:32,scale=16:24")]
+    # FFmpeg's chains allow spaces between filters and a trailing comma
+    clips = [ChapterClip(0, 3, "crop=32:48:0:32, pad=48:48:16:0"), ChapterClip(5, 8, "crop=32:48:16:32,scale=16:24,")]
     out = tmp_path / "source.mkv"
     write_chapters(source, out, clips)
 
