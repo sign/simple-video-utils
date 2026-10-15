@@ -9,7 +9,7 @@ from typing import BinaryIO
 import av
 import numpy as np
 
-from simple_video_utils.chapters import Chapter, _decode_from, _frames_on_timeline, _with_chapters, list_chapters
+from simple_video_utils.chapters import Chapter, decode_from, frames_on_timeline, list_chapters, with_chapters
 from simple_video_utils.metadata import (
     VideoMetadata,
     _open_video,
@@ -122,7 +122,7 @@ def _to_rgb(
     return_chapters: bool,
 ) -> Generator:
     """RGB arrays of (index, frame) pairs, each followed by its index and its chapter payload when asked for."""
-    items, frames = tee(_with_chapters(indexed, chapters), 2)
+    items, frames = tee(with_chapters(indexed, chapters), 2)
     for array, (index, _, payload) in zip(_frames_to_rgb((f for _, f, _ in frames), size=size), items, strict=True):
         extras = (index,) * return_indices + (payload,) * return_chapters
         yield (array, *extras) if extras else array
@@ -427,8 +427,8 @@ def read_frames_exact(
             chapter_file = any(chapter.payload is not None for chapter in chapters)
             did_seek = _seek_near(target_start, source_fps, stream, container, chapter_file=chapter_file)
             if chapter_file:
-                decoded = _decode_from(container, stream, start=(target_start - 0.5) / source_fps)
-                indexed = _frames_on_timeline(decoded, source_fps, target_start, target_end)
+                decoded = decode_from(container, stream, start=(target_start - 0.5) / source_fps)
+                indexed = frames_on_timeline(decoded, source_fps, target_start, target_end)
             elif did_seek:
                 decoded = container.decode(video=0)
                 origin = float((stream.start_time or 0) * stream.time_base)
