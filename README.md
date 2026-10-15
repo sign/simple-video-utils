@@ -152,6 +152,8 @@ end; boxes are integer `(left, top, right, bottom)` encoded-pixel coordinates.
 Box areas outside the source frame become black. `resolution=(width, height)`
 resizes the crop to exactly that size; the default keeps the box size.
 Clips play consecutively, and chapter payload tags retain their source specs.
+Chapter boundaries use Matroska's millisecond clock. A source that ends before
+a requested trim finishes raises `ValueError`.
 
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
 at `crf=23`, using the source frame rate and pixel format. Each chapter's output

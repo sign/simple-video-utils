@@ -3,6 +3,7 @@
 import json
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from itertools import islice
 from pathlib import Path
 
@@ -51,8 +52,10 @@ def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip
                 raise ValueError(message)
             end = offset + clip.end_frame - clip.start_frame
             chapters.append({
-                "id": len(chapters), "start": offset, "end": end,
-                "time_base": 1 / rate, "metadata": {"payload": json.dumps(asdict(clip))},
+                "id": len(chapters),
+                "start": int(offset * 1000 / rate + Fraction(1, 2)),
+                "end": int(end * 1000 / rate + Fraction(1, 2)),
+                "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
             })
             offset = end
         with open(out, "xb") as file, av.open(file, mode="w", format="matroska") as destination:
@@ -60,8 +63,10 @@ def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip
             width, height = clips[0].size
             # The muxer takes the header (avcC) from the first clip's packets.
             track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
-            for chapter, clip in zip(chapters, clips, strict=True):
-                _write_clip(stream, track, clip, chapter["start"], crf)
+            written = 0
+            for clip in clips:
+                _write_clip(stream, track, clip, written, crf)
+                written += clip.end_frame - clip.start_frame
 
 
 def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip, start: int, crf: int) -> None:
@@ -74,8 +79,8 @@ def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip
     padding = []
     if x or y or right > source.width or bottom > source.height:
         padding = [
-            # Full-resolution chroma keeps odd padding offsets exact before converting back.
-            graph.add("format", "yuv444p"),
+            # Full-resolution, high-depth chroma preserves odd offsets and source precision.
+            graph.add("format", "yuv444p16le"),
             graph.add("pad", f"{max(source.width, right) + x}:{max(source.height, bottom) + y}:{x}:{y}:black"),
         ]
     width, height = clip.size
@@ -93,9 +98,12 @@ def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip
     encoder.width, encoder.height = width, height
     encoder.pix_fmt = source.pix_fmt
     encoder.time_base, encoder.framerate = 1 / rate, rate
+    # Independent encoders must not reorder packets across chapter boundaries.
+    encoder.max_b_frames = 0
     encoder.options = {"crf": str(crf)}
     frames = islice(source.container.decode(source), clip.start_frame, clip.end_frame)
-    for index, frame in enumerate(frames, start):
+    indices = range(start, start + clip.end_frame - clip.start_frame)
+    for index, frame in zip(indices, frames, strict=True):
         graph.push(frame)
         cropped = graph.pull()
         cropped.pts = index
