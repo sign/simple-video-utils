@@ -77,7 +77,7 @@ def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip
     left, top, right, bottom = clip.box
     x, y = max(0, -left), max(0, -top)
     padding = []
-    if x or y or right > source.width or bottom > source.height:
+    if x or y or left % 2 or right > source.width or bottom > source.height:
         padding = [
             # Full-resolution, high-depth chroma preserves odd offsets and source precision.
             graph.add("format", "yuv444p16le"),

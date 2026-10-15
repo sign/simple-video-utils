@@ -135,24 +135,32 @@ def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):
         write_chapters(SOURCE, tmp_path / "short.mkv", [ChapterClip(128, 133, (0, 0, 32, 32))])
 
 
-def test_padding_preserves_ten_bit_source_precision(tmp_path):
+@pytest.mark.parametrize("box", [(-4, 0, 28, 32), (11, 6, 43, 38)])
+@pytest.mark.parametrize("pixel_format", ["yuv420p10le", "yuv422p10le"])
+def test_cropping_and_padding_preserve_ten_bit_source_precision(tmp_path, box, pixel_format):
     source = tmp_path / "ten-bit.mkv"
-    frame = av.VideoFrame(width=64, height=48, format="yuv420p10le")
+    frame = av.VideoFrame(width=64, height=48, format=pixel_format)
     for index, plane in enumerate(frame.planes):
         plane.update(np.full((plane.height, plane.line_size // 2), 514 if index == 0 else 512, dtype=np.uint16))
     with av.open(str(source), "w") as container:
         stream = container.add_stream("ffv1", rate=25)
-        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p10le"
+        stream.width, stream.height, stream.pix_fmt = 64, 48, pixel_format
         container.mux(stream.encode(frame))
         container.mux(stream.encode())
     output = tmp_path / "padded.mkv"
-    write_chapters(source, output, [ChapterClip(0, 1, (-4, 0, 28, 32))], crf=0)
+    write_chapters(source, output, [ChapterClip(0, 1, box)], crf=0)
     with av.open(str(output)) as container:
         actual = next(container.decode(video=0))
-        assert actual.format.name == "yuv420p10le"
+        assert actual.format.name == pixel_format
         luma = np.frombuffer(actual.planes[0], np.uint16).reshape(actual.height, -1)[:, :actual.width]
-        np.testing.assert_array_equal(luma[:, :4], 64)  # limited-range black at ten bits
-        np.testing.assert_array_equal(luma[:, 4:], 514)
+        if box[0] < 0:
+            np.testing.assert_array_equal(luma[:, :4], 64)  # limited-range black at ten bits
+            np.testing.assert_array_equal(luma[:, 4:], 514)
+        else:
+            np.testing.assert_array_equal(luma, 514)
+        for plane in actual.planes[1:]:
+            chroma = np.frombuffer(plane, np.uint16).reshape(plane.height, -1)[:, :plane.width]
+            np.testing.assert_allclose(chroma, 512, atol=1)
 
 
 def test_source_keyframes_and_full_range_do_not_change_chapter_encoding(tmp_path):
