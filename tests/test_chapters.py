@@ -185,24 +185,35 @@ def test_source_keyframes_and_full_range_do_not_change_chapter_encoding(tmp_path
         np.testing.assert_allclose(rgb[:, 8:], 192, atol=2)
 
 
-def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path):
+@pytest.mark.parametrize("pixel_format", ["yuv420p", "yuv422p"])
+def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path, pixel_format):
     source = tmp_path / "vertical-colour.mkv"
-    frame = av.VideoFrame(width=64, height=48, format="yuv420p")
+    frame = av.VideoFrame(width=64, height=48, format=pixel_format)
     for index, plane in enumerate(frame.planes):
         values = np.full((plane.height, plane.line_size), 128, dtype=np.uint8)
         if index == 1:
-            values[:] = 80 + np.arange(plane.height)[:, None] * 4
+            values[:] = 40 + np.arange(plane.height)[:, None] * 4
+        elif index == 2:
+            values[:, :plane.width] = np.where(np.arange(plane.width)[None, :] < 16, 80, 180)
         plane.update(values)
     with av.open(str(source), "w") as container:
         stream = container.add_stream("ffv1", rate=25)
-        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.width, stream.height, stream.pix_fmt = 64, 48, pixel_format
         container.mux(stream.encode(frame))
         container.mux(stream.encode())
     output = tmp_path / "cropped.mkv"
     write_chapters(source, output, [ChapterClip(0, 1, (10, 7, 42, 39))], crf=0)
     with av.open(str(output)) as container:
-        plane = next(container.decode(video=0)).planes[1]
+        decoded = next(container.decode(video=0))
+        plane = decoded.planes[1]
         chroma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
-    # Source rows 7/8 straddle chroma values 92/96: the new grid starts halfway, at 94.
-    expected = np.repeat((94 + np.arange(plane.height) * 4)[:, None], plane.width, axis=1)
+    # 4:2:0 averages source chroma rows 3/4 (52/56); 4:2:2 keeps source row 7 (68).
+    first = 54 if pixel_format == "yuv420p" else 68
+    expected = np.repeat((first + np.arange(plane.height) * 4)[:, None], plane.width, axis=1)
     np.testing.assert_allclose(chroma, expected, atol=1)
+    if pixel_format == "yuv422p":
+        # An odd top needs no conversion in 4:2:2; keep horizontal colour edges lossless.
+        plane = decoded.planes[2]
+        chroma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+        expected = np.repeat(np.where(np.arange(plane.width)[None, :] + 5 < 16, 80, 180), plane.height, axis=0)
+        np.testing.assert_array_equal(chroma, expected)
