@@ -22,7 +22,10 @@ INDICES = [*range(30, 40), *range(45, 55), *range(60, 70)]
 def chapter_video(tmp_path_factory) -> str:
     """One Matroska track holding each chapter at its source time and its own size, as a chapter export writes it:
     every chapter has its own encoder, whose headers travel in the stream, and a JSON payload tag."""
-    path = tmp_path_factory.mktemp("chapters") / "chapters.mkv"
+    return write_chapters(tmp_path_factory.mktemp("chapters") / "chapters.mkv", payloads=True)
+
+
+def write_chapters(path: Path, payloads: bool) -> str:
     rate = Fraction(FPS)
     with av.open(str(path), "w", format="matroska") as container:
         container.set_chapters([
@@ -31,7 +34,8 @@ def chapter_video(tmp_path_factory) -> str:
                 "start": start * 1000 // FPS,
                 "end": end * 1000 // FPS,
                 "time_base": Fraction(1, 1000),
-                "metadata": {"title": f"{start}-{end}", "payload": json.dumps({"start_frame": start, "side": side})},
+                "metadata": {"title": f"{start}-{end}"}
+                | ({"payload": json.dumps({"start_frame": start, "side": side})} if payloads else {}),
             }
             for k, (start, end, side) in enumerate(CHAPTERS)
         ])
@@ -110,6 +114,17 @@ def test_batching_frames_of_different_sizes_needs_a_size(chapter_video):
     assert indices.tolist() == INDICES
     assert [payload["start_frame"] for payload in payloads] == [30] * 10 + [45] * 10 + [60] * 10
     assert read_frames_batched(chapter_video, start_frame=45, end_frame=54).shape == (10, 32, 32, 3)
+
+
+def test_chapters_without_payloads_read_by_position_as_any_video(tmp_path):
+    # a film's chapters say nothing of where its frames come from: its frames count from 0, though it starts 3 s in
+    path = write_chapters(tmp_path / "film.mkv", payloads=False)
+    frames = list(read_frames_exact(path, return_indices=True, return_chapters=True))
+    assert [index for _, index, _ in frames] == list(range(len(INDICES)))
+    assert [payload for _, _, payload in frames] == [{}] * len(INDICES)
+    assert [index for _, index in read_frames_exact(path, start_frame=12, end_frame=14, return_indices=True)] == [
+        12, 13, 14,
+    ]
 
 
 def test_a_video_without_chapters_has_no_payloads():

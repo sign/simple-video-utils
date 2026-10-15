@@ -61,7 +61,8 @@ A chapter file keeps its clips as the chapters of one video track: each clip at 
 clips, and at its own frame size. Frames come at their chapter's size, which can change from frame to frame, unless
 `size` scales them to one. Frame indices and ranges follow the source timeline, as the chapters' own frame numbers do.
 `return_chapters=True` adds each frame's chapter payload: the JSON object in the chapter's `payload` tag, `{}` for a
-chapter without one, or `None` outside every chapter.
+chapter without one, or `None` outside every chapter. Only chapters carrying `payload` tags make a chapter file: any
+other video with chapters, such as a film's, reads by position as any video does.
 
 A chapter file's frame sides must be multiples of 16, which is the H.264 macroblock size. FFmpeg's decoder can keep the
 previous chapter's size when two sizes cover the same macroblocks and differ only in their crop, as 470 and 472 do. It

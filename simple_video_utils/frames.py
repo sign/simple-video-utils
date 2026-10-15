@@ -115,13 +115,14 @@ def _frames_to_rgb(
         yield np.ascontiguousarray(rgb.to_ndarray())
 
 
-def _chapters(container: av.container.InputContainer) -> list[tuple[Fraction, Fraction, dict]]:
-    """Each chapter's [start, end) in seconds and the JSON object in its ``payload`` tag ({} without one), by start."""
+def _chapters(container: av.container.InputContainer) -> list[tuple[Fraction, Fraction, dict | None]]:
+    """Each chapter's [start, end) in seconds and the JSON object in its ``payload`` tag, None without one, by start."""
     found = []
     for chapter in container.chapters():
         tags = {key.lower(): value for key, value in chapter["metadata"].items()}
         time_base = chapter["time_base"]
-        found.append((chapter["start"] * time_base, chapter["end"] * time_base, json.loads(tags.get("payload", "{}"))))
+        payload = json.loads(tags["payload"]) if "payload" in tags else None
+        found.append((chapter["start"] * time_base, chapter["end"] * time_base, payload))
     return sorted(found, key=operator.itemgetter(0))
 
 
@@ -180,7 +181,7 @@ def _with_chapters(
             while k < len(chapters) and time >= chapters[k][1]:
                 k += 1
             if k < len(chapters) and chapters[k][0] <= time:
-                payload = chapters[k][2]
+                payload = {} if chapters[k][2] is None else chapters[k][2]
         yield index, frame, payload
 
 
@@ -430,10 +431,12 @@ def read_frames_exact(
             JSON object in the ``payload`` tag of the chapter holding the frame
             ({} for a chapter without one), or None outside every chapter.
 
-    A file with chapters, such as the square signer clips of a chapter export,
-    keeps each frame at its source time with gaps between chapters: its frame
-    indices, ranges and ``return_indices`` follow those times, as the chapters'
-    own frame numbers do, not the frames' positions in the file.
+    A chapter file, whose chapters carry ``payload`` tags as the square signer
+    clips of a chapter export do, keeps each frame at its source time with gaps
+    between chapters: its frame indices, ranges and ``return_indices`` follow
+    those times, as the chapters' own frame numbers do, not the frames'
+    positions in the file. A file whose chapters carry no payload, such as a
+    film's, reads by position as any other video.
 
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3), or tuples of the array,
@@ -491,12 +494,14 @@ def read_frames_exact(
                 target_start, target_end = frame_range
 
             chapters = _chapters(container)
-            did_seek = _seek_near(target_start, source_fps, stream, container, chapter_file=bool(chapters))
-            if chapters:
+            # only payload-carrying chapters keep frames at their source times; any other file reads by position
+            chapter_file = any(payload is not None for _, _, payload in chapters)
+            did_seek = _seek_near(target_start, source_fps, stream, container, chapter_file=chapter_file)
+            if chapter_file:
                 decoded = _decode_from(container, stream, start=(target_start - 0.5) / source_fps)
             else:
                 decoded = container.decode(video=0)
-            if chapters:
+            if chapter_file:
                 indexed = _frames_on_timeline(decoded, source_fps, target_start, target_end)
             elif did_seek:
                 origin = float((stream.start_time or 0) * stream.time_base)
