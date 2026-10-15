@@ -475,11 +475,11 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
     buf = None
     count = 0
     shape = None
-    for array in frames:
+    for index, array in enumerate(frames):
         if shape is None:
             shape = array.shape
         elif array.shape != shape:
-            msg = (f"frame {sum(map(len, chunks)) + count} has shape {array.shape}, not {shape} like the first; "
+            msg = (f"frame {index} has shape {array.shape}, not {shape} like the first; "
                    "pass size=(width, height) to batch frames of different sizes")
             raise ValueError(msg)
         if buf is None:

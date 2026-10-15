@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from simple_video_utils.frames import read_frames_batched, read_frames_exact
+from simple_video_utils.frames import read_frames_batched, read_frames_exact, stack_frames
 
 ASSETS = Path(__file__).parent / "assets"
 
@@ -35,3 +35,10 @@ def test_size_applies_in_display_orientation():
 def test_size_is_validated_at_call_time():
     with pytest.raises(ValueError, match="size"):
         read_frames_exact("missing.mp4", size=(0, 10))
+
+
+def test_a_frame_of_another_size_is_named_by_its_index():
+    # the third frame lands just after the first chunk of two fills
+    frames = [np.zeros((2, 2, 3), np.uint8)] * 2 + [np.zeros((3, 3, 3), np.uint8)]
+    with pytest.raises(ValueError, match="frame 2 has shape"):
+        stack_frames(frames, size_hint=2)
