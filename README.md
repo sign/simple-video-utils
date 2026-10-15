@@ -59,24 +59,30 @@ one size.
 
 ### Chapter Files
 
-A chapter file keeps clips of a video as the chapters of one Matroska video track. Each clip sits at its source time
-with gaps between clips, runs through its own FFmpeg filters, and keeps the frame size they give it. Its chapter
-carries a JSON `payload` tag with the clip's `start_frame` and `end_frame`, then the clip's own payload.
+A chapter file plays clips of a video back to back as the chapters of one Matroska video track. Each clip runs
+through its own FFmpeg filters and keeps the frame size they give it. Its chapter carries a JSON `payload` tag with
+the clip's source `start_frame` and `end_frame`, then the clip's own payload.
 
 ```python
 from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.frames import read_frames_exact
 
-# frames [start, end) of a 30 fps source, each through an FFmpeg filter chain ("null", the default, keeps the frame)
+# source frames [start, end), each through an FFmpeg filter chain ("null", the default, keeps the frame)
 clips = [ChapterClip(30, 90, "crop=384:624:400:80,pad=624:624:128:0", payload={"score": 0.93}), ChapterClip(150, 400)]
 write_chapters("video.mp4", "clips.mkv", clips, crf=23)
 
 for chapter in list_chapters("clips.mkv"):
     print(chapter.start, chapter.end, chapter.payload)
-# 1 3 {'start_frame': 30, 'end_frame': 90, 'score': 0.93}
+# 0 2 {'start_frame': 30, 'end_frame': 90, 'score': 0.93}
+# 2 31/3 {'start_frame': 150, 'end_frame': 400}
+
+for frame in read_frames_exact("clips.mkv"):
+    ...  # 60 frames of 624 x 624, then 250 at the source's size
 ```
 
-- `write_chapters` makes one pass over the source and encodes each chapter with its own x264 encoder, in the pixel
-  format its filters leave.
+- `write_chapters` makes one pass over the source and encodes each chapter with its own x264 encoder, at the
+  source's frame rate and in the pixel format its filters leave. x264 picks every frame's type; the source's
+  keyframes do not carry over.
 - Filters see frames as decoded, unrotated. Each must give one frame for each frame (crop, pad, scale and format
   do), and no filter's arguments may hold a comma.
 - `on_frame(clip_index, frame)` sees each source frame inside a clip before its filters, during that same pass.
@@ -85,17 +91,6 @@ FFmpeg's decoder can keep the previous chapter's size when two sizes cover the s
 differ only in their crop, as 470 and 472 do. It then returns the top-left of the frame and drops its right and
 bottom edge, and every FFmpeg-based reader reads such a file this way. `write_chapters` refuses such a chapter;
 sides that are multiples of 16 never hit it.
-
-The frame readers read a chapter file on the source timeline: frame indices and ranges follow the chapters' source
-times, not the frames' positions in the file. Only chapters carrying `payload` tags make a chapter file. Any other
-video with chapters, such as a film, reads by position as any video does.
-
-```python
-from simple_video_utils.frames import read_frames_exact
-
-for frame, index in read_frames_exact("clips.mkv", return_indices=True):
-    ...  # e.g. 624x624 frames 30 to 89, then the next chapter's
-```
 
 ### One Open, Many Reads
 

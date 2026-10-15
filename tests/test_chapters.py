@@ -10,15 +10,15 @@ from simple_video_utils.frames import read_frames_batched, read_frames_exact
 
 ASSETS = Path(__file__).parent / "assets"
 FPS = 10
-# source frames [start, end) and the square each chapter is cropped to, on whole 16-px macroblocks: the chapters
-# start 3 s into the source, with gaps between them
+# source frames [start, end) and the square each chapter is cropped to, on whole 16-px macroblocks, with gaps between
+# the clips in the source
 CLIPS = [
     ChapterClip(30, 40, "crop=64:64:0:0"),
     ChapterClip(45, 55, "crop=32:32:16:16"),
     ChapterClip(60, 70, "crop=48:48:16:16", payload={"note": "last"}),
 ]
 SIDES = [64, 32, 48]
-INDICES = [*range(30, 40), *range(45, 55), *range(60, 70)]
+SOURCE_INDICES = [*range(30, 40), *range(45, 55), *range(60, 70)]
 
 
 def level(index: int) -> int:
@@ -27,11 +27,17 @@ def level(index: int) -> int:
 
 
 def write_source(
-    path: Path, frames: int, fps: int = FPS, width: int = 160, height: int = 120, pix_fmt: str = "yuv420p"
+    path: Path,
+    frames: int,
+    fps: int = FPS,
+    width: int = 160,
+    height: int = 120,
+    pix_fmt: str = "yuv420p",
+    gop: int = 12,
 ) -> str:
     with av.open(str(path), "w") as container:
         stream = container.add_stream("libx264", rate=fps)
-        stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
+        stream.width, stream.height, stream.pix_fmt, stream.codec_context.gop_size = width, height, pix_fmt, gop
         for index in range(frames):
             frame = av.VideoFrame.from_ndarray(np.full((height, width, 3), level(index), np.uint8), format="rgb24")
             frame.pts, frame.time_base = index, Fraction(1, fps)
@@ -50,7 +56,8 @@ def chapter_video(tmp_path_factory) -> str:
 
 def test_list_chapters_gives_each_chapter_its_time_and_payload(chapter_video):
     chapters = list(list_chapters(chapter_video))
-    assert [(chapter.start, chapter.end) for chapter in chapters] == [(3, 4), (Fraction(9, 2), Fraction(11, 2)), (6, 7)]
+    # back to back from the file's start, ten frames each at the source's 10 fps
+    assert [(chapter.start, chapter.end) for chapter in chapters] == [(0, 1), (1, 2), (2, 3)]
     assert [chapter.payload for chapter in chapters] == [
         {"start_frame": 30, "end_frame": 40},
         {"start_frame": 45, "end_frame": 55},
@@ -59,55 +66,28 @@ def test_list_chapters_gives_each_chapter_its_time_and_payload(chapter_video):
     assert list(list_chapters(ASSETS / "example.mp4")) == []
 
 
-def test_chapter_frames_keep_their_own_size_at_their_source_index(chapter_video):
-    frames = list(read_frames_exact(chapter_video, return_indices=True))
-    assert [index for _, index in frames] == INDICES
-    assert [frame.shape for frame, _ in frames] == [(side, side, 3) for side in SIDES for _ in range(10)]
-    assert [float(frame.mean()) for frame, _ in frames] == pytest.approx([level(index) for index in INDICES], abs=2)
-
-
-def test_a_frame_range_follows_the_source_timeline(chapter_video):
-    frames = read_frames_exact(chapter_video, start_frame=38, end_frame=46, return_indices=True)
-    assert [index for _, index in frames] == [38, 39, 45, 46]
-    # past 3 s the read seeks, on the file's own source times
-    frames = read_frames_exact(chapter_video, start_frame=50, return_indices=True)
-    assert [index for _, index in frames] == [*range(50, 55), *range(60, 70)]
+def test_chapter_frames_read_back_to_back_at_their_own_sizes(chapter_video):
+    frames = list(read_frames_exact(chapter_video))
+    assert [frame.shape for frame in frames] == [(side, side, 3) for side in SIDES for _ in range(10)]
+    assert [float(frame.mean()) for frame in frames] == pytest.approx([level(i) for i in SOURCE_INDICES], abs=2)
+    # a range is file positions: the last three of the first chapter, then the second's first two
+    sides = [frame.shape[0] for frame in read_frames_exact(chapter_video, start_frame=7, end_frame=11)]
+    assert sides == [64, 64, 64, 32, 32]
 
 
 def test_size_scales_every_chapter_s_frames_to_one_size(chapter_video):
     frames = list(read_frames_exact(chapter_video, size=(48, 40)))
     assert {frame.shape for frame in frames} == {(40, 48, 3)}
-    assert [float(frame.mean()) for frame in frames] == pytest.approx([level(index) for index in INDICES], abs=2)
+    assert [float(frame.mean()) for frame in frames] == pytest.approx([level(i) for i in SOURCE_INDICES], abs=2)
 
 
 def test_batching_frames_of_different_sizes_needs_a_size(chapter_video):
     with pytest.raises(ValueError, match="size="):
         read_frames_batched(chapter_video)
-    frames, indices = read_frames_batched(chapter_video, size=(32, 32), return_indices=True)
-    assert frames.shape == (30, 32, 32, 3)
-    assert indices.tolist() == INDICES
+    assert read_frames_batched(chapter_video, size=(32, 32)).shape == (30, 32, 32, 3)
 
 
-def test_chapters_without_payloads_read_by_position_as_any_video(chapter_video, tmp_path):
-    # a film's chapters say nothing of where its frames come from: its frames count from 0, though it starts 3 s in
-    path = tmp_path / "film.mkv"
-    with av.open(chapter_video) as source, av.open(str(path), "w", format="matroska") as film:
-        film.set_chapters([{**chapter, "metadata": {"title": "scene"}} for chapter in source.chapters()])
-        track = film.add_stream_from_template(source.streams.video[0])
-        for packet in source.demux(video=0):
-            if packet.size:
-                packet.stream = track
-                film.mux(packet)
-    assert [chapter.payload for chapter in list_chapters(path)] == [None] * 3
-    assert [index for _, index in read_frames_exact(str(path), return_indices=True)] == list(range(len(INDICES)))
-    assert [index for _, index in read_frames_exact(str(path), start_frame=12, end_frame=14, return_indices=True)] == [
-        12,
-        13,
-        14,
-    ]
-
-
-def test_write_chapters_writes_each_clip_through_its_filters_at_its_source_time(tmp_path):
+def test_write_chapters_writes_each_clip_through_its_filters(tmp_path):
     source = write_source(tmp_path / "source.mp4", frames=8, fps=3)
     clips = [ChapterClip(0, 3, "crop=32:48:0:32,pad=48:48:16:0"), ChapterClip(5, 8, "crop=32:48:16:32,scale=16:24")]
     out = tmp_path / "source.mkv"
@@ -124,8 +104,8 @@ def test_write_chapters_writes_each_clip_through_its_filters_at_its_source_time(
         # a seek to a chapter's start lands on its own first frame, not the previous chapter's keyframe
         stream = container.streams.video[0]
         container.seek(int(list(list_chapters(out))[1].start / stream.time_base), stream=stream)
-        assert round(next(container.decode(stream)).time * 3) == 5
-    assert frames == [(0, 48, 48), (1, 48, 48), (2, 48, 48), (5, 16, 24), (6, 16, 24), (7, 16, 24)]
+        assert round(next(container.decode(stream)).time * 3) == 3
+    assert frames == [(0, 48, 48), (1, 48, 48), (2, 48, 48), (3, 16, 24), (4, 16, 24), (5, 16, 24)]
 
 
 def test_a_chapter_without_filters_keeps_the_source_s_size_and_pixel_format(tmp_path):
@@ -138,17 +118,13 @@ def test_a_chapter_without_filters_keeps_the_source_s_size_and_pixel_format(tmp_
         }
 
 
-def test_chapters_starting_on_the_frame_after_the_last_play_in_order_at_their_own_sizes(tmp_path):
-    source = write_source(tmp_path / "source.mp4", frames=9, fps=3)
-    # each encoder's first packet decodes before its first frame shows, so it must still follow the last chapter's
-    sides = [48, 112, 48]
+def test_x264_picks_the_chapter_s_frame_types_not_the_source_s(tmp_path):
+    # every source frame is a keyframe; passed on, its type would make every chapter frame one too
+    source = write_source(tmp_path / "source.mp4", frames=10, fps=10, gop=1)
     out = tmp_path / "source.mkv"
-    write_chapters(
-        source, out, [ChapterClip(3 * k, 3 * k + 3, f"crop={side}:{side}:0:0") for k, side in enumerate(sides)]
-    )
+    write_chapters(source, out, [ChapterClip(0, 10)])
     with av.open(str(out)) as container:
-        frames = [(round(frame.time * 3), frame.width) for frame in container.decode(video=0)]
-    assert frames == [(index, sides[index // 3]) for index in range(9)]
+        assert [packet.is_keyframe for packet in container.demux(video=0) if packet.size] == [True] + [False] * 9
 
 
 def test_on_frame_sees_each_clip_frame_whole_before_its_filters(tmp_path):
