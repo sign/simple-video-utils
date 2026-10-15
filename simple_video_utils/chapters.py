@@ -232,16 +232,12 @@ def write_chapters(
                 rate=rate,
                 crf=crf,
                 source_frames=meta.nb_frames,
-                on_frame=on_frame or _ignore,
+                on_frame=on_frame or (lambda clip_index, frame: None),
             )
             if written < len(payloads):
                 msg = f"{src} ended inside the clip from frame {payloads[written]['start_frame']}"
                 raise ValueError(msg)
     return payloads
-
-
-def _ignore(clip_index: int, frame: av.VideoFrame) -> None:
-    """The default ``on_frame``."""
 
 
 def _encode(
