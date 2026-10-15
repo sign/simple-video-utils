@@ -16,10 +16,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - python-version: "3.11"
-            pyav: "18"
-          - python-version: "3.12"
-            pyav: "18"
           - python-version: "3.12"
             pyav: "19"
           - python-version: "3.13"

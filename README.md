@@ -2,7 +2,7 @@
 
 Lightweight utilities for extracting frames and metadata from videos. Built for sign language processing workflows.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue)
+![Python](https://img.shields.io/badge/python-3.12+-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 ## Installation
@@ -122,6 +122,46 @@ from simple_video_utils.joining import join_videos
 
 video = join_videos(clips)
 ```
+
+### Chapters: Crops and Trims in One File
+
+```python
+import json
+
+from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.frames import read_frames_exact
+
+write_chapters("video.mp4", "chapters.mkv", [
+    ChapterClip(30, 60, (100, 50, 500, 354), payload={"signer": "Alice"}),
+    ChapterClip(90, 120, (200, 80, 440, 400)),
+    ChapterClip(150, 180, (-20, 0, 300, 250), resolution=(256, 192)),
+])
+
+for chapter in list_chapters("chapters.mkv"):
+    start_seconds = chapter["start"] * chapter["time_base"]
+    tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+    source_clip = json.loads(tags["payload"])
+
+for frame in read_frames_exact("chapters.mkv"):
+    process(frame)  # each chapter can have a different frame shape
+```
+
+Pass nonempty clips from a video with a nominal frame rate and an
+H.264-compatible pixel format. Trims use source frame indices with an exclusive
+end; boxes are integer `(left, top, right, bottom)` encoded-pixel coordinates.
+Box areas outside the source frame become black. `resolution=(width, height)`
+resizes the crop to exactly that size; the default keeps the box size.
+Clips play consecutively, and chapter payload tags retain their source specs.
+Chapter boundaries use Matroska's millisecond clock. A source that ends before
+a requested trim finishes raises `ValueError`.
+
+Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
+at `crf=23`, using the source frame rate and pixel format. Each chapter's output
+width and height must be multiples of 16, otherwise `ValueError` is raised. The
+destination must not already exist. Each trim decodes its source lead-in again.
+
+`list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
+for frames; its generator accommodates chapters with different dimensions.
 
 ### Remote Videos
 
