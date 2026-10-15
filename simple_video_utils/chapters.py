@@ -82,10 +82,11 @@ def square(box: Sequence[float], frame_size: tuple[int, int], max_side: int = MA
     half of one; the square's side, whole macroblocks up to ``max_side``; and the side it is scaled to.
     """
     width, height = frame_size
-    # an edge past the frame's last whole macroblock stops on its last even pixel, as yuv420p needs
+    # an edge past the frame's last whole macroblock stops on its last even pixel, as yuv420p needs, and one before the
+    # frame's first pixel stops on it
     right_limit, bottom_limit = width - width % 2, height - height % 2
-    left = min(math.floor(box[0] / MACROBLOCK) * MACROBLOCK, right_limit)
-    top = min(math.floor(box[1] / MACROBLOCK) * MACROBLOCK, bottom_limit)
+    left = min(max(math.floor(box[0] / MACROBLOCK) * MACROBLOCK, 0), right_limit)
+    top = min(max(math.floor(box[1] / MACROBLOCK) * MACROBLOCK, 0), bottom_limit)
     right = min(math.ceil(box[2] / MACROBLOCK) * MACROBLOCK, right_limit)
     bottom = min(math.ceil(box[3] / MACROBLOCK) * MACROBLOCK, bottom_limit)
     if right <= left or bottom <= top:
