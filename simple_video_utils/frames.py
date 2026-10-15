@@ -9,6 +9,7 @@ from typing import BinaryIO
 import av
 import numpy as np
 
+from simple_video_utils.chapters import Chapter, _decode_from, _frames_on_timeline, _with_chapters, list_chapters
 from simple_video_utils.metadata import (
     VideoMetadata,
     _open_container,
@@ -87,6 +88,19 @@ def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, Non
         # a non-contiguous view — consumers like MediaPipe and OpenCV reject
         # those, so copy (no-op when already contiguous).
         yield np.ascontiguousarray(rgb.to_ndarray())
+
+
+def _to_rgb(
+    indexed: Iterable[tuple[int, av.VideoFrame]],
+    chapters: list[Chapter],
+    return_indices: bool,
+    return_chapters: bool,
+) -> Generator:
+    """RGB arrays of (index, frame) pairs, each followed by its index and its chapter payload when asked for."""
+    items, frames = tee(_with_chapters(indexed, chapters), 2)
+    for array, (index, _, payload) in zip(_frames_to_rgb(f for _, f, _ in frames), items, strict=True):
+        extras = (index,) * return_indices + (payload,) * return_chapters
+        yield (array, *extras) if extras else array
 
 
 def _prepend(
@@ -178,6 +192,7 @@ def _seek_near(
     fps: float,
     stream,
     container,
+    chapter_file: bool = False,
 ) -> bool:
     """
     Seek toward the target position if it is far enough from the start.
@@ -193,6 +208,13 @@ def _seek_near(
     seek_buffer_seconds = 1.0  # Seek 1 second before target
 
     target_time = target_start_frame / fps
+    if chapter_file:
+        # a chapter file's timestamps are the source times frames are indexed by, and its Matroska cues land a
+        # seek on the keyframe at or before it: half a frame past the target keeps the target's own keyframe
+        if not target_start_frame:
+            return False
+        container.seek(int((target_start_frame + 0.5) / fps / float(stream.time_base)), stream=stream)
+        return True
     if target_time < min_seek_seconds:
         return False
 
@@ -260,15 +282,6 @@ def _select_frames_by_fps(
             last_bucket = bucket
 
 
-def _indexed_frames_to_rgb(
-    items: Iterable[tuple[int, av.VideoFrame]],
-) -> Generator[tuple[np.ndarray, int], None, None]:
-    """Convert (index, frame) pairs to (rgb_array, index) pairs."""
-    frames, pairs = tee(items, 2)
-    for rgb, (index, _) in zip(_frames_to_rgb(f for _, f in frames), pairs, strict=True):
-        yield rgb, index
-
-
 def _validate_fps(fps: float | None) -> None:
     if fps is not None and fps <= 0:
         msg = "fps must be positive"
@@ -284,7 +297,8 @@ def read_frames_exact(
     thread_type: str = "AUTO",
     fps: float | None = None,
     return_indices: bool = False,
-) -> Generator[np.ndarray, None, None] | Generator[tuple[np.ndarray, int], None, None]:
+    return_chapters: bool = False,
+) -> Generator[np.ndarray, None, None] | Generator[tuple, None, None]:
     """
     Return frames as RGB np.ndarrays from specified range.
 
@@ -306,10 +320,21 @@ def read_frames_exact(
             ``index`` is the frame's absolute 0-based position in the whole
             video (the start offset is included, and fps drop-selection
             reports exactly the frames it kept). Default False: plain arrays.
+        return_chapters: When True, also yield each frame's chapter payload: the
+            JSON object in the ``payload`` tag of the chapter holding the frame
+            ({} for a chapter without one), or None outside every chapter.
+
+    A chapter file (see ``simple_video_utils.chapters``), whose chapters carry
+    ``payload`` tags, keeps each frame at its source time with gaps between
+    chapters: its frame indices, ranges and ``return_indices`` follow those
+    times, as the chapters' own frame numbers do, not the frames' positions in
+    the file. A file whose chapters carry no payload, such as a film's, reads
+    by position as any other video.
 
     Returns:
-        Generator yielding RGB numpy arrays (H, W, 3), or (array, index)
-        pairs when return_indices is True.
+        Generator yielding RGB numpy arrays (H, W, 3), or tuples of the array,
+        its index when return_indices is True, and its chapter payload when
+        return_chapters is True, in that order.
 
     Raises:
         ValueError: If frame and time parameters are mixed, or a range is
@@ -360,9 +385,15 @@ def read_frames_exact(
             else:
                 target_start, target_end = frame_range
 
-            did_seek = _seek_near(target_start, source_fps, stream, container)
-            decoded = container.decode(video=0)
-            if did_seek:
+            chapters = list_chapters(container)
+            # only payload-carrying chapters keep frames at their source times; any other file reads by position
+            chapter_file = any(chapter.payload is not None for chapter in chapters)
+            did_seek = _seek_near(target_start, source_fps, stream, container, chapter_file=chapter_file)
+            if chapter_file:
+                decoded = _decode_from(container, stream, start=(target_start - 0.5) / source_fps)
+                indexed = _frames_on_timeline(decoded, source_fps, target_start, target_end)
+            elif did_seek:
+                decoded = container.decode(video=0)
                 origin = float((stream.start_time or 0) * stream.time_base)
                 # guessed_rate (av_guess_frame_rate) recovers the true cadence
                 # when the header's average_rate drifts from the actual frame
@@ -372,19 +403,17 @@ def read_frames_exact(
                 # reciprocal — 1000 on Matroska), so only the derived rate can
                 # locate frames.
                 locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
-                frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
+                indexed = enumerate(
+                    _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end), start=target_start
+                )
             else:
                 stop = target_end + 1 if target_end is not None else None
-                frames = islice(decoded, target_start, stop)
+                indexed = enumerate(islice(container.decode(video=0), target_start, stop), start=target_start)
 
-            indexed = enumerate(frames, start=target_start)
             if fps is not None:
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
 
-            if return_indices:
-                yield from _indexed_frames_to_rgb(indexed)
-            else:
-                yield from _frames_to_rgb(frame for _, frame in indexed)
+            yield from _to_rgb(indexed, chapters if return_chapters else [], return_indices, return_chapters)
 
     return generate()
 
@@ -474,7 +503,8 @@ def read_frames_batched(
     thread_type: str = "AUTO",
     fps: float | None = None,
     return_indices: bool = False,
-) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+    return_chapters: bool = False,
+) -> np.ndarray | tuple:
     """
     Read a frame range as one batched (N, H, W, 3) RGB uint8 array.
 
@@ -491,13 +521,16 @@ def read_frames_batched(
     0-based index in the whole video (the start offset is included, and fps
     drop-selection reports exactly the frames it kept).
 
+    With ``return_chapters=True`` a list of each frame's chapter payload, as
+    read_frames_exact gives it, follows the frames (and indices).
+
     Raises:
         ValueError: Same call-time validation as read_frames_exact, and,
             like np.stack, if the range contains no frames.
     """
     # Created first so parameter validation raises before the metadata peek.
     frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type, fps,
-                               return_indices=return_indices)
+                               return_indices=return_indices, return_chapters=return_chapters)
 
     total, source_fps = _count_and_rate(src)
     if start_time is not None or end_time is not None:
@@ -510,14 +543,15 @@ def read_frames_batched(
     if hint and fps is not None and source_fps and fps < source_fps:
         # bucket selection keeps ~one frame per 1/fps; hint tolerates the estimate
         hint = int(hint * fps / source_fps) + 1
-    if not return_indices:
+    if not return_indices and not return_chapters:
         return stack_frames(frames, size_hint=hint)
 
-    indices: list[int] = []
-    return (
-        stack_frames((indices.append(i) or a for a, i in frames), size_hint=hint),
-        np.asarray(indices, dtype=np.int64),
-    )
+    extras: list[tuple] = []
+    batch = stack_frames((extras.append(rest) or array for array, *rest in frames), size_hint=hint)
+    columns = list(zip(*extras, strict=True))
+    indices = (np.asarray(columns.pop(0), dtype=np.int64),) if return_indices else ()
+    payloads = (list(columns.pop(0)),) if return_chapters else ()
+    return (batch, *indices, *payloads)
 
 def read_frames_from_stream(
     stream: BinaryIO,
