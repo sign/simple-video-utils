@@ -9,11 +9,10 @@ from typing import BinaryIO
 import av
 import numpy as np
 
-from simple_video_utils.chapters import frames_on_timeline, list_chapters
 from simple_video_utils.metadata import (
     VideoMetadata,
+    _open_container,
     _open_video,
-    open_container,
     video_metadata,
     video_metadata_from_container,
 )
@@ -117,7 +116,7 @@ def _validate_parameters(
         raise ValueError(msg)
 
     # fps-free time checks run here, before the container opens — errors raised
-    # inside `with open_container` get wrapped as "Failed to open video".
+    # inside `with _open_container` get wrapped as "Failed to open video".
     if end_time is not None and (end_time < 0 or end_time < (start_time or 0.0)):
         msg = "invalid time range"
         raise ValueError(msg)
@@ -179,7 +178,6 @@ def _seek_near(
     fps: float,
     stream,
     container,
-    chapter_file: bool = False,
 ) -> bool:
     """
     Seek toward the target position if it is far enough from the start.
@@ -198,9 +196,8 @@ def _seek_near(
     if target_time < min_seek_seconds:
         return False
 
-    # stream timestamps don't have to start at 0 — seek on the stream's timeline,
-    # but a chapter file's are already the source times its frames are indexed by
-    origin = 0 if chapter_file else stream.start_time or 0
+    # stream timestamps don't have to start at 0 — seek on the stream's timeline
+    origin = stream.start_time or 0
     seek_timestamp = int((target_time - seek_buffer_seconds) / float(stream.time_base)) + origin
     container.seek(seek_timestamp, stream=stream)
     return True
@@ -310,13 +307,6 @@ def read_frames_exact(
             video (the start offset is included, and fps drop-selection
             reports exactly the frames it kept). Default False: plain arrays.
 
-    A chapter file (see ``simple_video_utils.chapters``), whose chapters carry
-    ``payload`` tags, keeps each frame at its source time with gaps between
-    chapters: its frame indices, ranges and ``return_indices`` follow those
-    times, as the chapters' own frame numbers do, not the frames' positions in
-    the file. A file whose chapters carry no payload, such as a film's, reads
-    by position as any other video.
-
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3), or (array, index)
         pairs when return_indices is True.
@@ -345,7 +335,7 @@ def read_frames_exact(
 
     # Inner generator so validation above raises at call time, not first next().
     def generate() -> Generator[np.ndarray, None, None]:
-        with open_container(src) as container:
+        with _open_container(src) as container:
             stream = container.streams.video[0]
             # A reused container's codec may already be open (e.g. metadata's
             # rotation probe decoded a frame) and PyAV forbids changing
@@ -370,13 +360,9 @@ def read_frames_exact(
             else:
                 target_start, target_end = frame_range
 
-            # only payload-carrying chapters keep frames at their source times; any other file reads by position
-            chapter_file = any(chapter.payload is not None for chapter in list_chapters(container))
-            did_seek = _seek_near(target_start, source_fps, stream, container, chapter_file=chapter_file)
+            did_seek = _seek_near(target_start, source_fps, stream, container)
             decoded = container.decode(video=0)
-            if chapter_file:
-                indexed = frames_on_timeline(decoded, source_fps, target_start, target_end)
-            elif did_seek:
+            if did_seek:
                 origin = float((stream.start_time or 0) * stream.time_base)
                 # guessed_rate (av_guess_frame_rate) recovers the true cadence
                 # when the header's average_rate drifts from the actual frame
@@ -386,13 +372,12 @@ def read_frames_exact(
                 # reciprocal — 1000 on Matroska), so only the derived rate can
                 # locate frames.
                 locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
-                indexed = enumerate(
-                    _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end), start=target_start
-                )
+                frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
             else:
                 stop = target_end + 1 if target_end is not None else None
-                indexed = enumerate(islice(decoded, target_start, stop), start=target_start)
+                frames = islice(decoded, target_start, stop)
 
+            indexed = enumerate(frames, start=target_start)
             if fps is not None:
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
 
@@ -456,7 +441,7 @@ def _count_and_rate_cached(src: str) -> tuple[int, float]:
     straight from the header, or video_metadata's decode-derived recovery
     when the header carries none.
     """
-    with open_container(src) as container:
+    with _open_container(src) as container:
         stream = container.streams.video[0]
         total, fps = stream.frames, float(stream.average_rate or 0)
     return _fill_from_metadata(total, fps, lambda: video_metadata(src))
@@ -584,7 +569,7 @@ def read_frames_from_stream(
 
     seekable = getattr(stream, "seekable", lambda: False)()
 
-    # Not open_container: the returned generator owns the container, so it
+    # Not _open_container: the returned generator owns the container, so it
     # must stay open after this function returns.
     container = _open_video(stream, buffer_size=buffer_size)
     try:
