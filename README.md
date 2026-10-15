@@ -51,51 +51,41 @@ frames = list(read_frames_exact("video.mp4", fps=15))
 
 ### Chapter Files
 
-A chapter file keeps clips of a video as the chapters of one Matroska video track. Each clip is cut square around a
-box, sits at its source time with gaps between clips, and has its own frame size. Its chapter carries a JSON
-`payload` tag that says where the clip came from and how it was cut.
+A chapter file keeps clips of a video as the chapters of one Matroska video track. Each clip sits at its source time
+with gaps between clips, runs through its own FFmpeg filters, and keeps the frame size they give it. Its chapter
+carries a JSON `payload` tag with the clip's `start_frame` and `end_frame`, then the clip's own payload.
 
 ```python
 from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
 
-# frames [start, end) of the source, each clip cut square around its box (left, top, right, bottom in pixels)
-clips = [ChapterClip(30, 90, [412.3, 80.0, 770.9, 700.2], payload={"score": 0.93}), ChapterClip(150, 400, [...])]
-payloads = write_chapters("video.mp4", "clips.mkv", clips, crf=23)
+# frames [start, end) of a 30 fps source, each through an FFmpeg filter chain ("null", the default, keeps the frame)
+clips = [ChapterClip(30, 90, "crop=384:624:400:80,pad=624:624:128:0", payload={"score": 0.93}), ChapterClip(150, 400)]
+write_chapters("video.mp4", "clips.mkv", clips, crf=23)
 
 for chapter in list_chapters("clips.mkv"):
     print(chapter.start, chapter.end, chapter.payload)
-# 1 3 {'start_frame': 30, 'end_frame': 90, 'box': [412.3, 80.0, 770.9, 700.2], 'crop': [400, 80, 784, 704],
-#      'pad': [128, 0, 112, 0], 'side': 624, 'scale': 1.0, 'resolution': {'width': 624, 'height': 624}, 'score': 0.93}
+# 1 3 {'start_frame': 30, 'end_frame': 90, 'score': 0.93}
 ```
 
-- `crop` is the box moved out to the source's next 16-pixel macroblock on each side.
-- `pad` holds the black bars that square the crop, left, top, right and bottom. The left and top bars are whole
-  macroblocks.
-- `side` is the square's side, which is whole macroblocks up to `max_side` (768 by default).
-- A larger square is scaled down to `max_side`, and `scale` and `resolution` give the result.
-- `write_chapters` makes one pass over the source and encodes each chapter with its own x264 encoder.
-- `on_frame(clip_index, frame)` sees each source frame inside a clip before it is cut, during that same pass.
+- `write_chapters` makes one pass over the source and encodes each chapter with its own x264 encoder, in the pixel
+  format its filters leave.
+- Filters see frames as decoded, unrotated. Each must give one frame for each frame (crop, pad, scale and format
+  do), and no filter's arguments may hold a comma.
+- `on_frame(clip_index, frame)` sees each source frame inside a clip before its filters, during that same pass.
 
-Chapter sides are multiples of 16, the H.264 macroblock size. FFmpeg's decoder can keep the previous chapter's size
-when two sizes cover the same macroblocks and differ only in their crop, as 470 and 472 do. It then returns the
-top-left of the frame and drops its right and bottom edge. Every FFmpeg-based reader reads such a file this way.
+FFmpeg's decoder can keep the previous chapter's size when two sizes cover the same 16-pixel H.264 macroblocks and
+differ only in their crop, as 470 and 472 do. It then returns the top-left of the frame and drops its right and
+bottom edge, and every FFmpeg-based reader reads such a file this way. `write_chapters` refuses such a chapter;
+sides that are multiples of 16 never hit it.
 
-The frame readers read a chapter file on the source timeline:
-- Frame indices and ranges follow the chapters' source times, not the frames' positions in the file.
-- `return_chapters=True` adds each frame's payload: `{}` for a chapter without one, or `None` outside every chapter.
-- Only chapters carrying `payload` tags make a chapter file. Any other video with chapters, such as a film, reads by
-  position as any video does.
-
-A range read seeks to the keyframe at or before its first frame. It skips decoding the non-reference frames before
-that frame, since no other frame refers to them. For a 15-frame clip:
-- `thread_type="AUTO"` reads fastest;
-- `"SLICE"` takes a quarter less CPU at nearly the same speed;
-- `"NONE"` takes the least CPU, for loaders whose worker processes already fill the cores.
+The frame readers read a chapter file on the source timeline: frame indices and ranges follow the chapters' source
+times, not the frames' positions in the file. Only chapters carrying `payload` tags make a chapter file. Any other
+video with chapters, such as a film, reads by position as any video does.
 
 ```python
 from simple_video_utils.frames import read_frames_exact
 
-for frame, index, payload in read_frames_exact("clips.mkv", return_indices=True, return_chapters=True):
+for frame, index in read_frames_exact("clips.mkv", return_indices=True):
     ...  # e.g. 624x624 frames 30 to 89, then the next chapter's
 ```
 
