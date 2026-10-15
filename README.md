@@ -145,19 +145,18 @@ for frame in read_frames_exact("chapters.mkv"):
     process(frame)  # each chapter can have a different frame shape
 ```
 
-Trims use source frame indices with an **exclusive** end; boxes are integer
-`(left, top, right, bottom)` coordinates in the encoded frame, before display
-rotation. Clips play consecutively in the supplied order. Each chapter's JSON
-`payload` stores the source frame range, box and optional caller payload.
-`list_chapters` yields PyAV's chapter dictionaries, including their time base.
+Pass nonempty, in-bounds clips from a video with a nominal frame rate and an
+H.264-compatible pixel format. Trims use source frame indices with an exclusive
+end; boxes are integer `(left, top, right, bottom)` encoded-pixel coordinates.
+Clips play consecutively, and chapter payload tags retain their source specs.
 
-Requires PyAV 19 or newer. Output is one video track in Matroska, encoded as
-H.264 at `crf=23` by default, using the source pixel format. Crop width and height must be multiples of 16;
-other sizes raise `ValueError` rather than being rounded or padded. Output follows
-the source's nominal frame rate; audio and display rotation are omitted. There
-is no resizing or square-crop constraint.
-Use the frame generator when chapter sizes differ, since a NumPy batch needs
-frames of the same shape. Each trim currently decodes its source lead-in again.
+Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
+at `crf=23`, using the source frame rate and pixel format. Crop width and height
+must be multiples of 16, otherwise `ValueError` is raised. The destination must
+not already exist. Each trim decodes its source lead-in again.
+
+`list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
+for frames; its generator accommodates chapters with different dimensions.
 
 ### Remote Videos
 
