@@ -22,11 +22,7 @@ class VideoMetadata(NamedTuple):
 def _open_video(source: str | io.BytesIO, **av_kwargs) -> av.container.InputContainer:
     """Open a container, wrapping failures as RuntimeError('Failed to open video')."""
     try:
-        # PyAV 19 handles non-UTF-8 metadata with surrogateescape and removed
-        # metadata_errors. Older versions need it to open those same files.
-        if int(av.__version__.split(".", 1)[0]) < 19:
-            av_kwargs.setdefault("metadata_errors", "replace")
-        elif sys.platform == "linux" and isinstance(source, str) and source.startswith("https://"):
+        if sys.platform == "linux" and isinstance(source, str) and source.startswith("https://"):
             # PyAV 19's Linux wheels need an explicit trust store for HTTPS.
             # Prefer system/SSL_CERT_FILE roots, falling back for Python builds
             # with no default CA file. Preserve caller options.

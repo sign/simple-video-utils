@@ -2,7 +2,7 @@
 
 Lightweight utilities for extracting frames and metadata from videos. Built for sign language processing workflows.
 
-![Python](https://img.shields.io/badge/python-3.10+-blue)
+![Python](https://img.shields.io/badge/python-3.12+-blue)
 [![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
 
 ## Installation
@@ -56,41 +56,6 @@ frames = list(read_frames_exact("video.mp4", size=(256, 256)))
 size, as an encode at that size would keep it, and the read takes a third of the CPU of scaling straight to RGB.
 Frames of different sizes, such as a chapter file's, batch in `read_frames_batched` only once `size` scales them to
 one size.
-
-### Chapter Files
-
-A chapter file plays clips of a video back to back as the chapters of one Matroska video track. Each clip runs
-through its own FFmpeg filters and keeps the frame size they give it. Its chapter carries a JSON `payload` tag with
-the clip's source `start_frame` and `end_frame`, then the clip's own payload.
-
-```python
-from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
-from simple_video_utils.frames import read_frames_exact
-
-# source frames [start, end), each through an FFmpeg filter chain ("null", the default, keeps the frame)
-clips = [ChapterClip(30, 90, "crop=384:624:400:80,pad=624:624:128:0", payload={"score": 0.93}), ChapterClip(150, 400)]
-write_chapters("video.mp4", "clips.mkv", clips, crf=23)
-
-for chapter in list_chapters("clips.mkv"):
-    print(chapter.start, chapter.end, chapter.payload)
-# 0 2 {'start_frame': 30, 'end_frame': 90, 'score': 0.93}
-# 2 31/3 {'start_frame': 150, 'end_frame': 400}
-
-for frame in read_frames_exact("clips.mkv"):
-    ...  # 60 frames of 624 x 624, then 250 at the source's size
-```
-
-- `write_chapters` makes one pass over the source and encodes each chapter with its own x264 encoder, at the
-  source's frame rate and in the pixel format its filters leave. x264 picks every frame's type; the source's
-  keyframes do not carry over.
-- Filters see frames as decoded, unrotated. Each must give one frame for each frame (crop, pad, scale and format
-  do), and no filter's arguments may hold a comma.
-- `on_frame(clip_index, frame)` sees each source frame inside a clip before its filters, during that same pass.
-
-FFmpeg's decoder can keep the previous chapter's size when two sizes cover the same 16-pixel H.264 macroblocks and
-differ only in their crop, as 470 and 472 do. It then returns the top-left of the frame and drops its right and
-bottom edge, and every FFmpeg-based reader reads such a file this way. `write_chapters` refuses such a chapter;
-sides that are multiples of 16 never hit it.
 
 ### One Open, Many Reads
 
@@ -165,6 +130,46 @@ from simple_video_utils.joining import join_videos
 
 video = join_videos(clips)
 ```
+
+### Chapters: Crops and Trims in One File
+
+```python
+import json
+
+from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.frames import read_frames_exact
+
+write_chapters("video.mp4", "chapters.mkv", [
+    ChapterClip(30, 60, (100, 50, 500, 354), payload={"signer": "Alice"}),
+    ChapterClip(90, 120, (200, 80, 440, 400)),
+    ChapterClip(150, 180, (-20, 0, 300, 250), resolution=(256, 192)),
+])
+
+for chapter in list_chapters("chapters.mkv"):
+    start_seconds = chapter["start"] * chapter["time_base"]
+    tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+    source_clip = json.loads(tags["payload"])
+
+for frame in read_frames_exact("chapters.mkv"):
+    process(frame)  # each chapter can have a different frame shape
+```
+
+Pass nonempty clips from a video with a nominal frame rate and an
+H.264-compatible pixel format. Trims use source frame indices with an exclusive
+end; boxes are integer `(left, top, right, bottom)` encoded-pixel coordinates.
+Box areas outside the source frame become black. `resolution=(width, height)`
+resizes the crop to exactly that size; the default keeps the box size.
+Clips play consecutively, and chapter payload tags retain their source specs.
+Chapter boundaries use Matroska's millisecond clock. A source that ends before
+a requested trim finishes raises `ValueError`.
+
+Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
+at `crf=23`, using the source frame rate and pixel format. Each chapter's output
+width and height must be multiples of 16, otherwise `ValueError` is raised. The
+destination must not already exist. Each trim decodes its source lead-in again.
+
+`list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
+for frames; its generator accommodates chapters with different dimensions.
 
 ### Remote Videos
 
