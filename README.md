@@ -158,9 +158,8 @@ a requested trim finishes raises `ValueError`.
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
 at `crf=23`, using the source frame rate and pixel format. Each chapter's output
 width and height must be multiples of 16, otherwise `ValueError` is raised. The
-destination must not already exist. Clips in source order share one decode of the
-source; a clip that starts before the previous one ended decodes the source from
-its start again.
+destination must not already exist. Clips in source order share one decode; a clip
+starting before the previous one's end decodes from the start again.
 
 `list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
 for frames; its generator accommodates chapters with different dimensions.
