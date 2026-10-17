@@ -51,16 +51,25 @@ class FrameSize:
             raise TypeError(message)
 
 
-def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
-    """
-    Build a filter graph rotating rgb24 frames.
+def _native_size(frame: av.VideoFrame, size: FrameSize) -> tuple[int, int]:
+    """Target dimensions before display rotation, preserving aspect ratio for pad mode."""
+    width, height = size.resolution[::-1] if frame.rotation % 360 in (90, 270) else size.resolution
+    if size.mode == "pad":
+        ratio = min(width / frame.width, height / frame.height)
+        width, height = max(1, round(frame.width * ratio)), max(1, round(frame.height * ratio))
+    return width, height
 
-    rotation=90 maps to a counterclockwise transpose, matching ffmpeg
-    autorotate (and np.rot90 k=1) pixel-exactly. Graphs are stateful
-    (push/pull is a FIFO), so cache only per-read (the lru_cache in
-    _frames_to_rgb) — a shared/module-level cache would interleave
-    frames across concurrent reads.
-    """
+
+def _letterbox(array: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
+    width, height = resolution
+    top, left = (height - array.shape[0]) // 2, (width - array.shape[1]) // 2
+    padded = np.zeros((height, width, 3), dtype=np.uint8)
+    padded[top:top + array.shape[0], left:left + array.shape[1]] = array
+    return padded
+
+
+def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
+    """Rotate RGB pixels; 90 degrees is counterclockwise, matching display-matrix rotation."""
     graph = av.filter.Graph()
     if rotation == 180:
         filters = [graph.add("hflip"), graph.add("vflip")]
@@ -78,62 +87,38 @@ def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction 
 def _frames_to_rgb(
     frames: Iterable[av.VideoFrame], size: FrameSize | None = None,
 ) -> Generator[np.ndarray, None, None]:
-    """
-    Convert decoded frames to RGB arrays in display orientation.
+    """Resize native planes, convert to RGB, then apply display rotation and padding.
 
-    PyAV decodes frames in their stored orientation and does not apply the
-    container's display-matrix rotation (unlike the ffmpeg CLI, which
-    autorotates). Phone-recorded videos commonly store landscape frames with
-    a 90° rotation tag, so we apply it here.
-
-    A single reformatter is reused across all frames of a read so the
-    swscale conversion context is built once instead of being reallocated on
-    every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
-    dramatically faster full-clip decode.
-
-    With size, a separate reformatter resizes native planes before RGB conversion.
-
-    Rotation runs as a libavfilter transpose/flip on the rgb24 frame — a pure
-    pixel permutation, so it stays byte-identical to np.rot90 while ffmpeg's
-    cache-blocked transpose is ~10x faster than numpy's strided copy. It is
-    applied after the rgb24 reformat, not on the decoded yuv420p frame:
-    transposing before chroma upsampling changes the interpolation and breaks
-    pixel-exactness (measured maxdiff 2-3).
+    PyAV does not apply display rotation while decoding. Rotate after RGB conversion
+    so chroma interpolation stays unchanged; native transpose also avoids NumPy's strided copy.
     """
     reformatter = VideoReformatter()
     scaler = VideoReformatter()
-    # One-slot cache: built on the first rotated frame, reused for the whole
-    # read, rebuilt only if stream geometry changes mid-read. Created here so
-    # each read gets its own graph (see _rotation_graph on why).
+    # Graphs are stateful: reuse per geometry within this read, never across readers.
     rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
+    padding = size.resolution if size is not None and size.mode == "pad" else None
     for frame in frames:
         rotation = frame.rotation % 360
         if size is not None:
-            width, height = size.resolution[::-1] if rotation in (90, 270) else size.resolution
-            if size.mode == "pad":
-                ratio = min(width / frame.width, height / frame.height)
-                width, height = max(1, round(frame.width * ratio)), max(1, round(frame.height * ratio))
+            width, height = _native_size(frame, size)
             # Keep the native planes until after resizing; separate contexts avoid rebuilding swscale each step.
             threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
             frame = scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=threads)
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
-        if rotation and rotation % 90 == 0:
+        rgb_method = Interpolation.BILINEAR
+        if frame.width % 2:
+            # swscale's fast RGB conversion can leave the last column unwritten on odd widths.
+            rgb_method |= Interpolation.ACCURATE_RND
+        rgb = reformatter.reformat(frame, format='rgb24', interpolation=rgb_method, threads=threads)
+        if rotation in (90, 180, 270):
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
             rgb = graph.pull()
-        # The frame's linesize may be padded past width*3, making to_ndarray
-        # a non-contiguous view — consumers like MediaPipe and OpenCV reject
-        # those, so copy (no-op when already contiguous).
+        # Padded linesizes can produce strided views, which downstream image tools reject.
         array = rgb.to_ndarray()
-        if size is not None and size.mode == "pad":
-            width, height = size.resolution
-            top, left = (height - array.shape[0]) // 2, (width - array.shape[1]) // 2
-            padded = np.zeros((height, width, 3), dtype=np.uint8)
-            padded[top:top + array.shape[0], left:left + array.shape[1]] = array
-            yield padded
-        else:
-            yield np.ascontiguousarray(array)
+        if padding is not None:
+            array = _letterbox(array, padding)
+        yield np.ascontiguousarray(array)
 
 
 def _prepend(
@@ -466,7 +451,7 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
         if shape is None:
             shape = array.shape
         elif array.shape != shape:
-            message = "frames have different shapes; specify size when reading video"
+            message = f"frames have different shapes: {shape} and {array.shape}"
             raise ValueError(message)
         if buf is None:
             buf = np.empty((chunk, *array.shape), array.dtype)
