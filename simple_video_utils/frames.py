@@ -1,3 +1,4 @@
+import math
 import operator
 import sys
 from collections.abc import Callable, Generator, Iterable
@@ -446,7 +447,7 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
 @lru_cache(maxsize=128)
 def _count_and_rate_cached(src: str) -> tuple[int, float]:
     """
-    Frame count and fps, header-first — metadata only when the header lacks one.
+    Frame-count hint and fps from the header or duration, with metadata as a fallback.
 
     The count feeds stack_frames' size_hint, which tolerates being wrong: the
     accurate-but-heavy video_metadata (its rotation probe decodes a frame)
@@ -458,8 +459,24 @@ def _count_and_rate_cached(src: str) -> tuple[int, float]:
     """
     with _open_container(src) as container:
         stream = container.streams.video[0]
-        total, fps = stream.frames, float(stream.average_rate or 0)
+        fps = float(stream.average_rate or 0)
+        total = _header_frames(container, stream, fps)
     return _fill_from_metadata(total, fps, lambda: video_metadata(src))
+
+
+def _header_frames(container: av.container.InputContainer, stream: av.VideoStream, fps: float) -> int:
+    """
+    Estimate missing frame counts from duration; this only sizes the batch.
+
+    Counting packets via video_metadata would scan the whole file.
+    """
+    if stream.frames or not fps:
+        return stream.frames
+    if stream.duration and stream.time_base:
+        seconds = float(stream.duration * stream.time_base)
+    else:
+        seconds = (container.duration or 0) / av.time_base
+    return math.ceil(seconds * fps)
 
 
 def _fill_from_metadata(total: int, fps: float, get_meta) -> tuple[int, float]:
@@ -476,8 +493,8 @@ def _count_and_rate(src: str | av.container.InputContainer) -> tuple[int, float]
     # Open containers read the header directly, uncached — caching keyed on a
     # container would pin it and serve stale answers after it's closed.
     stream = src.streams.video[0]
-    total, fps = stream.frames, float(stream.average_rate or 0)
-    return _fill_from_metadata(total, fps, lambda: video_metadata_from_container(src))
+    fps = float(stream.average_rate or 0)
+    return _fill_from_metadata(_header_frames(src, stream, fps), fps, lambda: video_metadata_from_container(src))
 
 
 def read_frames_batched(
@@ -495,9 +512,10 @@ def read_frames_batched(
     Read a frame range as one batched (N, H, W, 3) RGB uint8 array.
 
     ``stack_frames`` over ``read_frames_exact`` (same parameters), with the
-    batch preallocated exactly: the requested range is converted to a frame
+    batch preallocated from a size hint: the requested range is converted to a frame
     count with the same helpers read_frames_exact uses, clamped to the
-    clip's header frame count — 26-38% faster than stacking afterward.
+    clip's frame count from its header or duration — 26-38% faster than
+    stacking afterward.
     ``torch.from_numpy(...)`` wraps the result zero-copy; building the batch
     in torch directly measured 3x slower (per-op dispatch), so numpy is the
     fast path either way.
