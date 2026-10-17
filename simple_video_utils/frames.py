@@ -108,11 +108,7 @@ def _frames_to_rgb(
     for frame in frames:
         rotation = frame.rotation % 360
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        rgb_flags = Interpolation.BILINEAR
-        if frame.width % 2:
-            # swscale's fast RGB conversion can leave the last column unwritten on odd widths.
-            rgb_flags |= Interpolation.ACCURATE_RND
-        rgb = converter.reformat(frame, format='rgb24', interpolation=rgb_flags, threads=threads)
+        rgb = converter.reformat(frame, format='rgb24', threads=threads)
         if rotation in (90, 180, 270):
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)

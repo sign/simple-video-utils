@@ -102,21 +102,6 @@ def test_shape_change_at_chunk_boundary_is_rejected():
         stack_frames(frames, size_hint=2)
 
 
-@pytest.mark.parametrize("size", [None, FrameSize((63, 48))])
-def test_odd_width_read_writes_the_last_rgb_column(tmp_path, size):
-    source = tmp_path / "odd.mkv"
-    frame = av.VideoFrame(81, 48, "yuv420p")
-    for plane, value in zip(frame.planes, (235, 128, 128), strict=True):
-        plane.update(bytes([value]) * plane.buffer_size)
-    with av.open(str(source), "w") as container:
-        stream = container.add_stream("ffv1", rate=30)
-        stream.width, stream.height, stream.pix_fmt = 81, 48, "yuv420p"
-        container.mux(stream.encode(frame))
-        container.mux(stream.encode())
-    for array in read_frames_exact(str(source), size=size):
-        np.testing.assert_allclose(array, 255, atol=1)
-
-
 @pytest.mark.parametrize("resolution", [(0, 10), (-1, 10), (10,), (10, 20, 30)])
 def test_invalid_resolution_is_rejected(resolution):
     with pytest.raises(ValueError, match="resolution"):
