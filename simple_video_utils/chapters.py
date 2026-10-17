@@ -63,17 +63,18 @@ def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip
             width, height = clips[0].size
             # The muxer takes the header (avcC) from the first clip's packets.
             track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
-            frames, position, written = stream.container.decode(stream), 0, 0
+            decoded = source.decode(stream)
+            source_end = output_start = 0
             for clip in clips:
-                if clip.start_frame < position:
-                    # Clips in source order share one decode; one that starts before the last ended decodes again.
-                    stream.container.seek(0, stream=stream)
-                    frames, position = stream.container.decode(stream), 0
-                # ponytail: decodes the gaps between clips too; seek to each clip's keyframe if long gaps matter.
-                trim = islice(frames, clip.start_frame - position, clip.end_frame - position)
-                _write_clip(stream, track, clip, trim, written, crf)
-                written += clip.end_frame - clip.start_frame
-                position = clip.end_frame
+                if clip.start_frame < source_end:
+                    source.seek(0, stream=stream)
+                    decoded = source.decode(stream)
+                    source_end = 0
+                # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
+                frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
+                _write_clip(stream, track, clip, frames, output_start, crf)
+                source_end = clip.end_frame
+                output_start += clip.end_frame - clip.start_frame
 
 
 def _write_clip(
