@@ -1,6 +1,7 @@
 import operator
 import sys
 from collections.abc import Callable, Generator, Iterable
+from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
 from itertools import islice, tee
@@ -8,6 +9,7 @@ from typing import BinaryIO
 
 import av
 import numpy as np
+from av.video.reformatter import Interpolation, VideoReformatter
 
 from simple_video_utils.metadata import (
     VideoMetadata,
@@ -17,7 +19,7 @@ from simple_video_utils.metadata import (
     video_metadata_from_container,
 )
 
-# Below this frame size, swscale's threads=0 (auto, one slice job per CPU)
+# For RGB conversion below this frame size, threads=0 (auto, one slice job per CPU)
 # loses to single-threaded: dispatch overhead exceeds the conversion itself —
 # measured 2x slower at 320x240, a wash at 640x360, auto wins from ~960x540.
 # Output is byte-identical at any thread count. The crossover is
@@ -25,16 +27,28 @@ from simple_video_utils.metadata import (
 # is a calibration knob, not a derived value.
 _SINGLE_THREAD_MAX_PIXELS = 300_000
 
-def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
-    """
-    Build a filter graph rotating rgb24 frames.
 
-    rotation=90 maps to a counterclockwise transpose, matching ffmpeg
-    autorotate (and np.rot90 k=1) pixel-exactly. Graphs are stateful
-    (push/pull is a FIFO), so cache only per-read (the lru_cache in
-    _frames_to_rgb) — a shared/module-level cache would interleave
-    frames across concurrent reads.
+@dataclass(frozen=True)
+class FrameSize:
+    """Resize to (width, height) using the specified interpolation.
+
+    Dimensions are in display orientation. Interpolation defaults to PyAV's AREA.
     """
+
+    resolution: tuple[int, int]
+    method: Interpolation = Interpolation.AREA
+
+    def __post_init__(self) -> None:
+        if len(self.resolution) != 2 or any(operator.index(side) <= 0 for side in self.resolution):
+            message = "resolution must be two positive integers, (width, height)"
+            raise ValueError(message)
+        if not isinstance(self.method, Interpolation):
+            message = "method must be a PyAV Interpolation"
+            raise TypeError(message)
+
+
+def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
+    """Rotate RGB pixels; 90 degrees is counterclockwise, matching display-matrix rotation."""
     graph = av.filter.Graph()
     if rotation == 180:
         filters = [graph.add("hflip"), graph.add("vflip")]
@@ -49,43 +63,31 @@ def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction 
     return graph
 
 
-def _frames_to_rgb(frames: Iterable[av.VideoFrame]) -> Generator[np.ndarray, None, None]:
+def _frames_to_rgb(
+    frames: Iterable[av.VideoFrame], size: FrameSize | None = None,
+) -> Generator[np.ndarray, None, None]:
+    """Resize native planes, convert to RGB, then apply display rotation.
+
+    PyAV does not apply display rotation while decoding. Rotate after RGB conversion
+    so chroma interpolation stays unchanged; native transpose also avoids NumPy's strided copy.
     """
-    Convert decoded frames to RGB arrays in display orientation.
-
-    PyAV decodes frames in their stored orientation and does not apply the
-    container's display-matrix rotation (unlike the ffmpeg CLI, which
-    autorotates). Phone-recorded videos commonly store landscape frames with
-    a 90° rotation tag, so we apply it here.
-
-    A single reformatter is reused across all frames of a read so the
-    swscale conversion context is built once instead of being reallocated on
-    every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
-    dramatically faster full-clip decode.
-
-    Rotation runs as a libavfilter transpose/flip on the rgb24 frame — a pure
-    pixel permutation, so it stays byte-identical to np.rot90 while ffmpeg's
-    cache-blocked transpose is ~10x faster than numpy's strided copy. It is
-    applied after the rgb24 reformat, not on the decoded yuv420p frame:
-    transposing before chroma upsampling changes the interpolation and breaks
-    pixel-exactness (measured maxdiff 2-3).
-    """
-    reformatter = av.video.reformatter.VideoReformatter()
-    # One-slot cache: built on the first rotated frame, reused for the whole
-    # read, rebuilt only if stream geometry changes mid-read. Created here so
-    # each read gets its own graph (see _rotation_graph on why).
+    # Separate contexts retain each stage's scaling and conversion setup.
+    scaler = VideoReformatter()
+    converter = VideoReformatter()
+    # Graphs are stateful: reuse per geometry within this read, never across readers.
     rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
     for frame in frames:
-        threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        rgb = reformatter.reformat(frame, format='rgb24', threads=threads)
         rotation = frame.rotation % 360
-        if rotation and rotation % 90 == 0:
+        if size is not None:
+            width, height = size.resolution[::-1] if rotation in (90, 270) else size.resolution
+            frame = scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=1)
+        threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
+        rgb = converter.reformat(frame, format='rgb24', threads=threads)
+        if rotation in (90, 180, 270):
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
             rgb = graph.pull()
-        # The frame's linesize may be padded past width*3, making to_ndarray
-        # a non-contiguous view — consumers like MediaPipe and OpenCV reject
-        # those, so copy (no-op when already contiguous).
+        # Padded linesizes can produce strided views, which downstream image tools reject.
         yield np.ascontiguousarray(rgb.to_ndarray())
 
 
@@ -262,10 +264,11 @@ def _select_frames_by_fps(
 
 def _indexed_frames_to_rgb(
     items: Iterable[tuple[int, av.VideoFrame]],
+    size: FrameSize | None = None,
 ) -> Generator[tuple[np.ndarray, int], None, None]:
     """Convert (index, frame) pairs to (rgb_array, index) pairs."""
     frames, pairs = tee(items, 2)
-    for rgb, (index, _) in zip(_frames_to_rgb(f for _, f in frames), pairs, strict=True):
+    for rgb, (index, _) in zip(_frames_to_rgb((f for _, f in frames), size), pairs, strict=True):
         yield rgb, index
 
 
@@ -284,6 +287,7 @@ def read_frames_exact(
     thread_type: str = "AUTO",
     fps: float | None = None,
     return_indices: bool = False,
+    size: FrameSize | None = None,
 ) -> Generator[np.ndarray, None, None] | Generator[tuple[np.ndarray, int], None, None]:
     """
     Return frames as RGB np.ndarrays from specified range.
@@ -306,6 +310,8 @@ def read_frames_exact(
             ``index`` is the frame's absolute 0-based position in the whole
             video (the start offset is included, and fps drop-selection
             reports exactly the frames it kept). Default False: plain arrays.
+        size: Optional output resolution and interpolation in display orientation.
+            Resizes native planes before RGB conversion. None preserves each frame's size.
 
     Returns:
         Generator yielding RGB numpy arrays (H, W, 3), or (array, index)
@@ -330,6 +336,9 @@ def read_frames_exact(
     """
     has_time_params = _validate_parameters(start_frame, end_frame, start_time, end_time)
     _validate_fps(fps)
+    if size is not None and not isinstance(size, FrameSize):
+        message = "size must be a FrameSize"
+        raise TypeError(message)
     if not has_time_params:
         frame_range = _normalize_frame_range(start_frame, end_frame)
 
@@ -382,9 +391,9 @@ def read_frames_exact(
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
 
             if return_indices:
-                yield from _indexed_frames_to_rgb(indexed)
+                yield from _indexed_frames_to_rgb(indexed, size)
             else:
-                yield from _frames_to_rgb(frame for _, frame in indexed)
+                yield from _frames_to_rgb((frame for _, frame in indexed), size)
 
     return generate()
 
@@ -401,13 +410,19 @@ def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray
     chunks grow geometrically and one concatenation assembles them.
 
     Raises:
-        ValueError: If the iterable is empty, like np.stack.
+        ValueError: If the iterable is empty or arrays differ in shape, like np.stack.
     """
     chunk = size_hint or 64
     chunks = []
     buf = None
     count = 0
+    shape = None
     for array in frames:
+        if shape is None:
+            shape = array.shape
+        elif array.shape != shape:
+            message = f"frames have different shapes: {shape} and {array.shape}"
+            raise ValueError(message)
         if buf is None:
             buf = np.empty((chunk, *array.shape), array.dtype)
             chunk *= 2
@@ -474,6 +489,7 @@ def read_frames_batched(
     thread_type: str = "AUTO",
     fps: float | None = None,
     return_indices: bool = False,
+    size: FrameSize | None = None,
 ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     """
     Read a frame range as one batched (N, H, W, 3) RGB uint8 array.
@@ -491,13 +507,16 @@ def read_frames_batched(
     0-based index in the whole video (the start offset is included, and fps
     drop-selection reports exactly the frames it kept).
 
+    ``size`` resizes before RGB conversion, as in ``read_frames_exact``.
+    Supply it when reading across chapters with different frame dimensions.
+
     Raises:
         ValueError: Same call-time validation as read_frames_exact, and,
-            like np.stack, if the range contains no frames.
+            like np.stack, if the range contains no frames or frames differ in shape.
     """
     # Created first so parameter validation raises before the metadata peek.
     frames = read_frames_exact(src, start_frame, end_frame, start_time, end_time, thread_type, fps,
-                               return_indices=return_indices)
+                               return_indices=return_indices, size=size)
 
     total, source_fps = _count_and_rate(src)
     if start_time is not None or end_time is not None:
