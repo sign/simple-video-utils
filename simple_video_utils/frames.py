@@ -46,6 +46,9 @@ class FrameSize:
         if self.mode not in ("rescale", "pad"):
             message = "mode must be 'rescale' or 'pad'"
             raise ValueError(message)
+        if not isinstance(self.method, Interpolation):
+            message = "method must be a PyAV Interpolation"
+            raise TypeError(message)
 
 
 def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
@@ -87,6 +90,8 @@ def _frames_to_rgb(
     swscale conversion context is built once instead of being reallocated on
     every ``frame.to_ndarray(format='rgb24')`` call — byte-identical output,
     dramatically faster full-clip decode.
+
+    With size, a separate reformatter resizes native planes before RGB conversion.
 
     Rotation runs as a libavfilter transpose/flip on the rgb24 frame — a pure
     pixel permutation, so it stays byte-identical to np.rot90 while ffmpeg's
@@ -376,6 +381,9 @@ def read_frames_exact(
     """
     has_time_params = _validate_parameters(start_frame, end_frame, start_time, end_time)
     _validate_fps(fps)
+    if size is not None and not isinstance(size, FrameSize):
+        message = "size must be a FrameSize"
+        raise TypeError(message)
     if not has_time_params:
         frame_range = _normalize_frame_range(start_frame, end_frame)
 

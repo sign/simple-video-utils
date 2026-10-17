@@ -11,12 +11,12 @@ from simple_video_utils.frames import FrameSize, read_frames_batched, read_frame
 ASSETS = Path(__file__).parent / "assets"
 
 
-@pytest.fixture
-def grayscale_video(tmp_path):
+@pytest.fixture(params=["yuv420p", "yuv444p", "yuv420p10le"])
+def grayscale_video(tmp_path, request):
     path = tmp_path / "gray.mkv"
     with av.open(str(path), "w") as container:
         stream = container.add_stream("ffv1", rate=30)
-        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.width, stream.height, stream.pix_fmt = 64, 48, request.param
         checker = (np.indices((48, 64)).sum(axis=0) % 2 * 80 + 32).astype(np.uint8)
         for index in range(3):
             array = np.repeat((checker + index * 40)[..., None], 3, axis=2)
@@ -113,3 +113,14 @@ def test_invalid_mode_and_noninteger_resolution_are_rejected():
         FrameSize((10, 10), mode="crop")
     with pytest.raises(TypeError):
         FrameSize((10.5, 10))
+
+
+def test_invalid_interpolation_is_rejected():
+    with pytest.raises(TypeError, match="Interpolation"):
+        FrameSize((10, 10), method="bogus")
+
+
+@pytest.mark.parametrize("reader", [read_frames_exact, read_frames_batched])
+def test_invalid_size_is_rejected_before_opening(reader):
+    with pytest.raises(TypeError, match="FrameSize"):
+        reader("missing.mp4", size=(32, 24))
