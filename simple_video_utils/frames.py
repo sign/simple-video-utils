@@ -51,13 +51,21 @@ class FrameSize:
             raise TypeError(message)
 
 
-def _native_size(frame: av.VideoFrame, size: FrameSize) -> tuple[int, int]:
-    """Target dimensions before display rotation, preserving aspect ratio for pad mode."""
-    width, height = size.resolution[::-1] if frame.rotation % 360 in (90, 270) else size.resolution
-    if size.mode == "pad":
-        ratio = min(width / frame.width, height / frame.height)
-        width, height = max(1, round(frame.width * ratio)), max(1, round(frame.height * ratio))
-    return width, height
+def _resize_frames(
+    frames: Iterable[av.VideoFrame], size: FrameSize,
+) -> Generator[av.VideoFrame, None, None]:
+    """Resize in stored orientation, fitting within the display resolution in pad mode.
+
+    A dedicated scaler keeps its context separate from the later RGB conversion.
+    """
+    scaler = VideoReformatter()
+    for frame in frames:
+        width, height = size.resolution[::-1] if frame.rotation % 360 in (90, 270) else size.resolution
+        if size.mode == "pad":
+            ratio = min(width / frame.width, height / frame.height)
+            width, height = max(1, round(frame.width * ratio)), max(1, round(frame.height * ratio))
+        threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
+        yield scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=threads)
 
 
 def _letterbox(array: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
@@ -92,24 +100,20 @@ def _frames_to_rgb(
     PyAV does not apply display rotation while decoding. Rotate after RGB conversion
     so chroma interpolation stays unchanged; native transpose also avoids NumPy's strided copy.
     """
-    reformatter = VideoReformatter()
-    scaler = VideoReformatter()
+    if size is not None:
+        frames = _resize_frames(frames, size)
+    converter = VideoReformatter()
     # Graphs are stateful: reuse per geometry within this read, never across readers.
     rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
     padding = size.resolution if size is not None and size.mode == "pad" else None
     for frame in frames:
         rotation = frame.rotation % 360
-        if size is not None:
-            width, height = _native_size(frame, size)
-            # Keep the native planes until after resizing; separate contexts avoid rebuilding swscale each step.
-            threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-            frame = scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=threads)
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        rgb_method = Interpolation.BILINEAR
+        rgb_flags = Interpolation.BILINEAR
         if frame.width % 2:
             # swscale's fast RGB conversion can leave the last column unwritten on odd widths.
-            rgb_method |= Interpolation.ACCURATE_RND
-        rgb = reformatter.reformat(frame, format='rgb24', interpolation=rgb_method, threads=threads)
+            rgb_flags |= Interpolation.ACCURATE_RND
+        rgb = converter.reformat(frame, format='rgb24', interpolation=rgb_flags, threads=threads)
         if rotation in (90, 180, 270):
             graph = rotation_graph(rotation, rgb.width, rgb.height, frame.time_base)
             graph.push(rgb)
