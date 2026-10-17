@@ -19,7 +19,7 @@ from simple_video_utils.metadata import (
     video_metadata_from_container,
 )
 
-# Below this frame size, swscale's threads=0 (auto, one slice job per CPU)
+# For RGB conversion below this frame size, threads=0 (auto, one slice job per CPU)
 # loses to single-threaded: dispatch overhead exceeds the conversion itself —
 # measured 2x slower at 320x240, a wash at 640x360, auto wins from ~960x540.
 # Output is byte-identical at any thread count. The crossover is
@@ -64,8 +64,7 @@ def _resize_frames(
         if size.mode == "pad":
             ratio = min(width / frame.width, height / frame.height)
             width, height = max(1, round(frame.width * ratio)), max(1, round(frame.height * ratio))
-        threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
-        yield scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=threads)
+        yield scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=1)
 
 
 def _letterbox(array: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
