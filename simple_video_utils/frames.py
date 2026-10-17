@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
 from itertools import islice, tee
-from typing import BinaryIO, Literal
+from typing import BinaryIO
 
 import av
 import numpy as np
@@ -30,21 +30,17 @@ _SINGLE_THREAD_MAX_PIXELS = 300_000
 
 @dataclass(frozen=True)
 class FrameSize:
-    """Output (width, height): stretch with rescale, or fit and center on black with pad.
+    """Resize to (width, height) using the specified interpolation.
 
     Dimensions are in display orientation. Interpolation defaults to PyAV's AREA.
     """
 
     resolution: tuple[int, int]
-    mode: Literal["rescale", "pad"] = "rescale"
     method: Interpolation = Interpolation.AREA
 
     def __post_init__(self) -> None:
         if len(self.resolution) != 2 or any(operator.index(side) <= 0 for side in self.resolution):
             message = "resolution must be two positive integers, (width, height)"
-            raise ValueError(message)
-        if self.mode not in ("rescale", "pad"):
-            message = "mode must be 'rescale' or 'pad'"
             raise ValueError(message)
         if not isinstance(self.method, Interpolation):
             message = "method must be a PyAV Interpolation"
@@ -54,25 +50,14 @@ class FrameSize:
 def _resize_frames(
     frames: Iterable[av.VideoFrame], size: FrameSize,
 ) -> Generator[av.VideoFrame, None, None]:
-    """Resize in stored orientation, fitting within the display resolution in pad mode.
+    """Resize native planes to the requested display resolution.
 
     A dedicated scaler keeps its context separate from the later RGB conversion.
     """
     scaler = VideoReformatter()
     for frame in frames:
         width, height = size.resolution[::-1] if frame.rotation % 360 in (90, 270) else size.resolution
-        if size.mode == "pad":
-            ratio = min(width / frame.width, height / frame.height)
-            width, height = max(1, round(frame.width * ratio)), max(1, round(frame.height * ratio))
         yield scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=1)
-
-
-def _letterbox(array: np.ndarray, resolution: tuple[int, int]) -> np.ndarray:
-    width, height = resolution
-    top, left = (height - array.shape[0]) // 2, (width - array.shape[1]) // 2
-    padded = np.zeros((height, width, 3), dtype=np.uint8)
-    padded[top:top + array.shape[0], left:left + array.shape[1]] = array
-    return padded
 
 
 def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
@@ -94,7 +79,7 @@ def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction 
 def _frames_to_rgb(
     frames: Iterable[av.VideoFrame], size: FrameSize | None = None,
 ) -> Generator[np.ndarray, None, None]:
-    """Resize native planes, convert to RGB, then apply display rotation and padding.
+    """Resize native planes, convert to RGB, then apply display rotation.
 
     PyAV does not apply display rotation while decoding. Rotate after RGB conversion
     so chroma interpolation stays unchanged; native transpose also avoids NumPy's strided copy.
@@ -104,7 +89,6 @@ def _frames_to_rgb(
     converter = VideoReformatter()
     # Graphs are stateful: reuse per geometry within this read, never across readers.
     rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
-    padding = size.resolution if size is not None and size.mode == "pad" else None
     for frame in frames:
         rotation = frame.rotation % 360
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
@@ -114,10 +98,7 @@ def _frames_to_rgb(
             graph.push(rgb)
             rgb = graph.pull()
         # Padded linesizes can produce strided views, which downstream image tools reject.
-        array = rgb.to_ndarray()
-        if padding is not None:
-            array = _letterbox(array, padding)
-        yield np.ascontiguousarray(array)
+        yield np.ascontiguousarray(rgb.to_ndarray())
 
 
 def _prepend(
@@ -339,7 +320,7 @@ def read_frames_exact(
             ``index`` is the frame's absolute 0-based position in the whole
             video (the start offset is included, and fps drop-selection
             reports exactly the frames it kept). Default False: plain arrays.
-        size: Optional output resolution, mode and interpolation in display orientation.
+        size: Optional output resolution and interpolation in display orientation.
             Resizes native planes before RGB conversion. None preserves each frame's size.
 
     Returns:

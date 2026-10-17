@@ -58,9 +58,6 @@ from simple_video_utils.frames import FrameSize, read_frames_batched
 # Stretch to (width, height), resizing native YUV planes before RGB conversion.
 frames = read_frames_batched("video.mp4", size=FrameSize((256, 256)))
 
-# Preserve aspect ratio and center on a black canvas.
-frames = read_frames_batched("video.mp4", size=FrameSize((256, 256), mode="pad"))
-
 # Choose PyAV's interpolation, e.g. bicubic for enlarging frames.
 frames = read_frames_batched("video.mp4", size=FrameSize((512, 512), method=Interpolation.BICUBIC))
 ```

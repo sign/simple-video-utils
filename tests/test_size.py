@@ -42,15 +42,6 @@ def test_interpolation_is_forwarded_to_pyav(grayscale_video):
     assert not np.array_equal(resized, smooth)
 
 
-def test_padding_preserves_aspect_ratio_and_centers_on_black(grayscale_video):
-    padded = read_frames_batched(grayscale_video, size=FrameSize((80, 81), mode="pad"))
-    content = read_frames_batched(grayscale_video, size=FrameSize((80, 60)))
-    assert padded.shape == (3, 81, 80, 3)
-    assert not padded[:, :10].any()
-    assert not padded[:, 70:].any()
-    np.testing.assert_array_equal(padded[:, 10:70], content)
-
-
 def test_size_uses_display_orientation():
     source = str(ASSETS / "rotated90.mp4")
     resized = next(read_frames_exact(source, end_frame=0, size=FrameSize((180, 320))))
@@ -58,11 +49,6 @@ def test_size_uses_display_orientation():
     expected = original.reshape(320, 2, 180, 2, 3).mean(axis=(1, 3))
     assert resized.shape == (320, 180, 3)
     assert np.abs(resized.astype(float) - expected).mean() < 3
-    padded = next(read_frames_exact(source, end_frame=0, size=FrameSize((200, 300), mode="pad")))
-    assert padded.shape == (300, 200, 3)
-    assert not padded[:, :15].any()
-    assert not padded[:, 184:].any()
-    assert padded[:, 16:184].any()
 
 
 def test_size_preserves_range_fps_and_indices():
@@ -80,14 +66,13 @@ def test_size_preserves_range_fps_and_indices():
         assert frame.flags.c_contiguous
 
 
-@pytest.mark.parametrize("mode", ["rescale", "pad"])
-def test_variable_size_chapters_resize_in_one_read(tmp_path, mode):
+def test_variable_size_chapters_resize_in_one_read(tmp_path):
     output = tmp_path / "chapters.mkv"
     write_chapters(ASSETS / "example.mp4", output, [
         ChapterClip(30, 35, (10, 6, 74, 38)),
         ChapterClip(60, 64, (40, 20, 72, 84)),
     ])
-    size = FrameSize((48, 40), mode=mode)
+    size = FrameSize((48, 40))
     frames = read_frames_batched(str(output), size=size)
     assert frames.shape == (9, 40, 48, 3)
     expected = list(read_frames_exact(str(output), size=size))
@@ -108,9 +93,7 @@ def test_invalid_resolution_is_rejected(resolution):
         FrameSize(resolution)
 
 
-def test_invalid_mode_and_noninteger_resolution_are_rejected():
-    with pytest.raises(ValueError, match="mode"):
-        FrameSize((10, 10), mode="crop")
+def test_noninteger_resolution_is_rejected():
     with pytest.raises(TypeError):
         FrameSize((10.5, 10))
 
