@@ -130,6 +130,25 @@ def test_short_chapters_keep_packet_order_and_seek_to_their_keyframes(tmp_path, 
 
 
 
+def test_clips_out_of_source_order_or_overlapping_keep_their_frames(tmp_path):
+    # the second and third clips start before the previous one ended, so each decodes the source again
+    clips = [
+        ChapterClip(60, 64, (40, 20, 72, 84)),
+        ChapterClip(30, 35, (10, 6, 74, 38)),
+        ChapterClip(32, 36, (10, 6, 74, 38)),
+    ]
+    output = tmp_path / "chapters.mkv"
+    write_chapters(SOURCE, output, clips, crf=0)
+    original = list(read_frames_exact(str(SOURCE)))
+    expected = [
+        original[index][clip.box[1] : clip.box[3], clip.box[0] : clip.box[2]]
+        for clip in clips
+        for index in range(clip.start_frame, clip.end_frame)
+    ]
+    for frame, crop in zip(read_frames_exact(str(output)), expected, strict=True):
+        np.testing.assert_allclose(frame, crop, atol=1)
+
+
 def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):
     with pytest.raises(ValueError, match="shorter"):
         write_chapters(SOURCE, tmp_path / "short.mkv", [ChapterClip(128, 133, (0, 0, 32, 32))])

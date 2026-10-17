@@ -63,16 +63,29 @@ def write_chapters(src: str | Path, out: str | Path, clips: Sequence[ChapterClip
             width, height = clips[0].size
             # The muxer takes the header (avcC) from the first clip's packets.
             track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
-            written = 0
+            decoded = source.decode(stream)
+            source_end = output_start = 0
             for clip in clips:
-                _write_clip(stream, track, clip, written, crf)
-                written += clip.end_frame - clip.start_frame
+                if clip.start_frame < source_end:
+                    source.seek(0, stream=stream)
+                    decoded = source.decode(stream)
+                    source_end = 0
+                # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
+                frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
+                _write_clip(stream, track, clip, frames, output_start, crf)
+                source_end = clip.end_frame
+                output_start += clip.end_frame - clip.start_frame
 
 
-def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip, start: int, crf: int) -> None:
+def _write_clip(
+    source: av.VideoStream,
+    track: av.VideoStream,
+    clip: ChapterClip,
+    frames: Iterator[av.VideoFrame],
+    start: int,
+    crf: int,
+) -> None:
     rate = source.average_rate
-    # shortcut: decode each trim's lead-in; seek when long sources need faster exports.
-    source.container.seek(0, stream=source)
     graph = av.filter.Graph()
     left, top, right, bottom = clip.box
     x, y = max(0, -left), max(0, -top)
@@ -105,7 +118,6 @@ def _write_clip(source: av.VideoStream, track: av.VideoStream, clip: ChapterClip
     # Independent encoders must not reorder packets across chapter boundaries.
     encoder.max_b_frames = 0
     encoder.options = {"crf": str(crf)}
-    frames = islice(source.container.decode(source), clip.start_frame, clip.end_frame)
     indices = range(start, start + clip.end_frame - clip.start_frame)
     for index, frame in zip(indices, frames, strict=True):
         graph.push(frame)
