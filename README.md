@@ -49,6 +49,27 @@ frames = list(read_frames_exact("video.mp4", start_frame=5, end_frame=None))
 frames = list(read_frames_exact("video.mp4", fps=15))
 ```
 
+### Resize While Reading
+
+```python
+from av.video.reformatter import Interpolation
+from simple_video_utils.frames import FrameSize, read_frames_batched
+
+# Stretch to (width, height), resizing native YUV planes before RGB conversion.
+frames = read_frames_batched("video.mp4", size=FrameSize((256, 256)))
+
+# Preserve aspect ratio and center on a black canvas.
+frames = read_frames_batched("video.mp4", size=FrameSize((256, 256), mode="pad"))
+
+# Choose PyAV's interpolation, e.g. bicubic for enlarging frames.
+frames = read_frames_batched("video.mp4", size=FrameSize((512, 512), method=Interpolation.BICUBIC))
+```
+
+Both `read_frames_exact` and `read_frames_batched` accept `size`. Resolution is in display orientation;
+the default method is `Interpolation.AREA`. Without `size`, each frame keeps its original dimensions.
+Supply `size` to batch across chapters with different dimensions. Native-plane resizing can produce different
+RGB pixels from resizing after RGB conversion, since chroma is resized at the source pixel format's resolution.
+
 ### One Open, Many Reads
 
 ```python
