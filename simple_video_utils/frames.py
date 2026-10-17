@@ -47,19 +47,6 @@ class FrameSize:
             raise TypeError(message)
 
 
-def _resize_frames(
-    frames: Iterable[av.VideoFrame], size: FrameSize,
-) -> Generator[av.VideoFrame, None, None]:
-    """Resize native planes to the requested display resolution.
-
-    A dedicated scaler keeps its context separate from the later RGB conversion.
-    """
-    scaler = VideoReformatter()
-    for frame in frames:
-        width, height = size.resolution[::-1] if frame.rotation % 360 in (90, 270) else size.resolution
-        yield scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=1)
-
-
 def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
     """Rotate RGB pixels; 90 degrees is counterclockwise, matching display-matrix rotation."""
     graph = av.filter.Graph()
@@ -84,13 +71,16 @@ def _frames_to_rgb(
     PyAV does not apply display rotation while decoding. Rotate after RGB conversion
     so chroma interpolation stays unchanged; native transpose also avoids NumPy's strided copy.
     """
-    if size is not None:
-        frames = _resize_frames(frames, size)
+    # Separate contexts retain each stage's scaling and conversion setup.
+    scaler = VideoReformatter()
     converter = VideoReformatter()
     # Graphs are stateful: reuse per geometry within this read, never across readers.
     rotation_graph = lru_cache(maxsize=1)(_rotation_graph)
     for frame in frames:
         rotation = frame.rotation % 360
+        if size is not None:
+            width, height = size.resolution[::-1] if rotation in (90, 270) else size.resolution
+            frame = scaler.reformat(frame, width=width, height=height, interpolation=size.method, threads=1)
         threads = 1 if frame.width * frame.height < _SINGLE_THREAD_MAX_PIXELS else 0
         rgb = converter.reformat(frame, format='rgb24', threads=threads)
         if rotation in (90, 180, 270):
