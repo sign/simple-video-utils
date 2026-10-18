@@ -169,8 +169,13 @@ def test_keep_chapters_matches_writing_only_the_kept_clips(tmp_path, keep):
     def chapters(path):
         return [(c["start"], c["end"], dict(c["metadata"])) for c in list_chapters(path)]
 
+    def packets(path):
+        with av.open(str(path)) as container:
+            return [(p.pts, p.dts, p.duration, p.is_keyframe, bytes(p)) for p in container.demux(video=0) if p.size]
+
     assert decoded(kept) == decoded(fresh)
     assert chapters(kept) == chapters(fresh)
+    assert packets(kept) == packets(fresh)
 
 
 def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):

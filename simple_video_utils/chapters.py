@@ -128,6 +128,7 @@ def keep_chapters(src: str | Path, out: str | Path, keep: Sequence[int]) -> None
                     continue
                 packet.pts = frame - shift[chapter]
                 packet.dts = round(packet.dts * packet.time_base * rate) - shift[chapter]
+                packet.duration = round(packet.duration * packet.time_base * rate)
                 packet.time_base = 1 / rate
                 for copy in annex_b.filter(packet):
                     copy.stream = track
