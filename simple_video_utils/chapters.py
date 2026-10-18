@@ -1,12 +1,10 @@
 """Store rectangular crops and time trims as chapters of one Matroska video."""
 
 import json
-from bisect import bisect_right
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
-from functools import partial
-from itertools import accumulate, islice
+from itertools import islice
 from pathlib import Path
 
 import av
@@ -47,16 +45,14 @@ def write_chapters(
     *,
     crf: int = 23,
     preset: str = "medium",
-    on_frame: Callable[[int, av.VideoFrame], None] | None = None,
     thread_type: str = "AUTO",
 ) -> None:
     """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
     Output must not exist. Coordinates refer to encoded pixels, before rotation.
     Each chapter stores its source specification in a JSON ``payload`` tag.
-    ``preset`` is the x264 preset, x264's own by default. ``on_frame(clip index, frame)`` sees each chapter frame as
-    it is encoded, cropped and resized, so a caller can measure chapters without decoding the output.
-    ``thread_type`` is PyAV's for decoding the source ("AUTO", "FRAME", "SLICE" or "NONE"); the frames do not change.
+    ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
+    "FRAME", "SLICE" or "NONE"); the frames do not change.
     """
     with _open_video(str(src)) as source:
         stream = source.streams.video[0]
@@ -70,9 +66,14 @@ def write_chapters(
             if width % 16 or height % 16:
                 message = "H.264 chapter width and height must be multiples of 16"
                 raise ValueError(message)
-            length = clip.end_frame - clip.start_frame
-            chapters.append(_chapter(len(chapters), offset, length, rate, json.dumps(asdict(clip))))
-            offset += length
+            end = offset + clip.end_frame - clip.start_frame
+            chapters.append({
+                "id": len(chapters),
+                "start": int(offset * 1000 / rate + Fraction(1, 2)),
+                "end": int(end * 1000 / rate + Fraction(1, 2)),
+                "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
+            })
+            offset = end
         with open(out, "xb") as file, av.open(file, mode="w", format="matroska") as destination:
             destination.set_chapters(chapters)
             width, height = clips[0].size
@@ -80,65 +81,16 @@ def write_chapters(
             track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
             decoded = source.decode(stream)
             source_end = output_start = 0
-            for index, clip in enumerate(clips):
+            for clip in clips:
                 if clip.start_frame < source_end:
                     source.seek(0, stream=stream)
                     decoded = source.decode(stream)
                     source_end = 0
                 # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
                 frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-                seen = on_frame and partial(on_frame, index)
-                _write_clip(stream, track, clip, frames, output_start, crf, preset, seen)
+                _write_clip(stream, track, clip, frames, output_start, crf, preset)
                 source_end = clip.end_frame
                 output_start += clip.end_frame - clip.start_frame
-
-
-def keep_chapters(src: str | Path, out: str | Path, keep: Sequence[int]) -> None:
-    """Copy the chapters at indices ``keep`` of a ``write_chapters`` file to ``out``, packets as they are, back to back.
-
-    Each chapter is its own encode, opening on a keyframe that carries its parameter sets and with no B-frames, so its
-    packets stand alone: the copy decodes to the frames ``write_chapters`` writes for those clips alone, with no second
-    decode or encode. Output must not exist.
-    """
-    with _open_video(str(src)) as source:
-        stream = source.streams.video[0]
-        rate = stream.average_rate
-        payloads = [{k.lower(): v for k, v in c["metadata"].items()}["payload"] for c in source.chapters()]
-        clips = [ChapterClip(**json.loads(payload)) for payload in payloads]
-        lengths = [clip.end_frame - clip.start_frame for clip in clips]
-        starts = list(accumulate(lengths, initial=0))  # each chapter's first frame in src
-        chapters, shift, offset = [], {}, 0
-        for index in keep:
-            chapters.append(_chapter(len(chapters), offset, lengths[index], rate, payloads[index]))
-            shift[index] = starts[index] - offset
-            offset += lengths[index]
-        # Matroska stores length-prefixed NAL units; the muxer takes start codes, as the encoder hands them over, and
-        # builds the header from the first kept chapter's own parameter sets
-        annex_b = av.bitstream.BitStreamFilterContext("h264_mp4toannexb", in_stream=stream)
-        with open(out, "xb") as file, av.open(file, mode="w", format="matroska") as destination:
-            destination.set_chapters(chapters)
-            width, height = clips[keep[0]].size
-            track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
-            for packet in source.demux(stream):
-                if packet.pts is None:  # the demuxer's closing empty packet
-                    continue
-                frame = round(packet.pts * packet.time_base * rate)
-                chapter = bisect_right(starts, frame) - 1
-                if chapter not in shift:
-                    continue
-                packet.pts = frame - shift[chapter]
-                packet.dts = round(packet.dts * packet.time_base * rate) - shift[chapter]
-                packet.duration = round(packet.duration * packet.time_base * rate)
-                packet.time_base = 1 / rate
-                for copy in annex_b.filter(packet):
-                    copy.stream = track
-                    destination.mux(copy)
-
-
-def _chapter(index: int, offset: int, length: int, rate: Fraction, payload: str) -> dict:
-    """A Matroska chapter of `length` frames from frame `offset`, its times in rounded milliseconds."""
-    start, end = (int(frame * 1000 / rate + Fraction(1, 2)) for frame in (offset, offset + length))
-    return {"id": index, "start": start, "end": end, "time_base": Fraction(1, 1000), "metadata": {"payload": payload}}
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
@@ -156,7 +108,6 @@ def _write_clip(
     start: int,
     crf: int,
     preset: str,
-    on_frame: Callable[[av.VideoFrame], None] | None,
 ) -> None:
     rate = source.average_rate
     graph = av.filter.Graph()
@@ -201,8 +152,6 @@ def _write_clip(
     for index, frame in zip(indices, frames, strict=True):
         graph.push(frame)
         cropped = graph.pull()
-        if on_frame is not None:
-            on_frame(cropped)
         cropped.pts = index
         cropped.time_base = 1 / rate
         cropped.pict_type = 0

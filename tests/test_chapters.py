@@ -7,7 +7,7 @@ import av
 import numpy as np
 import pytest
 
-from simple_video_utils.chapters import ChapterClip, keep_chapters, list_chapters, write_chapters
+from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
@@ -147,35 +147,6 @@ def test_clips_out_of_source_order_or_overlapping_keep_their_frames(tmp_path):
     ]
     for frame, crop in zip(read_frames_exact(str(output)), expected, strict=True):
         np.testing.assert_allclose(frame, crop, atol=1)
-
-
-@pytest.mark.parametrize("keep", [[0, 2], [1, 2], [0, 1], [1]])
-def test_keep_chapters_matches_writing_only_the_kept_clips(tmp_path, keep):
-    clips = [
-        ChapterClip(30, 35, (10, 6, 74, 38), {"n": 0}),
-        ChapterClip(60, 64, (40, 20, 72, 84), {"n": 1}),
-        ChapterClip(70, 78, (0, 0, 32, 32), {"n": 2}),
-    ]
-    whole, kept, fresh = tmp_path / "whole.mkv", tmp_path / "kept.mkv", tmp_path / "fresh.mkv"
-    write_chapters(SOURCE, whole, clips)
-    keep_chapters(whole, kept, keep)
-    write_chapters(SOURCE, fresh, [clips[index] for index in keep])
-
-    def decoded(path):
-        with av.open(str(path)) as container:
-            frames = container.decode(video=0)
-            return [(f.pts, f.width, f.height, f.to_ndarray(format="gray").tobytes()) for f in frames]
-
-    def chapters(path):
-        return [(c["start"], c["end"], dict(c["metadata"])) for c in list_chapters(path)]
-
-    def packets(path):
-        with av.open(str(path)) as container:
-            return [(p.pts, p.dts, p.duration, p.is_keyframe, bytes(p)) for p in container.demux(video=0) if p.size]
-
-    assert decoded(kept) == decoded(fresh)
-    assert chapters(kept) == chapters(fresh)
-    assert packets(kept) == packets(fresh)
 
 
 def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):
