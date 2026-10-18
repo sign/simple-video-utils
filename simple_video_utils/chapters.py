@@ -47,6 +47,7 @@ def write_chapters(
     crf: int = 23,
     preset: str | None = None,
     on_frame: Callable[[int, av.VideoFrame], None] | None = None,
+    thread_type: str = "AUTO",
 ) -> None:
     """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
@@ -54,11 +55,12 @@ def write_chapters(
     Each chapter stores its source specification in a JSON ``payload`` tag.
     ``preset`` is the x264 preset (x264's own default when None). ``on_frame(clip index, frame)`` sees each chapter
     frame as it is encoded, cropped and resized, so a caller can measure chapters without decoding the output.
+    ``thread_type`` is PyAV's for decoding the source ("AUTO", "FRAME", "SLICE" or "NONE"); the frames do not change.
     """
     with _open_video(str(src)) as source:
         stream = source.streams.video[0]
-        # H.264 slice threading idles on single-slice streams; frame threading decodes in parallel, frames unchanged.
-        stream.thread_type = "AUTO"
+        # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
+        stream.thread_type = thread_type
         rate = stream.average_rate
         chapters = []
         offset = 0
