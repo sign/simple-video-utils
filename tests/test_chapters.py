@@ -6,11 +6,45 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
+from av.video.reformatter import ColorRange
 
 from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
+
+
+@pytest.mark.parametrize("preset", ["medium", "veryfast"])
+def test_chapters_keep_frames_and_keyframes_across_encoder_thread_modes(tmp_path, preset):
+    source = tmp_path / "source.mkv"
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=30)
+        stream.width, stream.height, stream.pix_fmt = 640, 512, "yuv420p"
+        for index in range(74):
+            frame = av.VideoFrame(width=640, height=512, format="yuv420p")
+            for plane_index, plane in enumerate(frame.planes):
+                value = 32 + index * 2 if plane_index == 0 else 128
+                plane.update(np.full((plane.height, plane.line_size), value, dtype=np.uint8))
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    clips = [
+        ChapterClip(0, 64, (0, 0, 128, 128)),
+        ChapterClip(0, 64, (0, 0, 512, 512)),
+        ChapterClip(64, 74, (0, 0, 256, 256)),
+    ]
+    output = tmp_path / "chapters.mkv"
+    write_chapters(source, output, clips, preset=preset, crf=0)
+    with av.open(str(output)) as container:
+        frames = list(container.decode(video=0))
+        assert len(container.chapters()) == 3
+    expected = [(clip, index) for clip in clips for index in range(clip.start_frame, clip.end_frame)]
+    for frame, (clip, index) in zip(frames, expected, strict=True):
+        assert (frame.width, frame.height) == clip.size
+        plane = frame.planes[0]
+        luma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+        np.testing.assert_array_equal(luma, 32 + index * 2)
+    assert all(frames[index].key_frame for index in (0, 64, 128))
+    assert [frame.time for frame in frames] == pytest.approx([index / 30 for index in range(138)], abs=0.001)
 
 
 def test_crop_trim_and_read(tmp_path):
@@ -113,19 +147,13 @@ def test_padding_on_the_chroma_grid_keeps_source_pixels(tmp_path, box):
         np.testing.assert_array_equal(pixels, expected)
 
 
-def test_resize_controls_h264_alignment(tmp_path):
-    output = tmp_path / "resized.mkv"
-    write_chapters(SOURCE, output, [ChapterClip(30, 31, (10, 6, 73, 41), resolution=(64, 32))])
-    assert next(read_frames_exact(str(output))).shape == (32, 64, 3)
-    with pytest.raises(ValueError, match="multiples of 16"):
-        write_chapters(SOURCE, tmp_path / "invalid.mkv", [ChapterClip(30, 31, (0, 0, 64, 32), resolution=(62, 32))])
-
 
 def test_odd_size_past_the_frame_pads_to_its_resolution(tmp_path):
     # even left and top, but a 327x245 padded size is off the 4:2:0 chroma grid
     output = tmp_path / "odd.mkv"
     write_chapters(SOURCE, output, [ChapterClip(30, 31, (-4, -2, 323, 243), resolution=(64, 32))])
     assert next(read_frames_exact(str(output))).shape == (32, 64, 3)
+
 
 
 @pytest.mark.parametrize("box", [(-32, 0, 0, 32), (320, 0, 352, 32), (0, 240, 32, 272)])
@@ -137,6 +165,86 @@ def test_padding_with_no_source_overlap_is_black(tmp_path, box):
     for plane, black in zip(frame.planes, (16, 128, 128), strict=True):
         pixels = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
         np.testing.assert_allclose(pixels, black, rtol=0, atol=1)
+
+
+
+def _write_chroma_source(path, pixel_format, color_range=ColorRange.UNSPECIFIED):
+    frame = av.VideoFrame(width=64, height=48, format=pixel_format)
+    frame.time_base = Fraction(1, 25)
+    frame.color_range = color_range
+    dtype = np.uint16 if "10" in pixel_format else np.uint8
+    shift = 2 if dtype == np.uint16 else 0
+    for plane in frame.planes:
+        y, x = np.indices((plane.height, plane.line_size // np.dtype(dtype).itemsize))
+        plane.update((np.where((x + y) % 2, 64, 192) << shift).astype(dtype))
+    with av.open(str(path), "w") as container:
+        stream = container.add_stream("ffv1", rate=25)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, pixel_format
+        stream.codec_context.color_range = color_range
+        container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    return frame, dtype, shift
+
+
+@pytest.mark.parametrize("pixel_format", ["yuv420p", "yuv420p10le", "yuv422p10le", "yuv444p10le"])
+@pytest.mark.parametrize("box", [(-4, -4, 28, 28), (44, 28, 76, 60)])
+def test_aligned_padding_preserves_native_chroma(tmp_path, pixel_format, box):
+    source = tmp_path / "source.mkv"
+    original, dtype, shift = _write_chroma_source(source, pixel_format)
+    output = tmp_path / "padded.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, box)], crf=0)
+    with av.open(str(output)) as container:
+        actual = next(container.decode(video=0))
+    for index, (plane, source_plane) in enumerate(zip(actual.planes, original.planes, strict=True)):
+        pixels = np.frombuffer(plane, dtype).reshape(plane.height, -1)[:, :plane.width]
+        source_pixels = np.frombuffer(source_plane, dtype).reshape(source_plane.height, -1)[:, :source_plane.width]
+        y, x = np.indices(pixels.shape)
+        x += box[0] // (64 // source_plane.width)
+        y += box[1] // (48 // source_plane.height)
+        valid = (x >= 0) & (x < source_plane.width) & (y >= 0) & (y < source_plane.height)
+        expected = np.full(pixels.shape, (16 if index == 0 else 128) << shift, dtype=dtype)
+        expected[valid] = source_pixels[y[valid], x[valid]]
+        # 10-bit x264 CRF 0 still quantizes slightly; chroma resampling would lose far more detail.
+        np.testing.assert_allclose(pixels, expected, rtol=0, atol=6 if shift else 0)
+
+
+def test_odd_padded_edges_keep_full_resolution_chroma(tmp_path):
+    source = tmp_path / "source.mkv"
+    frame, _, _ = _write_chroma_source(source, "yuv420p")
+    output = tmp_path / "padded.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, (34, 20, 67, 53), resolution=(32, 32))], crf=0)
+    graph = av.filter.Graph()
+    graph.link_nodes(
+        graph.add_buffer(template=frame), graph.add("format", "yuv444p16le"),
+        graph.add("pad", "67:53:0:0:black"), graph.add("crop", "33:33:34:20:exact=1"),
+        graph.add("scale", "32:32"), graph.add("format", "yuv420p"), graph.add("buffersink"),
+    )
+    graph.configure()
+    graph.push(frame)
+    expected = graph.pull().to_ndarray()
+    with av.open(str(output)) as container:
+        actual = next(container.decode(video=0)).to_ndarray()
+    np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("pixel_format", ["yuv420p", "yuv420p10le"])
+def test_full_range_padding_keeps_black_borders(tmp_path, pixel_format):
+    source = tmp_path / "source.mkv"
+    _, dtype, shift = _write_chroma_source(source, pixel_format, ColorRange.JPEG)
+    output = tmp_path / "padded.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, (-4, 0, 28, 32))], crf=0)
+    with av.open(str(output)) as container:
+        plane = next(container.decode(video=0)).planes[0]
+        luma = np.frombuffer(plane, dtype).reshape(plane.height, -1)[:, :plane.width]
+    np.testing.assert_allclose(luma[:, :2], 16 << shift, rtol=0, atol=6 if shift else 1)
+
+
+def test_resize_controls_h264_alignment(tmp_path):
+    output = tmp_path / "resized.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(30, 31, (10, 6, 73, 41), resolution=(64, 32))])
+    assert next(read_frames_exact(str(output))).shape == (32, 64, 3)
+    with pytest.raises(ValueError, match="multiples of 16"):
+        write_chapters(SOURCE, tmp_path / "invalid.mkv", [ChapterClip(30, 31, (0, 0, 64, 32), resolution=(62, 32))])
 
 
 @pytest.mark.parametrize("rate", [Fraction(3), Fraction(25), Fraction(48), Fraction(30000, 1001)])

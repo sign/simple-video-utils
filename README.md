@@ -179,6 +179,15 @@ width and height must be multiples of 16, otherwise `ValueError` is raised. The
 destination must not already exist. Clips in source order share one decode; a clip
 starting before the previous one's end decodes from the start again.
 
+Aligned padding keeps the source chroma samples without resampling. Unaligned
+crops and full-range sources retain high-depth processing for accurate offsets
+and black borders.
+Encoder threading is calibrated by output size and chapter frame count.
+
+Compare export wall and CPU time against a release with
+`PYTHONPATH=. python benchmarks/chapter_export.py video.mp4 --baseline v0.9.4`.
+Add `--size 256` for a fixed output resolution; otherwise it writes varying-size crops.
+
 `list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
 for frames; its generator accommodates chapters with different dimensions.
 

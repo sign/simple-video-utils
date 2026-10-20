@@ -8,12 +8,18 @@ from itertools import islice
 from pathlib import Path
 
 import av
+from av.video.reformatter import ColorRange
 
 from simple_video_utils.metadata import _open_video
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
 CONTEXT = 16
+
+
+# Frame threading repays startup on larger, longer clips; retain slice threading for short chapters.
+_FRAME_THREAD_MIN_PIXELS = 256 * 256
+_FRAME_THREAD_MIN_FRAMES = 64
 
 
 @dataclass(frozen=True)
@@ -121,7 +127,7 @@ def _write_clip(
     inside_left, inside_top = max(left, 0), max(top, 0)
     inside_right, inside_bottom = min(right, source.width), min(bottom, source.height)
     step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
-    on_chroma_grid = not (
+    on_chroma_grid = source.codec_context.color_range != ColorRange.JPEG and not (
         left % step_x or right % step_x or inside_right % step_x
         or top % step_y or bottom % step_y or inside_bottom % step_y
     )
@@ -156,8 +162,11 @@ def _write_clip(
     encoder.time_base, encoder.framerate = 1 / rate, rate
     # Independent encoders must not reorder packets across chapter boundaries.
     encoder.max_b_frames = 0
+    frame_count = clip.end_frame - clip.start_frame
+    if width * height >= _FRAME_THREAD_MIN_PIXELS and frame_count >= _FRAME_THREAD_MIN_FRAMES:
+        encoder.thread_type = "AUTO"
     encoder.options = {"crf": str(crf), "preset": preset}
-    indices = range(start, start + clip.end_frame - clip.start_frame)
+    indices = range(start, start + frame_count)
     for index, frame in zip(indices, frames, strict=True):
         graph.push(frame)
         cropped = graph.pull()
