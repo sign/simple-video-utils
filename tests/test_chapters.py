@@ -128,6 +128,17 @@ def test_odd_size_past_the_frame_pads_to_its_resolution(tmp_path):
     assert next(read_frames_exact(str(output))).shape == (32, 64, 3)
 
 
+@pytest.mark.parametrize("box", [(-32, 0, 0, 32), (320, 0, 352, 32), (0, 240, 32, 272)])
+def test_padding_with_no_source_overlap_is_black(tmp_path, box):
+    output = tmp_path / "black.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(0, 1, box)], crf=0)
+    with av.open(str(output)) as container:
+        frame = next(container.decode(video=0))
+    for plane, black in zip(frame.planes, (16, 128, 128), strict=True):
+        pixels = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+        np.testing.assert_allclose(pixels, black, rtol=0, atol=1)
+
+
 @pytest.mark.parametrize("rate", [Fraction(3), Fraction(25), Fraction(48), Fraction(30000, 1001)])
 @pytest.mark.parametrize("lengths", [(8, 1, 8), (2, 3, 1)])
 def test_short_chapters_keep_packet_order_and_seek_to_their_keyframes(tmp_path, rate, lengths):

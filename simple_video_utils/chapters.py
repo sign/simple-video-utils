@@ -125,28 +125,20 @@ def _write_clip(
         left % step_x or right % step_x or inside_right % step_x
         or top % step_y or bottom % step_y or inside_bottom % step_y
     )
-    if outside and on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom:
-        # Every edge and padding offset sits on the chroma grid, so the crop and its black padding stay in the source
-        # format: the 4:4:4 round trip below more than doubles a chapter's filtering time.
-        padding = [
-            graph.add("crop", f"{inside_right - inside_left}:{inside_bottom - inside_top}:"
-                      f"{inside_left}:{inside_top}:exact=1"),
-            graph.add("pad", f"{right - left}:{bottom - top}:{inside_left - left}:{inside_top - top}:black"),
-        ]
-        left, top, right, bottom = 0, 0, right - left, bottom - top
-    elif outside or shifted_chroma:
-        # Cut the box's neighbourhood out first, on the chroma grid, so the conversion and padding below cost the
-        # crop's pixels rather than the whole frame's: a 1080p frame took 25 ms per frame through them.
-        x0, x1 = _neighbourhood(left, right, source.width)
-        y0, y1 = _neighbourhood(top, bottom, source.height)
+    if outside or shifted_chroma:
+        needs_conversion = not (on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom)
+        if needs_conversion:
+            # Keep nearby pixels so conversion preserves chroma at the crop's edges.
+            x0, x1 = _neighbourhood(left, right, source.width)
+            y0, y1 = _neighbourhood(top, bottom, source.height)
+        else:
+            x0, y0, x1, y1 = inside_left, inside_top, inside_right, inside_bottom
         left, top, right, bottom = left - x0, top - y0, right - x0, bottom - y0
         x, y = max(0, -left), max(0, -top)
-        padding = [
-            graph.add("crop", f"{x1 - x0}:{y1 - y0}:{x0}:{y0}:exact=1"),
-            # Full-resolution, high-depth chroma preserves odd offsets and source precision.
-            graph.add("format", "yuv444p16le"),
-            graph.add("pad", f"{max(x1 - x0, right) + x}:{max(y1 - y0, bottom) + y}:{x}:{y}:black"),
-        ]
+        padding = [graph.add("crop", f"{x1 - x0}:{y1 - y0}:{x0}:{y0}:exact=1")]
+        if needs_conversion:
+            padding.append(graph.add("format", "yuv444p16le"))
+        padding.append(graph.add("pad", f"{max(x1 - x0, right) + x}:{max(y1 - y0, bottom) + y}:{x}:{y}:black"))
     width, height = clip.size
     graph.link_nodes(
         graph.add_buffer(template=source),
