@@ -52,6 +52,7 @@ def write_chapters(
     crf: int = 23,
     preset: str = "medium",
     thread_type: str = "AUTO",
+    threads: int = 0,
 ) -> None:
     """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
@@ -59,11 +60,16 @@ def write_chapters(
     Each chapter stores its source specification in a JSON ``payload`` tag.
     ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
     "FRAME", "SLICE" or "NONE"); the frames do not change.
+    ``threads`` limits each native stage; 0 uses automatic selection, 1 suits single-CPU workers.
     """
+    if threads < 0:
+        message = "threads must be nonnegative"
+        raise ValueError(message)
     with _open_video(str(src)) as source:
         stream = source.streams.video[0]
         # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
         stream.thread_type = thread_type
+        stream.codec_context.thread_count = threads
         rate = stream.average_rate
         chapters = []
         offset = 0
@@ -94,7 +100,7 @@ def write_chapters(
                     source_end = 0
                 # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
                 frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-                _write_clip(stream, track, clip, frames, output_start, crf, preset)
+                _write_clip(stream, track, clip, frames, output_start, crf, preset, threads)
                 source_end = clip.end_frame
                 output_start += clip.end_frame - clip.start_frame
 
@@ -114,9 +120,11 @@ def _write_clip(
     start: int,
     crf: int,
     preset: str,
+    threads: int,
 ) -> None:
     rate = source.average_rate
     graph = av.filter.Graph()
+    graph.threads = threads
     left, top, right, bottom = clip.box
     pixel_format = source.format
     shifted_chroma = (left % 2 and pixel_format.chroma_width(2) == 1) or (
@@ -150,15 +158,20 @@ def _write_clip(
         graph.add_buffer(template=source),
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
-        graph.add("scale", f"{width}:{height}"),
+        # Avoid an implicit color-matrix conversion while resizing.
+        graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}"),
         graph.add("format", source.pix_fmt),
         graph.add("buffersink"),
     )
     graph.configure()
     # Each size needs its own encoder; H.264 keyframes carry the new dimensions.
     encoder = av.CodecContext.create("libx264", "w")
+    encoder.thread_count = threads
     encoder.width, encoder.height = width, height
     encoder.pix_fmt = source.pix_fmt
+    encoder.colorspace = source.codec_context.colorspace
+    encoder.color_primaries = source.codec_context.color_primaries
+    encoder.color_trc = source.codec_context.color_trc
     encoder.time_base, encoder.framerate = 1 / rate, rate
     # Independent encoders must not reorder packets across chapter boundaries.
     encoder.max_b_frames = 0

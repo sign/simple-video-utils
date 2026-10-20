@@ -15,7 +15,8 @@ SOURCE = Path(__file__).parent / "assets" / "example.mp4"
 
 
 @pytest.mark.parametrize("preset", ["medium", "veryfast"])
-def test_chapters_keep_frames_and_keyframes_across_encoder_thread_modes(tmp_path, preset):
+@pytest.mark.parametrize("threads", [0, 1, 2])
+def test_chapters_keep_frames_and_keyframes_across_encoder_thread_modes(tmp_path, preset, threads):
     source = tmp_path / "source.mkv"
     with av.open(str(source), "w") as container:
         stream = container.add_stream("ffv1", rate=30)
@@ -33,7 +34,7 @@ def test_chapters_keep_frames_and_keyframes_across_encoder_thread_modes(tmp_path
         ChapterClip(64, 74, (0, 0, 256, 256)),
     ]
     output = tmp_path / "chapters.mkv"
-    write_chapters(source, output, clips, preset=preset, crf=0)
+    write_chapters(source, output, clips, preset=preset, crf=0, threads=threads)
     with av.open(str(output)) as container:
         frames = list(container.decode(video=0))
         assert len(container.chapters()) == 3
@@ -87,6 +88,22 @@ def test_crop_trim_and_read(tmp_path):
 def test_h264_requires_whole_macroblocks(tmp_path, box):
     with pytest.raises(ValueError, match="multiples of 16"):
         write_chapters(SOURCE, tmp_path / "chapters.mkv", [ChapterClip(30, 35, box)])
+
+
+def test_negative_thread_budget_is_rejected(tmp_path):
+    with pytest.raises(ValueError, match="threads"):
+        write_chapters(SOURCE, tmp_path / "chapters.mkv", [ChapterClip(0, 1, (0, 0, 32, 32))], threads=-1)
+
+
+@pytest.mark.parametrize("box", [(-40, 0, -8, 32), (80, 0, 112, 32), (0, 64, 32, 96)])
+def test_crop_entirely_outside_source_is_black(tmp_path, box):
+    source = tmp_path / "source.mkv"
+    _write_chroma_source(source, "yuv420p")
+    output = tmp_path / "black.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, box)], crf=0)
+    with av.open(str(output)) as container:
+        frame = next(container.decode(video=0)).to_ndarray(format="rgb24")
+    assert frame.max() == 0
 
 
 @pytest.mark.parametrize("box", [(-5, -3, 27, 29), (45, 29, 77, 61)])
@@ -168,10 +185,11 @@ def test_padding_with_no_source_overlap_is_black(tmp_path, box):
 
 
 
-def _write_chroma_source(path, pixel_format, color_range=ColorRange.UNSPECIFIED):
+def _write_chroma_source(path, pixel_format, color_range=ColorRange.UNSPECIFIED, colorspace=2):
     frame = av.VideoFrame(width=64, height=48, format=pixel_format)
     frame.time_base = Fraction(1, 25)
     frame.color_range = color_range
+    frame.colorspace = colorspace
     dtype = np.uint16 if "10" in pixel_format else np.uint8
     shift = 2 if dtype == np.uint16 else 0
     for plane in frame.planes:
@@ -181,9 +199,32 @@ def _write_chroma_source(path, pixel_format, color_range=ColorRange.UNSPECIFIED)
         stream = container.add_stream("ffv1", rate=25)
         stream.width, stream.height, stream.pix_fmt = 64, 48, pixel_format
         stream.codec_context.color_range = color_range
+        stream.codec_context.colorspace = colorspace
+        if colorspace != 2:
+            stream.codec_context.color_primaries = stream.codec_context.color_trc = 1
         container.mux(stream.encode(frame))
         container.mux(stream.encode())
     return frame, dtype, shift
+
+
+@pytest.mark.parametrize("colorspace", [1, 6, 9])  # BT.709, SMPTE 170M and BT.2020 non-constant luminance.
+def test_padding_keeps_source_color_matrix_and_samples(tmp_path, colorspace):
+    source = tmp_path / "source.mkv"
+    original, _, _ = _write_chroma_source(source, "yuv420p", ColorRange.MPEG, colorspace)
+    output = tmp_path / "padded.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, (-4, 0, 28, 32))], crf=0)
+    with av.open(str(output)) as container:
+        frame = next(container.decode(video=0))
+        assert frame.colorspace == colorspace
+        assert container.streams.video[0].codec_context.color_primaries == 1
+        assert container.streams.video[0].codec_context.color_trc == 1
+    for index, (plane, source_plane) in enumerate(zip(frame.planes, original.planes, strict=True)):
+        pixels = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+        source_pixels = np.frombuffer(source_plane, np.uint8).reshape(source_plane.height, -1)
+        offset = 4 if index == 0 else 2
+        expected = np.full(pixels.shape, 16 if index == 0 else 128, dtype=np.uint8)
+        expected[:, offset:] = source_pixels[:plane.height, :plane.width - offset]
+        np.testing.assert_array_equal(pixels, expected)
 
 
 @pytest.mark.parametrize("pixel_format", ["yuv420p", "yuv420p10le", "yuv422p10le", "yuv444p10le"])

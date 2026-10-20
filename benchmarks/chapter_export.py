@@ -6,6 +6,7 @@ Add --size 256 to resize every chapter; otherwise retain varying native sizes.
 
 import argparse
 import importlib.util
+import inspect
 import json
 import resource
 import statistics
@@ -21,7 +22,7 @@ from simple_video_utils import chapters
 from simple_video_utils.metadata import video_metadata
 
 
-def main():
+def _arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source")
     parser.add_argument("--baseline", default="v0.9.4")
@@ -29,11 +30,19 @@ def main():
     parser.add_argument("--chapters", type=int, default=36)
     parser.add_argument("--size", type=int)
     parser.add_argument("--runs", type=int, default=5)
+    parser.add_argument("--threads", type=int, help="Native threads per stage; 1 for a single-CPU worker")
     args = parser.parse_args()
     if min(args.frames, args.chapters, args.runs) <= 0:
         parser.error("frames, chapters and runs must be positive")
     if args.size is not None and (args.size <= 0 or args.size % 16):
         parser.error("size must be a positive multiple of 16")
+    if args.threads is not None and args.threads < 0:
+        parser.error("threads must be nonnegative")
+    return parser, args
+
+
+def main():
+    parser, args = _arguments()
     meta = video_metadata(args.source)
     total = min(args.frames, meta.nb_frames or 0)
     count = min(args.chapters, total)
@@ -53,8 +62,17 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
         baseline_path = path / "baseline.py"
-        baseline_path.write_bytes(subprocess.check_output(
-            ["git", "show", f"{args.baseline}:simple_video_utils/chapters.py"]))
+        baseline_code = subprocess.check_output(
+            ["git", "show", f"{args.baseline}:simple_video_utils/chapters.py"], text=True)
+        if args.threads is not None:
+            # Older releases have no thread-budget argument; apply the same native settings to both versions.
+            for marker, setting in [
+                ("stream.thread_type = thread_type", "        stream.codec_context.thread_count"),
+                ("graph = av.filter.Graph()", "    graph.threads"),
+                ('encoder = av.CodecContext.create("libx264", "w")', "    encoder.thread_count"),
+            ]:
+                baseline_code = baseline_code.replace(marker, f"{marker}\n{setting} = {args.threads}")
+        baseline_path.write_text(baseline_code)
         spec = importlib.util.spec_from_file_location("baseline_chapters", baseline_path)
         baseline = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = baseline
@@ -64,9 +82,15 @@ def main():
             for name in list(modules) if iteration % 2 == 0 else list(reversed(modules)):
                 output = path / f"{name}.mkv"
                 output.unlink(missing_ok=True)
+                writer = modules[name].write_chapters
+                kwargs = {}
+                if args.threads is not None:
+                    kwargs["thread_type"] = "SLICE" if args.threads == 1 else "AUTO"
+                    if "threads" in inspect.signature(writer).parameters:
+                        kwargs["threads"] = args.threads
                 before = resource.getrusage(resource.RUSAGE_SELF)
                 start = time.perf_counter()
-                modules[name].write_chapters(args.source, output, clips, preset="veryfast")
+                writer(args.source, output, clips, preset="veryfast", **kwargs)
                 wall = time.perf_counter() - start
                 after = resource.getrusage(resource.RUSAGE_SELF)
                 if iteration:
@@ -79,7 +103,7 @@ def main():
     summary = {name: {key: {"median": statistics.median(v[key] for v in runs),
                             "min": min(v[key] for v in runs), "max": max(v[key] for v in runs)}
                       for key in ("wall", "cpu")} for name, runs in results.items()}
-    print(json.dumps({"baseline_ref": args.baseline, "frames": total, "chapters": count,
+    print(json.dumps({"baseline_ref": args.baseline, "threads": args.threads, "frames": total, "chapters": count,
                       "timings": summary, "runs": results}, indent=2))
 
 
