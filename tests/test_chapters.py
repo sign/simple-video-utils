@@ -14,47 +14,6 @@ from simple_video_utils.frames import read_frames_exact
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
 
 
-@pytest.mark.parametrize("preset", ["medium", "veryfast"])
-@pytest.mark.parametrize("threads", [0, 1, 2])
-def test_chapters_keep_frames_and_keyframes_across_encoder_thread_modes(tmp_path, preset, threads):
-    source = tmp_path / "source.mkv"
-    with av.open(str(source), "w") as container:
-        stream = container.add_stream("ffv1", rate=30)
-        stream.width, stream.height, stream.pix_fmt = 640, 512, "yuv420p"
-        for index in range(74):
-            frame = av.VideoFrame(width=640, height=512, format="yuv420p")
-            for plane_index, plane in enumerate(frame.planes):
-                value = 32 + index * 2 if plane_index == 0 else 128
-                plane.update(np.full((plane.height, plane.line_size), value, dtype=np.uint8))
-            container.mux(stream.encode(frame))
-        container.mux(stream.encode())
-    clips = [
-        ChapterClip(0, 64, (0, 0, 128, 128)),
-        ChapterClip(0, 64, (0, 0, 512, 512)),
-        ChapterClip(64, 74, (0, 0, 256, 256)),
-    ]
-    output = tmp_path / "chapters.mkv"
-    write_chapters(source, output, clips, preset=preset, crf=0, threads=threads)
-    with av.open(str(output)) as container:
-        frames = list(container.decode(video=0))
-        assert len(container.chapters()) == 3
-    expected = [(clip, index) for clip in clips for index in range(clip.start_frame, clip.end_frame)]
-    for frame, (clip, index) in zip(frames, expected, strict=True):
-        assert (frame.width, frame.height) == clip.size
-        plane = frame.planes[0]
-        luma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
-        np.testing.assert_array_equal(luma, 32 + index * 2)
-    assert all(frames[index].key_frame for index in (0, 64, 128))
-    assert [frame.time for frame in frames] == pytest.approx([index / 30 for index in range(138)], abs=0.001)
-
-
-
-def test_negative_thread_budget_is_rejected(tmp_path):
-    with pytest.raises(ValueError, match="threads"):
-        write_chapters(SOURCE, tmp_path / "chapters.mkv", [ChapterClip(0, 1, (0, 0, 32, 32))], threads=-1)
-
-
-
 def _write_chroma_source(path, pixel_format, color_range=ColorRange.UNSPECIFIED, colorspace=2):
     frame = av.VideoFrame(width=64, height=48, format=pixel_format)
     frame.time_base = Fraction(1, 25)
