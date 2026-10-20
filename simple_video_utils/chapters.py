@@ -118,17 +118,20 @@ def _write_clip(
     )
     padding, x, y = [], 0, 0
     outside = left < 0 or top < 0 or right > source.width or bottom > source.height
-    inside = max(left, 0), max(top, 0), min(right, source.width), min(bottom, source.height)
+    inside_left, inside_top = max(left, 0), max(top, 0)
+    inside_right, inside_bottom = min(right, source.width), min(bottom, source.height)
     step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
     on_chroma_grid = not (
-        left % step_x or right % step_x or inside[2] % step_x or top % step_y or bottom % step_y or inside[3] % step_y
+        left % step_x or right % step_x or inside_right % step_x
+        or top % step_y or bottom % step_y or inside_bottom % step_y
     )
-    if outside and on_chroma_grid and inside[0] < inside[2] and inside[1] < inside[3]:
+    if outside and on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom:
         # Every edge and padding offset sits on the chroma grid, so the crop and its black padding stay in the source
         # format: the 4:4:4 round trip below more than doubles a chapter's filtering time.
         padding = [
-            graph.add("crop", f"{inside[2] - inside[0]}:{inside[3] - inside[1]}:{inside[0]}:{inside[1]}:exact=1"),
-            graph.add("pad", f"{right - left}:{bottom - top}:{inside[0] - left}:{inside[1] - top}:black"),
+            graph.add("crop", f"{inside_right - inside_left}:{inside_bottom - inside_top}:"
+                      f"{inside_left}:{inside_top}:exact=1"),
+            graph.add("pad", f"{right - left}:{bottom - top}:{inside_left - left}:{inside_top - top}:black"),
         ]
         left, top, right, bottom = 0, 0, right - left, bottom - top
     elif outside or shifted_chroma:
