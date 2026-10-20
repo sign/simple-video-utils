@@ -117,7 +117,19 @@ def _write_clip(
         top % 2 and pixel_format.chroma_height(2) == 1
     )
     padding, x, y = [], 0, 0
-    if left < 0 or top < 0 or shifted_chroma or right > source.width or bottom > source.height:
+    outside = left < 0 or top < 0 or right > source.width or bottom > source.height
+    inside = max(left, 0), max(top, 0), min(right, source.width), min(bottom, source.height)
+    step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
+    on_chroma_grid = not (left % step_x or inside[2] % step_x or top % step_y or inside[3] % step_y)
+    if outside and on_chroma_grid and inside[0] < inside[2] and inside[1] < inside[3]:
+        # Every edge and padding offset sits on the chroma grid, so the crop and its black padding stay in the source
+        # format: the 4:4:4 round trip below more than doubles a chapter's filtering time.
+        padding = [
+            graph.add("crop", f"{inside[2] - inside[0]}:{inside[3] - inside[1]}:{inside[0]}:{inside[1]}:exact=1"),
+            graph.add("pad", f"{right - left}:{bottom - top}:{inside[0] - left}:{inside[1] - top}:black"),
+        ]
+        left, top, right, bottom = 0, 0, right - left, bottom - top
+    elif outside or shifted_chroma:
         # Cut the box's neighbourhood out first, on the chroma grid, so the conversion and padding below cost the
         # crop's pixels rather than the whole frame's: a 1080p frame took 25 ms per frame through them.
         x0, x1 = _neighbourhood(left, right, source.width)

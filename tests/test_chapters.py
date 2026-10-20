@@ -85,6 +85,34 @@ def test_padding_and_resolution(tmp_path, box, resolution):
     assert json.loads(tags["payload"])["resolution"] == (list(resolution) if resolution else None)
 
 
+@pytest.mark.parametrize("box", [(-4, -2, 28, 30), (36, 18, 68, 50)])
+def test_padding_on_the_chroma_grid_keeps_source_pixels(tmp_path, box):
+    # noise chroma changes on any 4:4:4 round trip, so equality shows the crop and padding stayed in yuv420p
+    source = tmp_path / "noise.mkv"
+    frame = av.VideoFrame(width=64, height=48, format="yuv420p")
+    rng = np.random.default_rng(0)
+    planes = [rng.integers(16, 236, (plane.height, plane.line_size), dtype=np.uint8) for plane in frame.planes]
+    for plane, values in zip(frame.planes, planes, strict=True):
+        plane.update(values)
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=25)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    output = tmp_path / "padded.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, box)], crf=0)
+    with av.open(str(output)) as container:
+        actual = next(container.decode(video=0))
+    for index, (plane, values) in enumerate(zip(actual.planes, planes, strict=True)):
+        scale = 1 if index == 0 else 2
+        left, top, right, bottom = (edge // scale for edge in box)
+        x0, y0, x1, y1 = max(left, 0), max(top, 0), min(right, 64 // scale), min(bottom, 48 // scale)
+        expected = np.full((plane.height, plane.width), 16 if index == 0 else 128, dtype=np.uint8)
+        expected[y0 - top : y1 - top, x0 - left : x1 - left] = values[y0:y1, x0:x1]
+        pixels = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+        np.testing.assert_array_equal(pixels, expected)
+
+
 def test_resize_controls_h264_alignment(tmp_path):
     output = tmp_path / "resized.mkv"
     write_chapters(SOURCE, output, [ChapterClip(30, 31, (10, 6, 73, 41), resolution=(64, 32))])
