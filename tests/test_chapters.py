@@ -121,6 +121,13 @@ def test_resize_controls_h264_alignment(tmp_path):
         write_chapters(SOURCE, tmp_path / "invalid.mkv", [ChapterClip(30, 31, (0, 0, 64, 32), resolution=(62, 32))])
 
 
+def test_odd_size_past_the_frame_pads_to_its_resolution(tmp_path):
+    # even left and top, but a 327x245 padded size is off the 4:2:0 chroma grid
+    output = tmp_path / "odd.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(30, 31, (-4, -2, 323, 243), resolution=(64, 32))])
+    assert next(read_frames_exact(str(output))).shape == (32, 64, 3)
+
+
 @pytest.mark.parametrize("rate", [Fraction(3), Fraction(25), Fraction(48), Fraction(30000, 1001)])
 @pytest.mark.parametrize("lengths", [(8, 1, 8), (2, 3, 1)])
 def test_short_chapters_keep_packet_order_and_seek_to_their_keyframes(tmp_path, rate, lengths):
