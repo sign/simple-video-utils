@@ -16,7 +16,6 @@ from simple_video_utils.metadata import _open_video
 # the crop's chroma comes out as if the whole frame had been converted
 CONTEXT = 16
 
-
 # Frame threading repays startup on larger, longer clips; retain slice threading for short chapters.
 _FRAME_THREAD_MIN_PIXELS = 256 * 256
 _FRAME_THREAD_MIN_FRAMES = 64
@@ -135,12 +134,14 @@ def _write_clip(
     inside_left, inside_top = max(left, 0), max(top, 0)
     inside_right, inside_bottom = min(right, source.width), min(bottom, source.height)
     step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
-    on_chroma_grid = source.codec_context.color_range != ColorRange.JPEG and not (
+    on_chroma_grid = not (
         left % step_x or right % step_x or inside_right % step_x
         or top % step_y or bottom % step_y or inside_bottom % step_y
     )
     if outside or shifted_chroma:
-        needs_conversion = not (on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom)
+        needs_conversion = source.codec_context.color_range == ColorRange.JPEG or not (
+            on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom
+        )
         if needs_conversion:
             # Keep nearby pixels so conversion preserves chroma at the crop's edges.
             x0, x1 = _neighbourhood(left, right, source.width)

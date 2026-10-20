@@ -186,11 +186,6 @@ Encoder threading is calibrated by output size and chapter frame count.
 Use `threads=1` for a single-CPU worker: this limits decoding, filtering and encoding
 to one thread each. The default `threads=0` lets the native libraries choose.
 
-Compare export wall and CPU time against a release with
-`PYTHONPATH=. python benchmarks/chapter_export.py video.mp4 --baseline v0.9.4`.
-Add `--size 256` for a fixed output resolution; otherwise it writes varying-size crops.
-Use `--threads 1` to compare both implementations with the same single-thread settings.
-
 `list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
 for frames; its generator accommodates chapters with different dimensions.
 
