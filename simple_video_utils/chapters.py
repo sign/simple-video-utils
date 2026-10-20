@@ -8,6 +8,7 @@ from itertools import islice
 from pathlib import Path
 
 import av
+from av.video.reformatter import ColorRange
 
 from simple_video_utils.metadata import _open_video
 
@@ -126,7 +127,9 @@ def _write_clip(
         or top % step_y or bottom % step_y or inside_bottom % step_y
     )
     if outside or shifted_chroma:
-        needs_conversion = not (on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom)
+        needs_conversion = source.codec_context.color_range == ColorRange.JPEG or not (
+            on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom
+        )
         if needs_conversion:
             # Keep nearby pixels so conversion preserves chroma at the crop's edges.
             x0, x1 = _neighbourhood(left, right, source.width)
@@ -144,7 +147,9 @@ def _write_clip(
         graph.add_buffer(template=source),
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
-        graph.add("scale", f"{width}:{height}"),
+        # Avoid implicit matrix or range conversions.
+        graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}:"
+                  f"out_range={source.codec_context.color_range}"),
         graph.add("format", source.pix_fmt),
         graph.add("buffersink"),
     )
@@ -153,6 +158,10 @@ def _write_clip(
     encoder = av.CodecContext.create("libx264", "w")
     encoder.width, encoder.height = width, height
     encoder.pix_fmt = source.pix_fmt
+    encoder.color_range = source.codec_context.color_range
+    encoder.colorspace = source.codec_context.colorspace
+    encoder.color_primaries = source.codec_context.color_primaries
+    encoder.color_trc = source.codec_context.color_trc
     encoder.time_base, encoder.framerate = 1 / rate, rate
     # Independent encoders must not reorder packets across chapter boundaries.
     encoder.max_b_frames = 0
