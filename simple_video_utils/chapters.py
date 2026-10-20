@@ -147,8 +147,9 @@ def _write_clip(
         graph.add_buffer(template=source),
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
-        # Avoid an implicit color-matrix conversion while resizing.
-        graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}"),
+        # Avoid implicit matrix or range conversions.
+        graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}:"
+                  f"out_range={source.codec_context.color_range}"),
         graph.add("format", source.pix_fmt),
         graph.add("buffersink"),
     )
@@ -157,6 +158,7 @@ def _write_clip(
     encoder = av.CodecContext.create("libx264", "w")
     encoder.width, encoder.height = width, height
     encoder.pix_fmt = source.pix_fmt
+    encoder.color_range = source.codec_context.color_range
     encoder.colorspace = source.codec_context.colorspace
     encoder.color_primaries = source.codec_context.color_primaries
     encoder.color_trc = source.codec_context.color_trc

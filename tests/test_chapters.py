@@ -108,10 +108,37 @@ def test_full_range_padding_keeps_black_borders(tmp_path, pixel_format):
     output = tmp_path / "padded.mkv"
     write_chapters(source, output, [ChapterClip(0, 1, (-4, 0, 28, 32))], crf=0)
     with av.open(str(output)) as container:
-        plane = next(container.decode(video=0)).planes[0]
+        frame = next(container.decode(video=0))
+        assert frame.color_range == ColorRange.JPEG
+        plane = frame.planes[0]
         luma = np.frombuffer(plane, dtype).reshape(plane.height, -1)[:, :plane.width]
-    np.testing.assert_allclose(luma[:, :2], 16 << shift, rtol=0, atol=6 if shift else 1)
+    np.testing.assert_allclose(luma[:, :2], 0, rtol=0, atol=6 if shift else 1)
 
+
+
+@pytest.mark.parametrize("resolution", [None, (32, 32)])
+def test_full_range_luma_preserves_all_levels(tmp_path, resolution):
+    source = tmp_path / "ramp.mkv"
+    frame = av.VideoFrame(64, 48, "yuv420p")
+    frame.color_range = ColorRange.JPEG
+    for index, plane in enumerate(frame.planes):
+        values = np.full((plane.height, plane.line_size), 128, dtype=np.uint8)
+        if index == 0:
+            values[:, :plane.width] = np.arange(48 * 64, dtype=np.uint8).reshape(48, 64)
+        plane.update(values)
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=25)
+        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuv420p"
+        stream.codec_context.color_range = ColorRange.JPEG
+        container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    output = tmp_path / "chapter.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, (0, 0, 64, 48), resolution=resolution)], crf=0)
+    with av.open(str(output)) as container:
+        actual = next(container.decode(video=0))
+    assert actual.color_range == ColorRange.JPEG
+    expected = frame.reformat(*(resolution or (64, 48)), interpolation="BICUBIC", threads=1)
+    np.testing.assert_array_equal(actual.to_ndarray(), expected.to_ndarray())
 
 
 def test_crop_trim_and_read(tmp_path):

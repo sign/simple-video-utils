@@ -181,7 +181,7 @@ starting before the previous one's end decodes from the start again.
 
 Aligned padding keeps the source chroma samples without resampling. Unaligned
 crops and full-range sources retain high-depth processing for accurate offsets
-and black borders. Scaling preserves the source color matrix and color tags.
+and black borders. Scaling preserves the source color matrix, range and color tags.
 
 `list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
 for frames; its generator accommodates chapters with different dimensions.
