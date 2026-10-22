@@ -665,3 +665,14 @@ def test_slice_chapters_cuts_source_spans_and_joins_them(tmp_path):
     joined = join_chapters(across)
     assert [c.source for c in read_chapters(io.BytesIO(joined))] == [1, Fraction(9, 5)]
     assert [_frame_count(d) for _, d in split_chapters(io.BytesIO(joined))] == [_frame_count(d) for _, d in across]
+
+
+def test_slice_chapters_reencodes_a_joined_file_at_its_own_size(tmp_path):
+    """A 256-like joined file looks already sized; its pieces must still start on a keyframe at the right place."""
+    joined = tmp_path / "joined.mkv"
+    joined.write_bytes(join_chapters(next(slice_chapters(_signer_chapters(tmp_path), [(1.0, 2.2)], size=32))))
+    pieces = next(slice_chapters(joined, [(0, math.inf)], size=32))
+    assert [s for s, _ in pieces] == [1, Fraction(9, 5)]
+    again = io.BytesIO(join_chapters(pieces))
+    assert [c.source for c in read_chapters(again)] == [1, Fraction(9, 5)]
+    assert [_frame_count(d) for _, d in split_chapters(again)] == [6, 12]

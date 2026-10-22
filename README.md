@@ -210,8 +210,9 @@ tag's `start_frame` at the file's frame rate, or at the tag's own `rate`.
 `split_chapters` and `slice_chapters` are generators that hold one chapter or
 one span at a time, and raise `ValueError` on a file without chapters.
 `slice_chapters` takes spans in source seconds and yields, per span, one
-`(source start, clip)` piece per chapter it touches, cut by `slice_video`; a
-span between chapters has none, and joining or choosing among pieces is the
+`(source start, clip)` piece per chapter it touches, always re-encoded (at `size`
+when given: the file's header describes only its first chapter); a span between
+chapters has none, and joining or choosing among pieces is the
 caller's. `join_chapters` needs clips from one encoder setting, as
 `slice_chapters` cuts at a fixed `size`, and tags each chapter with its source
 start to the millisecond. `split_chapters` needs chapters back to back from 0,

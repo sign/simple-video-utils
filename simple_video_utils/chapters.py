@@ -14,8 +14,8 @@ import av
 from av.video.reformatter import ColorRange
 
 from simple_video_utils.frames import _rotation_filters
-from simple_video_utils.metadata import _open_video
-from simple_video_utils.slicing import _iter_packets, slice_video
+from simple_video_utils.metadata import _open_video, video_metadata
+from simple_video_utils.slicing import _encode_clip, _iter_packets
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -71,7 +71,10 @@ Source = str | Path | io.BytesIO
 
 
 def _open(src: Source) -> av.container.InputContainer:
-    return _open_video(src if isinstance(src, io.BytesIO) else str(src))
+    if isinstance(src, io.BytesIO):
+        src.seek(0)  # read from the start, however often it is passed
+        return _open_video(src)
+    return _open_video(str(src))
 
 
 def _chapters_of(container: av.container.InputContainer) -> list[Chapter]:
@@ -143,16 +146,18 @@ def slice_chapters(
     src: str | Path, spans: Sequence[tuple[float, float]], size: int | None = None,
 ) -> Iterator[list[tuple[Fraction, bytes]]]:
     """Yield, per source-timeline span of a chaptered file, its pieces, one per chapter it touches: (where the piece
-    starts on the source's timeline, the clip ``slice_video`` cuts at ``size``). A span between chapters has none;
+    starts on the source's timeline, its clip re-encoded at ``size``). A span between chapters has none;
     ``end`` may be ``math.inf``. Clips are cut as they are yielded. Raises ``ValueError`` on a file without chapters."""
     with _open(src) as container:
         found = _require_chapters(container)
-    parts = [[(chapter, part) for chapter in found if (part := chapter.overlap(_exact(a), _exact(b)))]
-             for a, b in spans]
-    cuts = [(float(chapter.local(low)), float(chapter.local(high))) for span in parts for chapter, (low, high) in span]
-    clips = slice_video(str(src), cuts, size=size) if cuts else iter([])
-    for span in parts:
-        yield [(low, next(clips)) for _, (low, _) in span]
+    fps = video_metadata(str(src)).fps
+    for a, b in spans:
+        parts = [(chapter, part) for chapter in found if (part := chapter.overlap(_exact(a), _exact(b)))]
+        # Always re-encoded: the file's header describes only its first chapter, so a stream copy can't be trusted.
+        # [low, high): the frame reader's end is inclusive, and at a chapter's end it is the next chapter's first frame
+        yield [(low, _encode_clip(str(src), float(chapter.local(low)), float(chapter.local(high)) - 0.5 / fps,
+                                  fps, size))
+               for chapter, (low, high) in parts]
 
 
 def _exact(t: float) -> Fraction | float:
