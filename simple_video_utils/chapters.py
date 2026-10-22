@@ -1,7 +1,10 @@
-"""Store rectangular crops and time trims as chapters of one Matroska video."""
+"""Store rectangular crops and time trims as chapters of one Matroska video, and read, split, cut and join them."""
 
+import io
 import json
+import math
 from collections.abc import Iterator, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from fractions import Fraction
 from itertools import chain, islice
@@ -12,6 +15,7 @@ from av.video.reformatter import ColorRange
 
 from simple_video_utils.frames import _rotation_filters
 from simple_video_utils.metadata import _open_video
+from simple_video_utils.slicing import _encode_clip, _iter_packets
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -38,6 +42,166 @@ def list_chapters(src: str | Path) -> Iterator[dict]:
     """Yield PyAV chapter dictionaries (start/end ticks, time_base and metadata)."""
     with _open_video(str(src)) as container:
         yield from container.chapters()
+
+
+@dataclass(frozen=True)
+class Chapter:
+    """A chapter of a chaptered file: seconds [start, end) on the file's own timeline, and where it starts on its
+    source's (the ``start_frame`` of its ``payload`` tag, at the file's rate or the tag's own ``rate``)."""
+
+    start: Fraction
+    end: Fraction
+    source: Fraction
+
+    @property
+    def source_end(self) -> Fraction:
+        return self.source + self.end - self.start
+
+    def overlap(self, start: Fraction | float, end: Fraction | float) -> tuple[Fraction, Fraction] | None:
+        """The part of source span [start, end) this chapter holds, on the source's timeline."""
+        low, high = max(start, self.source), min(end, self.source_end)
+        return (Fraction(low), Fraction(high)) if low < high else None
+
+    def local(self, t: Fraction) -> Fraction:
+        """A source time on the file's own timeline."""
+        return self.start + t - self.source
+
+
+Source = str | Path | io.BytesIO
+
+
+def _open(src: Source) -> av.container.InputContainer:
+    if isinstance(src, io.BytesIO):
+        src.seek(0)  # read from the start, however often it is passed
+        return _open_video(src)
+    return _open_video(str(src))
+
+
+def _chapters_of(container: av.container.InputContainer) -> list[Chapter]:
+    rate = container.streams.video[0].average_rate
+    found = []
+    for chapter in container.chapters():
+        spec = json.loads({key.lower(): value for key, value in chapter["metadata"].items()}["payload"])
+        found.append(Chapter(chapter["start"] * chapter["time_base"], chapter["end"] * chapter["time_base"],
+                             spec["start_frame"] / Fraction(spec.get("rate", rate))))
+    return found
+
+
+def _require_chapters(container: av.container.InputContainer) -> list[Chapter]:
+    if not (found := _chapters_of(container)):
+        message = "the video has no chapters"
+        raise ValueError(message)
+    return found
+
+
+def read_chapters(src: Source) -> list[Chapter]:
+    """The chapters of a file, [] for a file without them."""
+    with _open(src) as container:
+        return _chapters_of(container)
+
+
+def split_chapters(src: Source) -> Iterator[tuple[Chapter, bytes]]:
+    """Yield each chapter as its own Matroska file, packets copied and timestamps from 0, as soon as it is read:
+    one chapter's packets are held at a time. Raises ``ValueError`` on a file without chapters.
+
+    Every chapter must start on a keyframe that carries its own headers, as ``write_chapters`` and
+    ``join_chapters`` write them, and chapters run back to back from 0."""
+    with _open(src) as source:
+        found = _require_chapters(source)
+        stream = source.streams.video[0]
+        index, packets = 0, []
+        for packet in source.demux(stream):
+            if packet.pts is None or not packet.size:  # Matroska stores no dts for reordered frames
+                continue
+            t = packet.pts * packet.time_base
+            if index + 1 < len(found) and t >= found[index + 1].start:  # every chapter holds a frame
+                yield found[index], _remux(stream, packets)
+                index, packets = index + 1, []
+            if not found[index].start <= t < found[index].end:
+                message = f"frame at {float(t):.3f} s is outside every chapter"
+                raise ValueError(message)
+            if not packets and not packet.is_keyframe:
+                message = f"chapter {index} does not start on a keyframe"
+                raise ValueError(message)
+            packets.append(packet)
+        if index != len(found) - 1:
+            message = f"{len(found) - 1 - index} chapters hold no frames"
+            raise ValueError(message)
+        yield found[index], _remux(stream, packets)
+
+
+def _remux(stream: av.VideoStream, packets: list[av.Packet]) -> bytes:
+    out = io.BytesIO()
+    with av.open(out, mode="w", format="matroska") as destination:
+        track = destination.add_stream_from_template(stream)
+        shift = packets[0].pts
+        for packet in packets:
+            packet.stream = track
+            packet.pts, packet.dts = packet.pts - shift, packet.dts - shift if packet.dts is not None else None
+            destination.mux(packet)
+    return out.getvalue()
+
+
+def slice_chapters(
+    src: str | Path, spans: Sequence[tuple[float, float]], size: int | None = None,
+) -> Iterator[list[tuple[Fraction, bytes]]]:
+    """Yield, per source-timeline span of a chaptered file, its pieces, one per chapter holding a frame that starts
+    in it: (where the piece starts on the source's timeline, those frames re-encoded at ``size``). A span between
+    chapters has none;
+    ``end`` may be ``math.inf``. Clips are cut as they are yielded. Raises ``ValueError`` on a file without chapters."""
+    with _open(src) as container:
+        found = _require_chapters(container)
+        rate = container.streams.video[0].average_rate
+    for a, b in spans:
+        pieces = []
+        for chapter in found:
+            if part := chapter.overlap(_exact(a), _exact(b)):
+                # the frames that START in [low, high); chapter bounds are whole ms, so allow half a ms of slack
+                first, last = (math.ceil((chapter.local(t) - Fraction(1, 2000)) * rate) for t in part)
+                if last > first:  # re-encoded: the file's header describes only its first chapter
+                    clip = _encode_clip(str(src), float((first + 0.5) / rate), float((last - 0.5) / rate),
+                                        float(rate), size)
+                    pieces.append((part[0], clip))
+        yield pieces
+
+
+def _exact(t: float) -> Fraction | float:
+    return Fraction(str(t)) if math.isfinite(t) else t
+
+
+def join_chapters(pieces: Sequence[tuple[Fraction, bytes]]) -> bytes:
+    """Clips of one encoder setting (so one set of headers), as ``slice_chapters`` cuts them, as the chapters of one
+    Matroska file; each chapter's ``payload`` tag holds where it starts on the source's timeline, to the millisecond."""
+    out = io.BytesIO()
+    with ExitStack() as stack:
+        inputs = [stack.enter_context(_open_video(io.BytesIO(clip))) for _, clip in pieces]
+        streams = [container.streams.video[0] for container in inputs]
+        if len({bytes(stream.codec_context.extradata or b"") for stream in streams}) != 1:
+            message = "clips to join differ in codec headers"
+            raise ValueError(message)
+        packets = [list(_iter_packets(container, stream)) for container, stream in zip(inputs, streams, strict=True)]
+        starts = [min(p.pts for p in group) * stream.time_base for group, stream in zip(packets, streams, strict=True)]
+        ends = [max(p.pts + p.duration for p in group) * stream.time_base
+                for group, stream in zip(packets, streams, strict=True)]
+        chapters, offset = [], Fraction(0)
+        for (source, _), first, last in zip(pieces, starts, ends, strict=True):
+            spec = {"start_frame": round(source * 1000), "rate": "1000"}
+            end = offset + last - first
+            chapters.append({"id": len(chapters), "start": round(offset * 1000), "end": round(end * 1000),
+                             "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(spec)}})
+            offset = end
+        destination = stack.enter_context(av.open(out, mode="w", format="matroska"))
+        destination.set_chapters(chapters)
+        track = destination.add_stream_from_template(streams[0])
+        for group, stream, first, chapter in zip(packets, streams, starts, chapters, strict=True):
+            shift = Fraction(chapter["start"], 1000) - first
+            for packet in group:
+                # Matroska keeps milliseconds; flooring dts keeps it monotonic and never past pts.
+                pts, dts = packet.pts * stream.time_base + shift, packet.dts * stream.time_base + shift
+                packet.stream, packet.time_base = track, Fraction(1, 1000)
+                packet.pts, packet.dts = round(pts * 1000), math.floor(dts * 1000)
+                destination.mux(packet)
+    return out.getvalue()
 
 
 def write_chapters(
