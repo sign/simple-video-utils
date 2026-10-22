@@ -187,6 +187,36 @@ and black borders. Scaling preserves the source color matrix, range and color ta
 `list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
 for frames; its generator accommodates chapters with different dimensions.
 
+### Chapters on the Source Timeline
+
+```python
+import io
+import math
+
+from simple_video_utils.chapters import join_chapters, read_chapters, slice_chapters, split_chapters
+
+chapters = read_chapters("chapters.mkv")         # Chapter(start, end, source) in seconds; [] without chapters
+for chapter, data in split_chapters("chapters.mkv"):
+    send(data)                                    # one Matroska file per chapter, packets copied, from 0
+
+for pieces in slice_chapters("chapters.mkv", [(1.0, 1.5), (1.0, 3.0)], size=256):
+    clip = join_chapters(pieces) if len(pieces) > 1 else pieces[0][1]
+everything = next(slice_chapters("chapters.mkv", [(0, math.inf)], size=256))
+in_memory = read_chapters(io.BytesIO(data))       # paths or io.BytesIO; bytes are yours to wrap
+```
+
+A chapter's `source` is where it starts on its source's timeline: its `payload`
+tag's `start_frame` at the file's frame rate, or at the tag's own `rate`.
+`split_chapters` and `slice_chapters` are generators that hold one chapter or
+one span at a time, and raise `ValueError` on a file without chapters.
+`slice_chapters` takes spans in source seconds and yields, per span, one
+`(source start, clip)` piece per chapter it touches, cut by `slice_video`; a
+span between chapters has none, and joining or choosing among pieces is the
+caller's. `join_chapters` needs clips from one encoder setting, as
+`slice_chapters` cuts at a fixed `size`, and tags each chapter with its source
+start to the millisecond. `split_chapters` needs chapters back to back from 0,
+each starting on a keyframe with its own headers, as both writers produce.
+
 ### Remote Videos
 
 ```python

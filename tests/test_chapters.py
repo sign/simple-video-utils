@@ -1,4 +1,6 @@
+import io
 import json
+import math
 from dataclasses import asdict
 from fractions import Fraction
 from pathlib import Path
@@ -8,7 +10,15 @@ import numpy as np
 import pytest
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.chapters import (
+    ChapterClip,
+    join_chapters,
+    list_chapters,
+    read_chapters,
+    slice_chapters,
+    split_chapters,
+    write_chapters,
+)
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
@@ -601,3 +611,57 @@ def test_phone_video_crop_uses_display_dimensions(tmp_path):
     shown = list(read_frames_exact(str(ROTATED), 0, 2))
     for actual, expected in zip(read_frames_exact(str(output)), shown, strict=True):
         np.testing.assert_array_equal(actual, expected[:512, :128])
+
+
+def _signer_chapters(tmp_path):
+    """Source frames [6, 36) at 48x48 and [54, 84) at 32x32: a 0.6 s gap between them."""
+    output = tmp_path / "signers.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(6, 36, (0, 0, 48, 48)), ChapterClip(54, 84, (16, 16, 48, 48))])
+    return output
+
+
+def _frame_count(data: bytes) -> int:
+    with av.open(io.BytesIO(data)) as container:
+        return sum(1 for _ in container.decode(video=0))
+
+
+def test_read_chapters_places_each_on_the_source_timeline(tmp_path):
+    output = _signer_chapters(tmp_path)
+    chapters = read_chapters(output)
+    assert [(c.start, c.end, c.source, c.source_end) for c in chapters] == [
+        (0, 1, Fraction(1, 5), Fraction(6, 5)), (1, 2, Fraction(9, 5), Fraction(14, 5))]
+    assert read_chapters(io.BytesIO(output.read_bytes())) == chapters
+    assert chapters[1].overlap(1.0, 2.0) == (Fraction(9, 5), 2)
+    assert chapters[0].overlap(1.3, 1.7) is None
+    assert read_chapters(SOURCE) == []
+
+
+def test_split_chapters_yields_each_chapter_from_zero(tmp_path):
+    pieces = split_chapters(_signer_chapters(tmp_path))
+    chapter, data = next(pieces)  # one chapter at a time
+    assert chapter.source == Fraction(1, 5)
+    rest = list(pieces)
+    assert [c.source for c, _ in rest] == [Fraction(9, 5)]
+    for piece, size in zip([data, rest[0][1]], [(48, 48), (32, 32)], strict=True):
+        with av.open(io.BytesIO(piece)) as container:
+            frames = list(container.decode(video=0))
+        assert (len(frames), (frames[0].width, frames[0].height), frames[0].pts) == (30, size, 0)
+
+
+@pytest.mark.parametrize("cut", [lambda src: next(split_chapters(src)),
+                                 lambda src: next(slice_chapters(src, [(0, 1)]))])
+def test_a_file_without_chapters_cannot_be_cut_into_them(cut):
+    with pytest.raises(ValueError, match="no chapters"):
+        cut(SOURCE)
+
+
+def test_slice_chapters_cuts_source_spans_and_joins_them(tmp_path):
+    output = _signer_chapters(tmp_path)
+    within, across, gap, whole = slice_chapters(output, [(0.3, 0.9), (1.0, 2.2), (1.3, 1.7), (0, math.inf)], size=32)
+    assert [s for s, _ in within] == [Fraction(3, 10)]
+    assert [s for s, _ in across] == [1, Fraction(9, 5)]
+    assert gap == []
+    assert [s for s, _ in whole] == [Fraction(1, 5), Fraction(9, 5)]
+    joined = join_chapters(across)
+    assert [c.source for c in read_chapters(io.BytesIO(joined))] == [1, Fraction(9, 5)]
+    assert [_frame_count(d) for _, d in split_chapters(io.BytesIO(joined))] == [_frame_count(d) for _, d in across]
