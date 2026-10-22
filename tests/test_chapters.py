@@ -683,3 +683,12 @@ def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
     [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there
     assert piece[0] == Fraction(9, 5)
     assert _frame_count(piece[1]) == 3                 # [1.8, 1.9): frames at 1.8, 1.833, 1.866
+
+
+def test_slice_chapters_reads_ms_rounded_bounds_as_their_frames(tmp_path):
+    """30 fps chapters start at 0.0667 s (frame 2), stored as 67 ms: a whole chapter keeps exactly its frames."""
+    output = tmp_path / "rounded.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(10, 12, (0, 0, 32, 32)), ChapterClip(40, 47, (0, 0, 32, 32))])
+    assert [c.start for c in read_chapters(output)] == [0, Fraction(67, 1000)]
+    first, second = next(slice_chapters(output, [(0, math.inf)], size=32))
+    assert (_frame_count(first[1]), _frame_count(second[1])) == (2, 7)

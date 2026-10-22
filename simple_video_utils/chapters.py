@@ -156,8 +156,8 @@ def slice_chapters(
         pieces = []
         for chapter in found:
             if part := chapter.overlap(_exact(a), _exact(b)):
-                # the frames that START in [low, high); reading at mid-frame times dodges float rounding at both ends
-                first, last = (math.ceil(chapter.local(t) * rate) for t in part)
+                # the frames that START in [low, high); chapter bounds are whole ms, so allow half a ms of slack
+                first, last = (math.ceil((chapter.local(t) - Fraction(1, 2000)) * rate) for t in part)
                 if last > first:  # re-encoded: the file's header describes only its first chapter
                     clip = _encode_clip(str(src), float((first + 0.5) / rate), float((last - 0.5) / rate),
                                         float(rate), size)
