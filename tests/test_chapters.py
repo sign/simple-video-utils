@@ -601,3 +601,30 @@ def test_phone_video_crop_uses_display_dimensions(tmp_path):
     shown = list(read_frames_exact(str(ROTATED), 0, 2))
     for actual, expected in zip(read_frames_exact(str(output)), shown, strict=True):
         np.testing.assert_array_equal(actual, expected[:512, :128])
+
+
+@pytest.mark.parametrize("name", ["no_average_rate_5s.webm", "mediarecorder-no-average-rate.webm"])
+def test_source_without_average_rate_uses_decoded_cadence(tmp_path, name):
+    output = tmp_path / "chapters.mkv"
+    clips = [ChapterClip(0, 10, (0, 0, 32, 32)), ChapterClip(10, 20, (0, 0, 32, 32))]
+    write_chapters(SOURCE.parent / name, output, clips)
+    with av.open(str(output)) as container:
+        rate = container.streams.video[0].average_rate
+        assert 1 < rate < 120
+        assert sum(1 for _ in container.decode(video=0)) == 20
+    second = list(list_chapters(output))[1]
+    assert float(second["start"] * second["time_base"]) == pytest.approx(float(10 / rate), abs=0.002)
+
+
+@pytest.mark.parametrize("clips", [
+    [],
+    [ChapterClip(5, 2, (0, 0, 32, 32))],
+    [ChapterClip(-3, 2, (0, 0, 32, 32))],
+    [ChapterClip(0, 2, (32, 0, 0, 32), resolution=(32, 32))],
+    [ChapterClip(0, 10**6, (0, 0, 32, 32))],
+])
+def test_invalid_clips_raise_and_leave_no_output(tmp_path, clips):
+    output = tmp_path / "chapters.mkv"
+    with pytest.raises(ValueError):  # noqa: PT011
+        write_chapters(SOURCE, output, clips)
+    assert not output.exists()
