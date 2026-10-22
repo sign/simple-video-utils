@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.chapters import ChapterClip, _stored_box, list_chapters, write_chapters
+from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
@@ -414,12 +414,134 @@ def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path, pixel_for
         np.testing.assert_array_equal(chroma, expected)
 
 
-@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
-def test_stored_box_holds_the_displayed_box_before_rotation(rotation):
-    stored = np.arange(6 * 10).reshape(6, 10)
-    shown = np.rot90(stored, rotation // 90)
-    left, top, right, bottom = _stored_box(box=(1, 2, 4, 5), rotation=rotation, width=10, height=6)
-    np.testing.assert_array_equal(np.rot90(stored[top:bottom, left:right], rotation // 90), shown[2:5, 1:4])
+def _write_rotated_noise(path, pixel_format, rotation):
+    """Four frames of lossless 64x48 noise in `pixel_format`, stored unturned and played turned by `rotation`."""
+    rng = np.random.default_rng(1)
+    dtype = np.uint16 if pixel_format.endswith("le") else np.uint8
+    flat = path.with_name(f"flat-{path.name}")
+    with av.open(str(flat), "w") as container:
+        stream = container.add_stream("libx264", rate=25, options={"qp": "0"})
+        stream.width, stream.height, stream.pix_fmt = 64, 48, pixel_format
+        for index in range(4):
+            frame = av.VideoFrame(width=64, height=48, format=pixel_format)
+            for plane in frame.planes:
+                # within the limited range of 8-bit and 10-bit samples alike
+                high = 940 if dtype == np.uint16 else 235
+                plane.update(rng.integers(20, high, (plane.height, plane.line_size // np.dtype(dtype).itemsize), dtype))
+            frame.pts, frame.time_base = index, Fraction(1, 25)
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    with av.open(str(flat)) as original, av.open(str(path), "w") as destination:
+        stream = destination.add_stream_from_template(original.streams.video[0])
+        stream.set_display_rotation(rotation)
+        for packet in original.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = stream
+                destination.mux(packet)
+
+
+def _chapter_planes(source, output, clips):
+    write_chapters(source, output, clips, crf=0)
+    with av.open(str(output)) as container:
+        return [
+            [
+                np.frombuffer(plane, np.uint16 if frame.format.name.endswith("le") else np.uint8)
+                .reshape(plane.height, -1)[:, :plane.width]
+                for plane in frame.planes
+            ]
+            for frame in container.decode(video=0)
+        ]
+
+
+def _assert_chapters_of_upright_copy(tmp_path, source, rotation, clips):
+    """`source`'s chapters equal those of the same video stored upright: its frames turned as FFmpeg autorotates
+    them, losslessly, with no rotation left."""
+    turns = {0: [], 90: [("transpose", "cclock")], 180: [("hflip",), ("vflip",)], 270: [("transpose", "clock")]}
+    upright = tmp_path / "upright.mkv"
+    with av.open(str(source)) as rotated, av.open(str(upright), "w") as container:
+        stored = rotated.streams.video[0]
+        stream = container.add_stream("libx264", rate=stored.average_rate, options={"qp": "0"})
+        stream.width, stream.height = (stored.height, stored.width) if rotation % 180 else (stored.width, stored.height)
+        stream.pix_fmt = stored.pix_fmt
+        for name in ("color_range", "colorspace", "color_primaries", "color_trc"):
+            setattr(stream.codec_context, name, getattr(stored.codec_context, name))
+        graph = av.filter.Graph()
+        turned_nodes = [graph.add(*turn) for turn in turns[rotation % 360]]
+        graph.link_nodes(graph.add_buffer(template=stored), *turned_nodes, graph.add("buffersink"))
+        graph.configure()
+        for index, frame in enumerate(rotated.decode(stored)):
+            graph.push(frame)
+            turned = graph.pull()
+            turned.pts, turned.time_base = index, 1 / stored.average_rate
+            container.mux(stream.encode(turned))
+        container.mux(stream.encode())
+    written = [_chapter_planes(video, tmp_path / f"{name}-chapters.mkv", clips)
+               for name, video in (("rotated", source), ("upright", upright))]
+    assert len(written[0]) == sum(clip.end_frame - clip.start_frame for clip in clips)
+    for rotated_planes, upright_planes in zip(*written, strict=True):
+        for rotated_plane, upright_plane in zip(rotated_planes, upright_planes, strict=True):
+            np.testing.assert_array_equal(rotated_plane, upright_plane)
+
+
+def test_rotated_source_writes_the_chapters_of_its_upright_copy(tmp_path):
+    clips = [ChapterClip(0, 3, (16, 32, 336, 608)), ChapterClip(3, 6, (-16, 576, 368, 672), resolution=(192, 48))]
+    _assert_chapters_of_upright_copy(tmp_path, ROTATED, 90, clips)
+
+
+@pytest.mark.parametrize("rotation", [90, 180, 270])
+@pytest.mark.parametrize("pixel_format", ["yuv420p10le", "yuv444p", "yuv444p10le"])
+def test_rotated_pixel_formats_write_the_chapters_of_their_upright_copy(tmp_path, pixel_format, rotation):
+    source = tmp_path / "rotated.mp4"
+    _write_rotated_noise(source, pixel_format, rotation)
+    height = 64 if rotation % 180 else 48
+    # one box inside the displayed frame, one padded past its bottom-left corner
+    clips = [ChapterClip(0, 2, (0, 0, 32, 32)), ChapterClip(2, 4, (-16, height - 16, 16, height + 16))]
+    _assert_chapters_of_upright_copy(tmp_path, source, rotation, clips)
+
+
+@pytest.mark.parametrize("rotation", [90, 270])
+@pytest.mark.parametrize("pixel_format", ["yuv420p", "yuv420p10le"])
+@pytest.mark.parametrize("box", [(1, 0, 33, 32), (0, 1, 32, 33), (7, 5, 39, 37), (-3, -5, 29, 27)])
+def test_rotated_odd_display_edges_write_the_chapters_of_the_upright_copy(tmp_path, rotation, pixel_format, box):
+    # an odd left or top in display coordinates puts the crop off the turned frame's chroma grid
+    source = tmp_path / "rotated.mp4"
+    _write_rotated_noise(source, pixel_format, rotation)
+    _assert_chapters_of_upright_copy(tmp_path, source, rotation, [ChapterClip(0, 2, box)])
+
+
+@pytest.mark.parametrize("rotation", [90, 270])
+@pytest.mark.parametrize("clips", [
+    # out of order and overlapping: decoding restarts at frame 0 and must keep turning the frames
+    [ChapterClip(2, 4, (0, 0, 32, 48)), ChapterClip(0, 3, (16, 16, 48, 48), resolution=(16, 16)),
+     ChapterClip(1, 3, (-16, 0, 16, 32))],
+    # a gap after frame 0, which the rotation is read from: that frame must be cut once, not twice
+    [ChapterClip(0, 1, (0, 0, 32, 32)), ChapterClip(3, 4, (0, 0, 32, 32))],
+])
+def test_rotated_clips_in_any_order_write_the_chapters_of_the_upright_copy(tmp_path, rotation, clips):
+    source = tmp_path / "rotated.mp4"
+    _write_rotated_noise(source, "yuv420p", rotation)
+    _assert_chapters_of_upright_copy(tmp_path, source, rotation, clips)
+
+
+@pytest.mark.parametrize("rotation", [-90, -180, -270, 450])
+def test_negative_and_wrapped_rotations_write_the_chapters_of_the_upright_copy(tmp_path, rotation):
+    source = tmp_path / "rotated.mp4"
+    _write_rotated_noise(source, "yuv420p", rotation)
+    _assert_chapters_of_upright_copy(tmp_path, source, rotation, [ChapterClip(0, 2, (0, 0, 32, 32))])
+
+
+@pytest.mark.parametrize("rotation", [90, 270])
+def test_rotated_422_source_is_turned_upright(tmp_path, rotation):
+    # transpose takes no 4:2:2, so FFmpeg converts before the turn and the format pin converts back; turned 4:2:2
+    # chroma has no exact upright copy, so luma alone is held to the stored frame turned
+    source = tmp_path / "rotated.mp4"
+    _write_rotated_noise(source, "yuv422p", rotation)
+    with av.open(str(source)) as container:
+        plane = next(container.decode(video=0)).planes[0]
+        stored = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+    luma, chroma, _ = _chapter_planes(source, tmp_path / "chapters.mkv", [ChapterClip(0, 1, (0, 0, 48, 64))])[0]
+    assert chroma.shape == (64, 24)
+    np.testing.assert_array_equal(luma, np.rot90(stored, 1 if rotation == 90 else 3))
 
 
 def test_rotated_source_crops_the_displayed_frame_upright(tmp_path):
@@ -436,3 +558,46 @@ def test_rotated_source_crops_the_displayed_frame_upright(tmp_path):
         inside = frames[3 + index][:64, 16:376].astype(int) - shown[3 + index][576:640]
         assert np.abs(inside).mean() < 1
         assert frames[3 + index][64:].max() <= 3
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("resolution", [None, (64, 64)])
+def test_chapters_autorotate_before_cropping_and_padding(tmp_path, rotation, resolution):
+    source = tmp_path / "rotated.mp4"
+    with av.open(str(SOURCE)) as original, av.open(str(source), "w") as destination:
+        stream = destination.add_stream_from_template(original.streams.video[0])
+        stream.set_display_rotation(rotation)
+        for packet in original.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = stream
+                destination.mux(packet)
+    with av.open(str(source)) as container:
+        stored = next(container.decode(video=0))
+        assert stored.rotation % 360 == rotation
+        shown = np.rot90(stored.to_ndarray(format="rgb24"), rotation // 90)
+    height, width = shown.shape[:2]
+    clips = [
+        ChapterClip(0, 1, (0, 0, 128, 128)),
+        ChapterClip(0, 1, (-16, height - 32, width + 16, height + 32), resolution=resolution),
+    ]
+    output = tmp_path / "chapters.mkv"
+    write_chapters(source, output, clips, crf=0)
+    frames = list(read_frames_exact(str(output)))
+    np.testing.assert_array_equal(frames[0], shown[:128, :128])
+    if resolution is None:
+        expected = np.pad(shown[-32:], ((0, 32), (16, 16), (0, 0)))
+        np.testing.assert_allclose(frames[1], expected, atol=3)
+    else:
+        assert frames[1].shape == (64, 64, 3)
+        assert frames[1][40:].max() <= 3
+        assert frames[1][:24, 8:56].mean() > 10
+    with av.open(str(output)) as container:
+        assert all(frame.rotation == 0 for frame in container.decode(video=0))
+
+
+def test_phone_video_crop_uses_display_dimensions(tmp_path):
+    output = tmp_path / "phone-crop.mkv"
+    write_chapters(ROTATED, output, [ChapterClip(0, 3, (0, 0, 128, 512))], crf=0)
+    shown = list(read_frames_exact(str(ROTATED), 0, 2))
+    for actual, expected in zip(read_frames_exact(str(output)), shown, strict=True):
+        np.testing.assert_array_equal(actual, expected[:512, :128])

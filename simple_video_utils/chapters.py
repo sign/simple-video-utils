@@ -4,14 +4,14 @@ import json
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
-from itertools import islice
+from itertools import chain, islice
 from pathlib import Path
 
 import av
 from av.video.reformatter import ColorRange
 
 from simple_video_utils.frames import _rotation_filters
-from simple_video_utils.metadata import _open_video, _probe_rotation
+from simple_video_utils.metadata import _open_video
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -61,7 +61,6 @@ def write_chapters(
         stream = source.streams.video[0]
         # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
         stream.thread_type = thread_type
-        rotation = _probe_rotation(container=source) % 360
         rate = stream.average_rate
         chapters = []
         offset = 0
@@ -84,6 +83,10 @@ def write_chapters(
             # The muxer takes the header (avcC) from the first clip's packets.
             track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
             decoded = source.decode(stream)
+            # PyAV reports the display-matrix rotation on decoded frames only
+            first = next(decoded, None)
+            rotation = 0 if first is None else first.rotation % 360
+            decoded = chain(() if first is None else (first,), decoded)
             source_end = output_start = 0
             for clip in clips:
                 if clip.start_frame < source_end:
@@ -104,18 +107,6 @@ def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
     return (start, end) if end > start else (0, size)
 
 
-def _stored_box(box: tuple[int, int, int, int], rotation: int, width: int, height: int) -> tuple[int, int, int, int]:
-    """A box of the displayed frame in the stored width x height frame that `rotation` (counterclockwise) turns."""
-    left, top, right, bottom = box
-    if rotation == 90:
-        return width - bottom, left, width - top, right
-    if rotation == 180:
-        return width - right, height - bottom, width - left, height - top
-    if rotation == 270:
-        return top, height - right, bottom, height - left
-    return box
-
-
 def _write_clip(
     source: av.VideoStream,
     track: av.VideoStream,
@@ -128,15 +119,19 @@ def _write_clip(
 ) -> None:
     rate = source.average_rate
     graph = av.filter.Graph()
-    left, top, right, bottom = _stored_box(box=clip.box, rotation=rotation, width=source.width, height=source.height)
+    left, top, right, bottom = clip.box
+    # a rotated source is turned upright first, as FFmpeg autorotates it, then cut like a source stored upright
+    frame_width, frame_height = source.width, source.height
+    if rotation in (90, 270):
+        frame_width, frame_height = frame_height, frame_width
     pixel_format = source.format
     shifted_chroma = (left % 2 and pixel_format.chroma_width(2) == 1) or (
         top % 2 and pixel_format.chroma_height(2) == 1
     )
     padding, x, y = [], 0, 0
-    outside = left < 0 or top < 0 or right > source.width or bottom > source.height
+    outside = left < 0 or top < 0 or right > frame_width or bottom > frame_height
     inside_left, inside_top = max(left, 0), max(top, 0)
-    inside_right, inside_bottom = min(right, source.width), min(bottom, source.height)
+    inside_right, inside_bottom = min(right, frame_width), min(bottom, frame_height)
     step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
     on_chroma_grid = not (
         left % step_x or right % step_x or inside_right % step_x
@@ -148,8 +143,8 @@ def _write_clip(
         )
         if needs_conversion:
             # Keep nearby pixels so conversion preserves chroma at the crop's edges.
-            x0, x1 = _neighbourhood(left, right, source.width)
-            y0, y1 = _neighbourhood(top, bottom, source.height)
+            x0, x1 = _neighbourhood(left, right, frame_width)
+            y0, y1 = _neighbourhood(top, bottom, frame_height)
         else:
             x0, y0, x1, y1 = inside_left, inside_top, inside_right, inside_bottom
         left, top, right, bottom = left - x0, top - y0, right - x0, bottom - y0
@@ -161,9 +156,11 @@ def _write_clip(
     width, height = clip.size
     graph.link_nodes(
         graph.add_buffer(template=source),
+        # turned in the decoded format, which FFmpeg would otherwise convert whole for the padding first
+        *_rotation_filters(graph=graph, rotation=rotation),
+        *([graph.add("format", source.pix_fmt)] if rotation else []),
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
-        *_rotation_filters(graph=graph, rotation=rotation),
         # Avoid implicit matrix or range conversions.
         graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}:"
                   f"out_range={source.codec_context.color_range}"),
