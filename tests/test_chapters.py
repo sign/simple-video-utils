@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.chapters import ChapterClip, _stored_box, list_chapters, write_chapters
+from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
@@ -414,12 +414,33 @@ def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path, pixel_for
         np.testing.assert_array_equal(chroma, expected)
 
 
-@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
-def test_stored_box_holds_the_displayed_box_before_rotation(rotation):
-    stored = np.arange(6 * 10).reshape(6, 10)
-    shown = np.rot90(stored, rotation // 90)
-    left, top, right, bottom = _stored_box(box=(1, 2, 4, 5), rotation=rotation, width=10, height=6)
-    np.testing.assert_array_equal(np.rot90(stored[top:bottom, left:right], rotation // 90), shown[2:5, 1:4])
+def test_rotated_source_writes_the_chapters_of_its_upright_copy(tmp_path):
+    # the same video stored upright: its frames turned as FFmpeg autorotates them, losslessly, with no rotation left
+    upright = tmp_path / "upright.mkv"
+    with av.open(str(ROTATED)) as source, av.open(str(upright), "w") as container:
+        stored = source.streams.video[0]
+        stream = container.add_stream("libx264", rate=stored.average_rate, options={"qp": "0"})
+        stream.width, stream.height, stream.pix_fmt = stored.height, stored.width, stored.pix_fmt
+        for name in ("color_range", "colorspace", "color_primaries", "color_trc"):
+            setattr(stream.codec_context, name, getattr(stored.codec_context, name))
+        graph = av.filter.Graph()
+        graph.link_nodes(graph.add_buffer(template=stored), graph.add("transpose", "cclock"), graph.add("buffersink"))
+        graph.configure()
+        for index, frame in enumerate(source.decode(stored)):
+            graph.push(frame)
+            turned = graph.pull()
+            turned.pts, turned.time_base = index, 1 / stored.average_rate
+            container.mux(stream.encode(turned))
+        container.mux(stream.encode())
+    clips = [ChapterClip(0, 3, (16, 32, 336, 608)), ChapterClip(3, 6, (-16, 576, 368, 672), resolution=(192, 48))]
+    written = []
+    for name, video in (("rotated", ROTATED), ("upright", upright)):
+        write_chapters(video, tmp_path / f"{name}-chapters.mkv", clips, crf=0)
+        with av.open(str(tmp_path / f"{name}-chapters.mkv")) as container:
+            written.append([frame.to_ndarray() for frame in container.decode(video=0)])
+    assert len(written[0]) == 6
+    for rotated, stored_upright in zip(*written, strict=True):
+        np.testing.assert_array_equal(rotated, stored_upright)
 
 
 def test_rotated_source_crops_the_displayed_frame_upright(tmp_path):
