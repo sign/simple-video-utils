@@ -410,3 +410,47 @@ def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path, pixel_for
         chroma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
         expected = np.repeat(np.where(np.arange(plane.width)[None, :] + 5 < 16, 80, 180), plane.height, axis=0)
         np.testing.assert_array_equal(chroma, expected)
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+@pytest.mark.parametrize("resolution", [None, (64, 64)])
+def test_chapters_autorotate_before_cropping_and_padding(tmp_path, rotation, resolution):
+    source = tmp_path / "rotated.mp4"
+    with av.open(str(SOURCE)) as original, av.open(str(source), "w") as destination:
+        stream = destination.add_stream_from_template(original.streams.video[0])
+        stream.set_display_rotation(rotation)
+        for packet in original.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = stream
+                destination.mux(packet)
+    with av.open(str(source)) as container:
+        stored = next(container.decode(video=0))
+        assert stored.rotation % 360 == rotation
+        shown = np.rot90(stored.to_ndarray(format="rgb24"), rotation // 90)
+    height, width = shown.shape[:2]
+    clips = [
+        ChapterClip(0, 1, (0, 0, 128, 128)),
+        ChapterClip(0, 1, (-16, height - 32, width + 16, height + 32), resolution=resolution),
+    ]
+    output = tmp_path / "chapters.mkv"
+    write_chapters(source, output, clips, crf=0)
+    frames = list(read_frames_exact(str(output)))
+    np.testing.assert_array_equal(frames[0], shown[:128, :128])
+    if resolution is None:
+        expected = np.pad(shown[-32:], ((0, 32), (16, 16), (0, 0)))
+        np.testing.assert_allclose(frames[1], expected, atol=3)
+    else:
+        assert frames[1].shape == (64, 64, 3)
+        assert frames[1][40:].max() <= 3
+        assert frames[1][:24, 8:56].mean() > 10
+    with av.open(str(output)) as container:
+        assert all(frame.rotation == 0 for frame in container.decode(video=0))
+
+
+def test_phone_video_crop_uses_display_dimensions(tmp_path):
+    source = Path(__file__).parent / "assets" / "rotated90.mp4"
+    output = tmp_path / "phone-crop.mkv"
+    write_chapters(source, output, [ChapterClip(0, 3, (0, 0, 128, 512))], crf=0)
+    shown = list(read_frames_exact(str(source), 0, 2))
+    for actual, expected in zip(read_frames_exact(str(output)), shown, strict=True):
+        np.testing.assert_array_equal(actual, expected[:512, :128])

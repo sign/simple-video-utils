@@ -10,7 +10,7 @@ from pathlib import Path
 import av
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.metadata import _open_video
+from simple_video_utils.metadata import _open_video, _probe_rotation
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -50,7 +50,8 @@ def write_chapters(
 ) -> None:
     """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
-    Output must not exist. Coordinates refer to encoded pixels, before rotation.
+    Output must not exist. Coordinates refer to the displayed frame, with rotation applied.
+    Source frames are rotated upright before cropping and padding.
     Each chapter stores its source specification in a JSON ``payload`` tag.
     ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
     "FRAME", "SLICE" or "NONE"); the frames do not change.
@@ -59,6 +60,7 @@ def write_chapters(
         stream = source.streams.video[0]
         # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
         stream.thread_type = thread_type
+        rotation = _probe_rotation(source) % 360
         rate = stream.average_rate
         chapters = []
         offset = 0
@@ -89,7 +91,7 @@ def write_chapters(
                     source_end = 0
                 # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
                 frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-                _write_clip(stream, track, clip, frames, output_start, crf, preset)
+                _write_clip(stream, track, clip, frames, output_start, crf, preset, rotation)
                 source_end = clip.end_frame
                 output_start += clip.end_frame - clip.start_frame
 
@@ -109,18 +111,27 @@ def _write_clip(
     start: int,
     crf: int,
     preset: str,
+    rotation: int,
 ) -> None:
     rate = source.average_rate
     graph = av.filter.Graph()
+    # PyAV exposes rotation metadata but does not autorotate decoded pixels.
+    autorotate = []
+    source_width, source_height = source.width, source.height
+    if rotation in (90, 270):
+        autorotate = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
+        source_width, source_height = source_height, source_width
+    elif rotation == 180:
+        autorotate = [graph.add("hflip"), graph.add("vflip")]
     left, top, right, bottom = clip.box
     pixel_format = source.format
     shifted_chroma = (left % 2 and pixel_format.chroma_width(2) == 1) or (
         top % 2 and pixel_format.chroma_height(2) == 1
     )
     padding, x, y = [], 0, 0
-    outside = left < 0 or top < 0 or right > source.width or bottom > source.height
+    outside = left < 0 or top < 0 or right > source_width or bottom > source_height
     inside_left, inside_top = max(left, 0), max(top, 0)
-    inside_right, inside_bottom = min(right, source.width), min(bottom, source.height)
+    inside_right, inside_bottom = min(right, source_width), min(bottom, source_height)
     step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
     on_chroma_grid = not (
         left % step_x or right % step_x or inside_right % step_x
@@ -132,8 +143,8 @@ def _write_clip(
         )
         if needs_conversion:
             # Keep nearby pixels so conversion preserves chroma at the crop's edges.
-            x0, x1 = _neighbourhood(left, right, source.width)
-            y0, y1 = _neighbourhood(top, bottom, source.height)
+            x0, x1 = _neighbourhood(left, right, source_width)
+            y0, y1 = _neighbourhood(top, bottom, source_height)
         else:
             x0, y0, x1, y1 = inside_left, inside_top, inside_right, inside_bottom
         left, top, right, bottom = left - x0, top - y0, right - x0, bottom - y0
@@ -145,6 +156,7 @@ def _write_clip(
     width, height = clip.size
     graph.link_nodes(
         graph.add_buffer(template=source),
+        *autorotate,
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
         # Avoid implicit matrix or range conversions.
