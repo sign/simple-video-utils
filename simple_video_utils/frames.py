@@ -48,18 +48,23 @@ class FrameSize:
             raise TypeError(message)
 
 
-def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
-    """Rotate RGB pixels; 90 degrees is counterclockwise, matching display-matrix rotation."""
-    graph = av.filter.Graph()
+def _rotation_filters(graph: av.filter.Graph, rotation: int) -> list[av.filter.context.FilterContext]:
+    """Filters that turn stored pixels upright; 90 degrees is counterclockwise, matching display-matrix rotation."""
     if rotation == 180:
-        filters = [graph.add("hflip"), graph.add("vflip")]
-    else:
-        filters = [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
+        return [graph.add("hflip"), graph.add("vflip")]
+    if rotation in (90, 270):
+        return [graph.add("transpose", "cclock" if rotation == 90 else "clock")]
+    return []
+
+
+def _rotation_graph(rotation: int, width: int, height: int, time_base: Fraction | None) -> av.filter.Graph:
+    """Rotate RGB pixels to display orientation."""
+    graph = av.filter.Graph()
     # add_buffer without an explicit time_base is deprecated; the value only
     # affects pts interpretation, never pixels, and we only take arrays.
     source = graph.add_buffer(width=width, height=height, format="rgb24",
                               time_base=time_base or Fraction(1, 1000))
-    graph.link_nodes(source, *filters, graph.add("buffersink"))
+    graph.link_nodes(source, *_rotation_filters(graph=graph, rotation=rotation), graph.add("buffersink"))
     graph.configure()
     return graph
 

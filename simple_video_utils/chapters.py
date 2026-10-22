@@ -10,7 +10,8 @@ from pathlib import Path
 import av
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.metadata import _open_video
+from simple_video_utils.frames import _rotation_filters
+from simple_video_utils.metadata import _open_video, _probe_rotation
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -50,7 +51,8 @@ def write_chapters(
 ) -> None:
     """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
-    Output must not exist. Coordinates refer to encoded pixels, before rotation.
+    Output must not exist. Coordinates refer to the displayed frame, rotation applied, as ``video_metadata`` and the
+    frame readers report it, and a rotated source's chapters come out upright.
     Each chapter stores its source specification in a JSON ``payload`` tag.
     ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
     "FRAME", "SLICE" or "NONE"); the frames do not change.
@@ -59,6 +61,7 @@ def write_chapters(
         stream = source.streams.video[0]
         # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
         stream.thread_type = thread_type
+        rotation = _probe_rotation(container=source) % 360
         rate = stream.average_rate
         chapters = []
         offset = 0
@@ -89,7 +92,7 @@ def write_chapters(
                     source_end = 0
                 # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
                 frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-                _write_clip(stream, track, clip, frames, output_start, crf, preset)
+                _write_clip(stream, track, clip, frames, output_start, crf, preset, rotation=rotation)
                 source_end = clip.end_frame
                 output_start += clip.end_frame - clip.start_frame
 
@@ -101,6 +104,18 @@ def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
     return (start, end) if end > start else (0, size)
 
 
+def _stored_box(box: tuple[int, int, int, int], rotation: int, width: int, height: int) -> tuple[int, int, int, int]:
+    """A box of the displayed frame in the stored width x height frame that `rotation` (counterclockwise) turns."""
+    left, top, right, bottom = box
+    if rotation == 90:
+        return width - bottom, left, width - top, right
+    if rotation == 180:
+        return width - right, height - bottom, width - left, height - top
+    if rotation == 270:
+        return top, height - right, bottom, height - left
+    return box
+
+
 def _write_clip(
     source: av.VideoStream,
     track: av.VideoStream,
@@ -109,10 +124,11 @@ def _write_clip(
     start: int,
     crf: int,
     preset: str,
+    rotation: int = 0,
 ) -> None:
     rate = source.average_rate
     graph = av.filter.Graph()
-    left, top, right, bottom = clip.box
+    left, top, right, bottom = _stored_box(box=clip.box, rotation=rotation, width=source.width, height=source.height)
     pixel_format = source.format
     shifted_chroma = (left % 2 and pixel_format.chroma_width(2) == 1) or (
         top % 2 and pixel_format.chroma_height(2) == 1
@@ -147,6 +163,7 @@ def _write_clip(
         graph.add_buffer(template=source),
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
+        *_rotation_filters(graph=graph, rotation=rotation),
         # Avoid implicit matrix or range conversions.
         graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}:"
                   f"out_range={source.codec_context.color_range}"),
