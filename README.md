@@ -166,7 +166,8 @@ for frame in read_frames_exact("chapters.mkv"):
 
 Pass nonempty clips from a video with a nominal frame rate and an
 H.264-compatible pixel format. Trims use source frame indices with an exclusive
-end; boxes are integer `(left, top, right, bottom)` encoded-pixel coordinates.
+end; boxes are integer `(left, top, right, bottom)` display coordinates.
+Source frames are rotated upright before cropping and padding.
 Box areas outside the source frame become black. `resolution=(width, height)`
 resizes the crop to exactly that size; the default keeps the box size.
 Clips play consecutively, and chapter payload tags retain their source specs.
