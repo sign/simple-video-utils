@@ -676,3 +676,10 @@ def test_slice_chapters_reencodes_a_joined_file_at_its_own_size(tmp_path):
     again = io.BytesIO(join_chapters(pieces))
     assert [c.source for c in read_chapters(again)] == [1, Fraction(9, 5)]
     assert [_frame_count(d) for _, d in split_chapters(again)] == [6, 12]
+
+
+def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
+    output = _signer_chapters(tmp_path)               # chapter 1 ends at source 1.2 (frame starts every 1/30 s)
+    [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there
+    assert piece[0] == Fraction(9, 5)
+    assert _frame_count(piece[1]) == 3                 # [1.8, 1.9): frames at 1.8, 1.833, 1.866

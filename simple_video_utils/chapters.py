@@ -14,7 +14,7 @@ import av
 from av.video.reformatter import ColorRange
 
 from simple_video_utils.frames import _rotation_filters
-from simple_video_utils.metadata import _open_video, video_metadata
+from simple_video_utils.metadata import _open_video
 from simple_video_utils.slicing import _encode_clip, _iter_packets
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
@@ -145,19 +145,24 @@ def _remux(stream: av.VideoStream, packets: list[av.Packet]) -> bytes:
 def slice_chapters(
     src: str | Path, spans: Sequence[tuple[float, float]], size: int | None = None,
 ) -> Iterator[list[tuple[Fraction, bytes]]]:
-    """Yield, per source-timeline span of a chaptered file, its pieces, one per chapter it touches: (where the piece
-    starts on the source's timeline, its clip re-encoded at ``size``). A span between chapters has none;
+    """Yield, per source-timeline span of a chaptered file, its pieces, one per chapter holding a frame that starts
+    in it: (where the piece starts on the source's timeline, those frames re-encoded at ``size``). A span between
+    chapters has none;
     ``end`` may be ``math.inf``. Clips are cut as they are yielded. Raises ``ValueError`` on a file without chapters."""
     with _open(src) as container:
         found = _require_chapters(container)
-    fps = video_metadata(str(src)).fps
+        rate = container.streams.video[0].average_rate
     for a, b in spans:
-        parts = [(chapter, part) for chapter in found if (part := chapter.overlap(_exact(a), _exact(b)))]
-        # Always re-encoded: the file's header describes only its first chapter, so a stream copy can't be trusted.
-        # [low, high): the frame reader's end is inclusive, and at a chapter's end it is the next chapter's first frame
-        yield [(low, _encode_clip(str(src), float(chapter.local(low)), float(chapter.local(high)) - 0.5 / fps,
-                                  fps, size))
-               for chapter, (low, high) in parts]
+        pieces = []
+        for chapter in found:
+            if part := chapter.overlap(_exact(a), _exact(b)):
+                # the frames that START in [low, high); reading at mid-frame times dodges float rounding at both ends
+                first, last = (math.ceil(chapter.local(t) * rate) for t in part)
+                if last > first:  # re-encoded: the file's header describes only its first chapter
+                    clip = _encode_clip(str(src), float((first + 0.5) / rate), float((last - 0.5) / rate),
+                                        float(rate), size)
+                    pieces.append((part[0], clip))
+        yield pieces
 
 
 def _exact(t: float) -> Fraction | float:
