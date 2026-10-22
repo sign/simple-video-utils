@@ -8,10 +8,12 @@ import numpy as np
 import pytest
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.chapters import ChapterClip, _stored_box, list_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
+# stores 640x360 frames that play as 360x640 (display rotation 90)
+ROTATED = Path(__file__).parent / "assets" / "rotated90.mp4"
 
 
 def _write_chroma_source(path, pixel_format, color_range=ColorRange.UNSPECIFIED, colorspace=2):
@@ -410,3 +412,27 @@ def test_odd_vertical_crop_resamples_chroma_on_the_crop_grid(tmp_path, pixel_for
         chroma = np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
         expected = np.repeat(np.where(np.arange(plane.width)[None, :] + 5 < 16, 80, 180), plane.height, axis=0)
         np.testing.assert_array_equal(chroma, expected)
+
+
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_stored_box_holds_the_displayed_box_before_rotation(rotation):
+    stored = np.arange(6 * 10).reshape(6, 10)
+    shown = np.rot90(stored, rotation // 90)
+    left, top, right, bottom = _stored_box(box=(1, 2, 4, 5), rotation=rotation, width=10, height=6)
+    np.testing.assert_array_equal(np.rot90(stored[top:bottom, left:right], rotation // 90), shown[2:5, 1:4])
+
+
+def test_rotated_source_crops_the_displayed_frame_upright(tmp_path):
+    clips = [ChapterClip(0, 3, (16, 32, 336, 608)), ChapterClip(3, 6, (-16, 576, 368, 672))]
+    output = tmp_path / "chapters.mkv"
+    write_chapters(ROTATED, output, clips, crf=0)
+    shown = list(read_frames_exact(str(ROTATED)))
+    frames = list(read_frames_exact(str(output)))
+    assert [frame.shape for frame in frames] == [(576, 320, 3)] * 3 + [(96, 384, 3)] * 3
+    for index in range(3):
+        np.testing.assert_array_equal(frames[index], shown[index][32:608, 16:336])
+        # the second clip pads 16 pixels left and right and 32 below the 360x640 frame; padding converts its chroma, so
+        # its pixels move by a few levels, where a crop turned the wrong way is ~37 off on average
+        inside = frames[3 + index][:64, 16:376].astype(int) - shown[3 + index][576:640]
+        assert np.abs(inside).mean() < 1
+        assert frames[3 + index][64:].max() <= 3
