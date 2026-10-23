@@ -62,7 +62,8 @@ def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
     return av.open(buffer, mode="w", format="mp4", options={"moov_size": str(4096 + 32 * samples)})
 
 
-def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None) -> bytes:
+def _encode_clip(src: str | av.container.InputContainer,
+                 start: float, end: float, fps: float, size: int | None) -> bytes:
     frames = list(read_frames_exact(src, start_time=start, end_time=end))
     if not frames:
         return b""

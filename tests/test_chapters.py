@@ -759,6 +759,20 @@ def test_slice_chapters_does_not_extend_a_rounded_chapter_end(tmp_path):
     assert next(slice_chapters(output, [(0.4, 0.4001)], size=32)) == []
 
 
+def test_slice_chapters_reuses_in_memory_input_across_spans_and_calls(tmp_path):
+    output = _signer_chapters(tmp_path)
+    spans = [(0.3, 0.9), (1.0, 2.2)]
+    expected = [[(start, _frame_count(data)) for start, data in pieces]
+                for pieces in slice_chapters(output, spans, size=32)]
+    source = io.BytesIO(output.read_bytes())
+    source.seek(0, io.SEEK_END)
+    for _ in range(2):
+        actual = [[(start, _frame_count(data)) for start, data in pieces]
+                  for pieces in slice_chapters(source, spans, size=32)]
+        assert actual == expected
+        assert not source.closed
+
+
 def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
     output = _signer_chapters(tmp_path)               # chapter 1 ends at source 1.2 (frame starts every 1/30 s)
     [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there

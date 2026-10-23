@@ -156,7 +156,7 @@ def _remux(stream: av.VideoStream, packets: list[av.Packet]) -> bytes:
 
 
 def slice_chapters(
-    src: str | Path, spans: Sequence[tuple[float, float]], size: int | None = None,
+    src: Source, spans: Sequence[tuple[float, float]], size: int | None = None,
 ) -> Iterator[list[tuple[Fraction, bytes]]]:
     """Yield, per source-timeline span of a chaptered file, its pieces, one per chapter holding a frame that starts
     in it: (where the piece starts on the source's timeline, those frames re-encoded at ``size``). A span between
@@ -165,21 +165,21 @@ def slice_chapters(
     with _open(src) as container:
         found = _require_chapters(container)
         rate = container.streams.video[0].average_rate
-    for a, b in spans:
-        pieces = []
-        for chapter in found:
-            # Only stored chapter bounds are rounded to milliseconds; user bounds stay exact.
-            chapter_first, chapter_last = (round(t * rate) for t in (chapter.start, chapter.end))
-            source_end = chapter.source + (chapter_last - chapter_first) / rate
-            low, high = max(_exact(a), chapter.source), min(_exact(b), source_end)
-            if low < high:
-                first, last = (chapter_first + math.ceil((t - chapter.source) * rate) for t in (low, high))
-                if last > first:  # re-encoded: the file's header describes only its first chapter
-                    clip = _encode_clip(str(src), float((first + 0.5) / rate), float((last - 0.5) / rate),
-                                        float(rate), size)
-                    source_start = chapter.source + (first - chapter_first) / rate
-                    pieces.append((source_start, clip))
-        yield pieces
+        for a, b in spans:
+            pieces = []
+            for chapter in found:
+                # Only stored chapter bounds are rounded to milliseconds; user bounds stay exact.
+                chapter_first, chapter_last = (round(t * rate) for t in (chapter.start, chapter.end))
+                source_end = chapter.source + (chapter_last - chapter_first) / rate
+                low, high = max(_exact(a), chapter.source), min(_exact(b), source_end)
+                if low < high:
+                    first, last = (chapter_first + math.ceil((t - chapter.source) * rate) for t in (low, high))
+                    if last > first:  # re-encoded: the file's header describes only its first chapter
+                        clip = _encode_clip(container, float((first + 0.5) / rate), float((last - 0.5) / rate),
+                                            float(rate), size)
+                        source_start = chapter.source + (first - chapter_first) / rate
+                        pieces.append((source_start, clip))
+            yield pieces
 
 
 def _exact(t: float) -> Fraction | float:
