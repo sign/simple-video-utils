@@ -4,7 +4,7 @@ import json
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
-from itertools import chain, islice
+from itertools import chain, islice, pairwise
 from pathlib import Path
 from typing import BinaryIO
 
@@ -77,6 +77,12 @@ def read_chapters(
     with _open_video(str(src) if isinstance(src, Path) else src) as container:
         stream = container.streams.video[0]
         found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
+        if any(chapter["end"] <= chapter["start"] for chapter in found) or any(
+            left["end"] * left["time_base"] > right["start"] * right["time_base"]
+            for left, right in pairwise(found)
+        ):
+            message = "chapters must not overlap and must have positive duration"
+            raise ValueError(message)
         _, decoded = read_frames_from_stream(
             container, size=size, fps=None if found else fps, return_frame_metadata=bool(found),
         )
@@ -84,22 +90,18 @@ def read_chapters(
             yield None, Fraction(0), decoded
             return
         frame = next(decoded, None)
-        previous_end = None
         for chapter in found:
             low, high = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
-            if high <= low or (previous_end is not None and low < previous_end):
-                message = "chapters must not overlap and must have positive duration"
-                raise ValueError(message)
-            previous_end = high
 
             def chapter_frames(low=low, high=high):
                 nonlocal frame
                 while frame is not None:
-                    if frame[1].time is not None and frame[1].time >= high:
+                    time = frame[1].time
+                    if time is not None and time >= high:
                         break
-                    current, frame = frame, next(decoded, None)
-                    if current[1].time is not None and current[1].time >= low:
-                        yield current
+                    if time is not None and time >= low:
+                        yield frame
+                    frame = next(decoded, None)
 
             yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
 

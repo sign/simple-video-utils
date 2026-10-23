@@ -119,7 +119,7 @@ def test_variable_dimensions_resize_and_preserve_source_starts():
 @pytest.mark.parametrize("bounds", [((0, 0),), ((0, 1000), (500, 1500))])
 def test_invalid_chapter_ranges_are_rejected(bounds):
     with pytest.raises(ValueError, match="chapters must"):
-        [list(gen) for _, _, gen in read_chapters(io.BytesIO(video(bounds=bounds)))]
+        next(read_chapters(io.BytesIO(video(bounds=bounds))))
 
 
 def test_plain_video_keeps_all_frames_and_matches_the_existing_reader(tmp_path):

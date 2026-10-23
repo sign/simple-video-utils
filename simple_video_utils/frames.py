@@ -285,24 +285,22 @@ def _select_frames_by_fps(
             last_bucket = bucket
 
 
-def _indexed_frames_to_rgb(
-    items: Iterable[tuple[int, av.VideoFrame]],
+def _frames_to_rgb_with_info[T](
+    items: Iterable[tuple[T, av.VideoFrame]],
     size: FrameSize | None = None,
-) -> Generator[tuple[np.ndarray, int], None, None]:
-    """Convert (index, frame) pairs to (rgb_array, index) pairs."""
+) -> Generator[tuple[np.ndarray, T], None, None]:
+    """Convert pixels while preserving the paired index or metadata."""
     frames, pairs = tee(items, 2)
-    for rgb, (index, _) in zip(_frames_to_rgb((f for _, f in frames), size), pairs, strict=True):
-        yield rgb, index
+    for rgb, (info, _) in zip(_frames_to_rgb((f for _, f in frames), size), pairs, strict=True):
+        yield rgb, info
 
 
 def _stream_frames_to_rgb(frames, size, return_frame_metadata):
     if not return_frame_metadata:
         yield from _frames_to_rgb((frame for _, frame in frames), size)
         return
-    items, pairs = tee((FrameMetadata(i, frame.pts, frame.time_base), frame) for i, frame in frames)
-    rgb = _frames_to_rgb((frame for _, frame in items), size)
-    for array, (info, _) in zip(rgb, pairs, strict=True):
-        yield array, info
+    items = ((FrameMetadata(i, frame.pts, frame.time_base), frame) for i, frame in frames)
+    yield from _frames_to_rgb_with_info(items, size)
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -424,7 +422,7 @@ def read_frames_exact(
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
 
             if return_indices:
-                yield from _indexed_frames_to_rgb(indexed, size)
+                yield from _frames_to_rgb_with_info(indexed, size)
             else:
                 yield from _frames_to_rgb((frame for _, frame in indexed), size)
 
