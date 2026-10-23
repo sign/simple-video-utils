@@ -11,7 +11,7 @@ import av
 from av.video.reformatter import ColorRange
 
 from simple_video_utils.frames import _rotation_filters
-from simple_video_utils.metadata import _open_video
+from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -51,24 +51,38 @@ def write_chapters(
 ) -> None:
     """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
-    Output must not exist. Coordinates refer to the displayed frame, rotation applied, as ``video_metadata`` and the
-    frame readers report it, and a rotated source's chapters come out upright.
+    Output must not exist, and a failed write removes it. Coordinates refer to the displayed frame, rotation applied,
+    as ``video_metadata`` and the frame readers report it, and a rotated source's chapters come out upright.
     Each chapter stores its source specification in a JSON ``payload`` tag.
     ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
     "FRAME", "SLICE" or "NONE"); the frames do not change.
     """
+    # clips are checked before the source is decoded or the output created, so a bad clip costs nothing
+    if not clips:
+        message = "write_chapters needs at least one clip"
+        raise ValueError(message)
+    for clip in clips:
+        left, top, right, bottom = clip.box
+        if not 0 <= clip.start_frame < clip.end_frame or left >= right or top >= bottom:
+            message = f"clip needs 0 <= start_frame < end_frame and a non-empty box: {clip}"
+            raise ValueError(message)
+        width, height = clip.size
+        if width % 16 or height % 16:
+            message = "H.264 chapter width and height must be multiples of 16"
+            raise ValueError(message)
     with _open_video(str(src)) as source:
         stream = source.streams.video[0]
         # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
         stream.thread_type = thread_type
-        rate = stream.average_rate
+        # browser-recorded WebM has no average rate, and its guessed rate is the time base's reciprocal, so the
+        # cadence comes from decoding the whole stream, which then rewinds
+        rate = stream.average_rate or Fraction(_decoded_rate_and_count(source)[0] or 0).limit_denominator(1001)
+        if not rate:
+            message = "Video has no frame rate information"
+            raise ValueError(message)
         chapters = []
         offset = 0
         for clip in clips:
-            width, height = clip.size
-            if width % 16 or height % 16:
-                message = "H.264 chapter width and height must be multiples of 16"
-                raise ValueError(message)
             end = offset + clip.end_frame - clip.start_frame
             chapters.append({
                 "id": len(chapters),
@@ -77,27 +91,38 @@ def write_chapters(
                 "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
             })
             offset = end
-        with open(out, "xb") as file, av.open(file, mode="w", format="matroska") as destination:
-            destination.set_chapters(chapters)
-            width, height = clips[0].size
-            # The muxer takes the header (avcC) from the first clip's packets.
-            track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
-            decoded = source.decode(stream)
-            # PyAV reports the display-matrix rotation on decoded frames only
-            first = next(decoded, None)
-            rotation = 0 if first is None else first.rotation % 360
-            decoded = chain(() if first is None else (first,), decoded)
-            source_end = output_start = 0
-            for clip in clips:
-                if clip.start_frame < source_end:
-                    source.seek(0, stream=stream)
+        with open(out, "xb") as file:
+            try:
+                with av.open(file, mode="w", format="matroska") as destination:
+                    destination.set_chapters(chapters)
+                    width, height = clips[0].size
+                    # The muxer takes the header (avcC) from the first clip's packets.
+                    track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
                     decoded = source.decode(stream)
-                    source_end = 0
-                # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
-                frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-                _write_clip(stream, track, clip, frames, output_start, crf, preset, rotation=rotation)
-                source_end = clip.end_frame
-                output_start += clip.end_frame - clip.start_frame
+                    # PyAV reports the display-matrix rotation on decoded frames only
+                    first = next(decoded, None)
+                    rotation = 0 if first is None else first.rotation % 360
+                    decoded = chain(() if first is None else (first,), decoded)
+                    source_end = output_start = 0
+                    for clip in clips:
+                        if clip.start_frame < source_end:
+                            source.seek(0, stream=stream)
+                            decoded = source.decode(stream)
+                            source_end = 0
+                        # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
+                        frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
+                        _write_clip(
+                            stream, track, clip, frames, output_start, crf, preset, rate=rate, rotation=rotation,
+                        )
+                        source_end = clip.end_frame
+                        output_start += clip.end_frame - clip.start_frame
+            except BaseException:
+                # a trim past the source's end, an unencodable pixel format or an interrupt leaves a truncated MKV,
+                # which "xb" would then refuse to overwrite on retry
+                file.close()
+                Path(out).unlink()
+                raise
+
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
@@ -115,9 +140,9 @@ def _write_clip(
     start: int,
     crf: int,
     preset: str,
+    rate: Fraction,
     rotation: int = 0,
 ) -> None:
-    rate = source.average_rate
     graph = av.filter.Graph()
     left, top, right, bottom = clip.box
     # a rotated source is turned upright first, as FFmpeg autorotates it, then cut like a source stored upright
