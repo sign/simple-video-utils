@@ -48,6 +48,23 @@ class FrameSize:
             raise TypeError(message)
 
 
+@dataclass(frozen=True)
+class FrameMetadata:
+    """Native decoded-frame information, before resize, skipping or FPS selection.
+
+    ``index`` counts decoded frames from the beginning of this read, starting at zero.
+    """
+
+    index: int
+    pts: int | None
+    time_base: Fraction | None
+
+    @property
+    def time(self) -> Fraction | None:
+        """Exact presentation time in seconds, when the decoder supplies a timestamp."""
+        return self.pts * self.time_base if self.pts is not None and self.time_base is not None else None
+
+
 def _rotation_filters(graph: av.filter.Graph, rotation: int) -> list[av.filter.context.FilterContext]:
     """Filters that turn stored pixels upright; 90 degrees is counterclockwise, matching display-matrix rotation."""
     if rotation == 180:
@@ -268,14 +285,22 @@ def _select_frames_by_fps(
             last_bucket = bucket
 
 
-def _indexed_frames_to_rgb(
-    items: Iterable[tuple[int, av.VideoFrame]],
+def _frames_to_rgb_with_info[T](
+    items: Iterable[tuple[T, av.VideoFrame]],
     size: FrameSize | None = None,
-) -> Generator[tuple[np.ndarray, int], None, None]:
-    """Convert (index, frame) pairs to (rgb_array, index) pairs."""
+) -> Generator[tuple[np.ndarray, T], None, None]:
+    """Convert pixels while preserving the paired index or metadata."""
     frames, pairs = tee(items, 2)
-    for rgb, (index, _) in zip(_frames_to_rgb((f for _, f in frames), size), pairs, strict=True):
-        yield rgb, index
+    for rgb, (info, _) in zip(_frames_to_rgb((f for _, f in frames), size), pairs, strict=True):
+        yield rgb, info
+
+
+def _stream_frames_to_rgb(frames, size, return_frame_metadata):
+    if not return_frame_metadata:
+        yield from _frames_to_rgb((frame for _, frame in frames), size)
+        return
+    items = ((FrameMetadata(i, frame.pts, frame.time_base), frame) for i, frame in frames)
+    yield from _frames_to_rgb_with_info(items, size)
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -397,7 +422,7 @@ def read_frames_exact(
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
 
             if return_indices:
-                yield from _indexed_frames_to_rgb(indexed, size)
+                yield from _frames_to_rgb_with_info(indexed, size)
             else:
                 yield from _frames_to_rgb((frame for _, frame in indexed), size)
 
@@ -562,17 +587,21 @@ def read_frames_batched(
     )
 
 def read_frames_from_stream(
-    stream: BinaryIO,
+    stream: BinaryIO | av.container.InputContainer,
     skip_frames: int = 0,
     thread_type: str = "AUTO",
     buffer_size: int = 32768, # PyAV default buffer size, can be reduced for lower latency when realtime streaming
     fps: float | None = None,
-) -> tuple[VideoMetadata, Generator[np.ndarray, None, None]]:
+    *,
+    size: FrameSize | None = None,
+    return_frame_metadata: bool = False,
+) -> tuple[VideoMetadata, Generator[np.ndarray | tuple[np.ndarray, FrameMetadata], None, None]]:
     """
     Read frames from a video stream (file-like object).
 
     Args:
-        stream: A file-like object containing video data (e.g., uploaded file).
+        stream: A file-like object containing video data, or an open input container.
+            An open container is read from its current position, without rewinding or closing it.
         skip_frames: Number of initial frames to skip (for resume support).
         thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
         buffer_size: Size of PyAV's internal read buffer in bytes. Smaller values
@@ -582,9 +611,13 @@ def read_frames_from_stream(
             to approximate this rate; never duplicates, so a target at or
             above the source rate returns every frame. None keeps all frames.
 
+        size: Resize native planes before RGB conversion, as in read_frames_exact.
+        return_frame_metadata: Yield (RGB array, FrameMetadata) instead of just the array.
+            Metadata retains native pts/time_base and the decoded index before skip/FPS selection.
+
     Returns:
         A tuple of (VideoMetadata, frame_generator).
-        The generator yields np.ndarray frames in RGB format (H, W, 3).
+        The generator yields RGB arrays (H, W, 3), or (array, FrameMetadata) pairs when requested.
 
     Raises:
         ValueError: If skip_frames is negative or too large. Raised at call
@@ -609,14 +642,19 @@ def read_frames_from_stream(
     skip_frames = _nonnegative_index(skip_frames, "skip_frames")
     _validate_fps(fps)
 
-    seekable = getattr(stream, "seekable", lambda: False)()
+    if size is not None and not isinstance(size, FrameSize):
+        message = "size must be a FrameSize"
+        raise TypeError(message)
+    reused = isinstance(stream, av.container.InputContainer)
+    seekable = not reused and getattr(stream, "seekable", lambda: False)()
 
-    # Not _open_container: the returned generator owns the container, so it
-    # must stay open after this function returns.
-    container = _open_video(stream, buffer_size=buffer_size)
+    # _open_container rewinds reused containers; streaming must preserve their position.
+    # A container opened here stays open until the returned generator closes.
+    container = stream if reused else _open_video(stream, buffer_size=buffer_size)
     try:
-        for s in container.streams.video:
-            s.thread_type = thread_type
+        video = container.streams.video[0]
+        if not video.codec_context.is_open:
+            video.thread_type = thread_type
 
         if seekable and not container.streams.video[0].average_rate:
             # A no-rate file on a seekable stream (uploaded blob, BytesIO)
@@ -639,21 +677,23 @@ def read_frames_from_stream(
             rotation = first_frame.rotation if first_frame is not None else 0
             meta = video_metadata_from_container(container, rotation=rotation)
     except Exception:
-        container.close()
+        if not reused:
+            container.close()
         raise
 
     # Built outside frame_generator so its closure doesn't capture (and pin)
     # the decoded first_frame (~3 MB at 1080p) for the whole read.
     if first_frame is not None:
         decoded = _prepend(first_frame, decoded)
-    frames = islice(decoded, skip_frames, None)
+    frames = islice(enumerate(decoded), skip_frames, None)
     if fps is not None:
-        frames = _select_frames_by_fps(frames, fps)
+        frames = _select_frames_by_fps(frames, fps, get_time=lambda item: item[1].time)
 
-    def frame_generator() -> Generator[np.ndarray, None, None]:
+    def frame_generator():
         try:
-            yield from _frames_to_rgb(frames)
+            yield from _stream_frames_to_rgb(frames, size, return_frame_metadata)
         finally:
-            container.close()
+            if not reused:
+                container.close()
 
     return meta, frame_generator()
