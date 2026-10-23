@@ -284,6 +284,22 @@ def _validate_fps(fps: float | None) -> None:
         raise ValueError(msg)
 
 
+def _read_frame_range(
+    container: av.container.InputContainer, start: int, end: int | None, source_fps: float,
+) -> Iterable[av.VideoFrame]:
+    """Read native frames at inclusive indices, sharing the readers' seek and cadence handling."""
+    stream = container.streams.video[0]
+    did_seek = _seek_near(start, source_fps, stream, container)
+    decoded = container.decode(video=0)
+    if did_seek:
+        origin = float((stream.start_time or 0) * stream.time_base)
+        # guessed_rate recovers the real cadence when average_rate drifts (issue #26), but is
+        # unreliable without average_rate; no-rate sources must use the derived cadence.
+        locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
+        return _select_frames_by_index(decoded, origin, locate_fps, start, end)
+    return islice(decoded, start, end + 1 if end is not None else None)
+
+
 def read_frames_exact(
     src: str | av.container.InputContainer,
     start_frame: int | None = None,
@@ -375,23 +391,7 @@ def read_frames_exact(
             else:
                 target_start, target_end = frame_range
 
-            did_seek = _seek_near(target_start, source_fps, stream, container)
-            decoded = container.decode(video=0)
-            if did_seek:
-                origin = float((stream.start_time or 0) * stream.time_base)
-                # guessed_rate (av_guess_frame_rate) recovers the true cadence
-                # when the header's average_rate drifts from the actual frame
-                # timestamps (issue #26) — average_rate would locate the start
-                # frame off by one past each drift point. But when there is no
-                # average_rate at all, guessed_rate is garbage (the time_base
-                # reciprocal — 1000 on Matroska), so only the derived rate can
-                # locate frames.
-                locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
-                frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
-            else:
-                stop = target_end + 1 if target_end is not None else None
-                frames = islice(decoded, target_start, stop)
-
+            frames = _read_frame_range(container, target_start, target_end, source_fps)
             indexed = enumerate(frames, start=target_start)
             if fps is not None:
                 indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)

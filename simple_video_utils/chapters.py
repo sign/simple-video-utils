@@ -13,9 +13,9 @@ from pathlib import Path
 import av
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.frames import _rotation_filters
+from simple_video_utils.frames import _read_frame_range, _rotation_filters
 from simple_video_utils.metadata import _open_container, _open_video
-from simple_video_utils.slicing import _encode_clip, _iter_packets
+from simple_video_utils.slicing import _encode_frames, _iter_packets
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -164,7 +164,10 @@ def slice_chapters(
     ``end`` may be ``math.inf``. Clips are cut as they are yielded. Raises ``ValueError`` on a file without chapters."""
     with _open(src) as container:
         found = _require_chapters(container)
-        rate = container.streams.video[0].average_rate
+        stream = container.streams.video[0]
+        rate = stream.average_rate
+        if not stream.codec_context.is_open:
+            stream.thread_type = "AUTO"
         for a, b in spans:
             pieces = []
             for chapter in found:
@@ -175,8 +178,9 @@ def slice_chapters(
                 if low < high:
                     first, last = (chapter_first + math.ceil((t - chapter.source) * rate) for t in (low, high))
                     if last > first:  # re-encoded: the file's header describes only its first chapter
-                        clip = _encode_clip(container, float((first + 0.5) / rate), float((last - 0.5) / rate),
-                                            float(rate), size)
+                        with _open_container(container) as source:
+                            frames = _read_frame_range(source, first, last - 1, float(rate))
+                            clip = _encode_frames(frames, rate, last - first, size)
                         source_start = chapter.source + (first - chapter_first) / rate
                         pieces.append((source_start, clip))
             yield pieces

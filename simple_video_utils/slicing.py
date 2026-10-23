@@ -14,13 +14,12 @@ Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
 
 import io
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from fractions import Fraction
-from itertools import takewhile
+from itertools import chain, takewhile
 from typing import BinaryIO, NamedTuple
 
 import av
-import numpy as np
 
 from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.metadata import _open_video, video_metadata
@@ -47,14 +46,6 @@ class Clip(NamedTuple):
     data: bytes
 
 
-def _center_crop_square(frame: np.ndarray) -> np.ndarray:
-    height, width = frame.shape[:2]
-    side = min(height, width)
-    top = (height - side) // 2
-    left = (width - side) // 2
-    return frame[top : top + side, left : left + side]
-
-
 def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
     """An MP4 muxer that puts ``moov`` first: libav reserves the room up front and seeks back into it
     on close (``faststart`` would need a real file). The room bounds the sample tables: ~13 bytes
@@ -64,22 +55,47 @@ def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
 
 def _encode_clip(src: str | av.container.InputContainer,
                  start: float, end: float, fps: float, size: int | None) -> bytes:
-    frames = list(read_frames_exact(src, start_time=start, end_time=end))
-    if not frames:
+    frames = (av.VideoFrame.from_ndarray(frame, format="rgb24")
+              for frame in read_frames_exact(src, start_time=start, end_time=end))
+    samples = int(end * fps) - max(0, int(start * fps)) + 1
+    return _encode_frames(frames, fps, samples, size)
+
+
+def _encode_frames(frames: Iterable[av.VideoFrame], fps: Fraction | float,
+                   samples: int, size: int | None) -> bytes:
+    """Encode a frame iterator without retaining decoded frames; samples bounds the MP4 header reservation."""
+    frames = iter(frames)
+    first = next(frames, None)
+    if first is None:
         return b""
-    height, width = (size, size) if size else frames[0].shape[:2]
+    width, height = (size, size) if size else (first.width, first.height)
+    rate = fps if isinstance(fps, Fraction) else Fraction(fps).limit_denominator(1000)
+    crop, geometry = None, None
     buffer = io.BytesIO()
-    with _mp4(buffer, len(frames)) as output:
-        stream = output.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
+    with _mp4(buffer, samples) as output:
+        stream = output.add_stream("h264", rate=rate)
         stream.width, stream.height = width, height
         stream.pix_fmt = "yuv420p"
-        # One reformatter per clip so the swscale context is built once, not
-        # per frame (same fix as _frames_to_rgb) — byte-identical output.
+        stream.codec_context.color_range = first.color_range
+        stream.codec_context.colorspace = first.colorspace
         reformatter = av.video.reformatter.VideoReformatter()
-        for frame in frames:
-            array = _center_crop_square(frame) if size else frame
-            video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
-            output.mux(stream.encode(reformatter.reformat(video_frame, width=width, height=height)))
+        for index, frame in enumerate(chain((first,), frames)):
+            frame.pts, frame.time_base = index, 1 / rate
+            if size and geometry != (frame.width, frame.height, frame.format.name):
+                geometry = frame.width, frame.height, frame.format.name
+                side = min(frame.width, frame.height)
+                crop = av.filter.Graph()
+                crop.link_nodes(crop.add_buffer(template=frame),
+                                crop.add("crop", f"{side}:{side}:{(frame.width - side) // 2}:"
+                                         f"{(frame.height - side) // 2}:exact=1"), crop.add("buffersink"))
+                crop.configure()
+            if crop is not None:
+                crop.push(frame)
+                frame = crop.pull()
+            video_frame = reformatter.reformat(frame, width=width, height=height, format="yuv420p")
+            video_frame.pts, video_frame.time_base = index, 1 / rate
+            video_frame.pict_type = 0
+            output.mux(stream.encode(video_frame))
         output.mux(stream.encode())
     return buffer.getvalue()
 

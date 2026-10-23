@@ -773,6 +773,56 @@ def test_slice_chapters_reuses_in_memory_input_across_spans_and_calls(tmp_path):
         assert not source.closed
 
 
+def test_slice_chapters_encodes_native_frames_without_rgb_conversion(tmp_path, monkeypatch):
+    from simple_video_utils import frames
+
+    output = _signer_chapters(tmp_path)
+
+    def reject_rgb(*args, **kwargs):
+        pytest.fail("chapter encoding must not convert decoded frames to RGB arrays")
+
+    monkeypatch.setattr(frames, "_frames_to_rgb", reject_rgb)
+    (start, clip), = next(slice_chapters(output, [(0.301, 0.9)], size=32))
+    assert start == Fraction(1, 3)
+    assert _frame_count(clip) == 17
+
+
+def test_slice_chapters_preserves_selected_content_after_a_seek(tmp_path):
+    output = tmp_path / "long.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(0, 130, (0, 0, 48, 48))])
+    with av.open(str(output)) as container:
+        expected = list(container.decode(video=0))[120:123]
+    (start, clip), = next(slice_chapters(output, [(4.0, 4.1)]))
+    assert start == 4
+    with av.open(io.BytesIO(clip)) as container:
+        actual = list(container.decode(video=0))
+    assert len(actual) == len(expected)
+    for frame, original in zip(actual, expected, strict=True):
+        assert np.abs(frame.to_ndarray(format="rgb24").astype(float)
+                      - original.to_ndarray(format="rgb24").astype(float)).mean() < 5
+
+
+def test_slice_chapters_preserves_native_color_range_and_matrix(tmp_path):
+    source = tmp_path / "full-range.mkv"
+    _write_chroma_source(source, "yuv420p", ColorRange.JPEG, colorspace=1)
+    output = tmp_path / "chapter.mkv"
+    write_chapters(source, output, [ChapterClip(0, 1, (0, 0, 32, 32))], crf=0)
+    (_, clip), = next(slice_chapters(output, [(0, 0.04)], size=32))
+    with av.open(io.BytesIO(clip)) as container:
+        assert container.streams.video[0].codec_context.color_range == ColorRange.JPEG
+        assert container.streams.video[0].codec_context.colorspace == 1
+
+
+def test_shared_encoder_handles_dimension_changes_in_an_existing_video_slice(tmp_path):
+    from simple_video_utils.slicing import slice_video
+
+    clip, = slice_video(str(_signer_chapters(tmp_path)), [(0, 2)], size=16)
+    with av.open(io.BytesIO(clip)) as container:
+        frames = list(container.decode(video=0))
+    assert len(frames) == 60
+    assert {(frame.width, frame.height) for frame in frames} == {(16, 16)}
+
+
 def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
     output = _signer_chapters(tmp_path)               # chapter 1 ends at source 1.2 (frame starts every 1/30 s)
     [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there
