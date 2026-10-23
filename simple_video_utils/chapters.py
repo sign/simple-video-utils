@@ -174,7 +174,8 @@ def slice_chapters(
                 if last > first:  # re-encoded: the file's header describes only its first chapter
                     clip = _encode_clip(str(src), float((first + 0.5) / rate), float((last - 0.5) / rate),
                                         float(rate), size)
-                    pieces.append((part[0], clip))
+                    source_start = chapter.source + (first - round(chapter.start * rate)) / rate
+                    pieces.append((source_start, clip))
         yield pieces
 
 

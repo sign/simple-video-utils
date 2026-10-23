@@ -725,6 +725,22 @@ def test_join_chapters_rescales_packet_durations(tmp_path):
                 assert float(packet.duration * packet.time_base) == pytest.approx(1 / 30, abs=0.001)
 
 
+def test_slice_chapters_labels_the_first_retained_source_frame(tmp_path):
+    pieces = next(slice_chapters(_signer_chapters(tmp_path), [(0.301, 0.9)], size=32))
+    (start, clip), = pieces
+    assert start == Fraction(1, 3)
+    assert _frame_count(clip) == 17
+    chapter, = read_chapters(io.BytesIO(join_chapters(pieces)))
+    assert chapter.source == Fraction(333, 1000)
+
+
+def test_slice_chapters_labels_frames_after_a_rounded_chapter_start(tmp_path):
+    output = tmp_path / "rounded-source.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(10, 12, (0, 0, 32, 32)), ChapterClip(40, 47, (0, 0, 32, 32))])
+    (start, _), = next(slice_chapters(output, [(1.36, 1.5)], size=32))
+    assert start == Fraction(41, 30)
+
+
 def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
     output = _signer_chapters(tmp_path)               # chapter 1 ends at source 1.2 (frame starts every 1/30 s)
     [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there
