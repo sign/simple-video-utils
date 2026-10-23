@@ -211,6 +211,7 @@ def join_chapters(pieces: Sequence[tuple[Fraction, bytes]]) -> bytes:
             for packet in group:
                 # Matroska keeps milliseconds; flooring dts keeps it monotonic and never past pts.
                 pts, dts = packet.pts * stream.time_base + shift, packet.dts * stream.time_base + shift
+                packet.duration = round(packet.duration * stream.time_base * 1000)
                 packet.stream, packet.time_base = track, Fraction(1, 1000)
                 packet.pts, packet.dts = round(pts * 1000), math.floor(dts * 1000)
                 destination.mux(packet)

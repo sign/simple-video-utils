@@ -715,6 +715,16 @@ def test_slice_chapters_reencodes_a_joined_file_at_its_own_size(tmp_path):
     assert [_frame_count(d) for _, d in split_chapters(again)] == [6, 12]
 
 
+def test_join_chapters_rescales_packet_durations(tmp_path):
+    pieces = next(slice_chapters(_signer_chapters(tmp_path), [(1.0, 2.2)], size=32))
+    joined = join_chapters(pieces)
+    with av.open(io.BytesIO(joined)) as container:
+        assert container.duration / av.time_base == pytest.approx(0.6, abs=0.001)
+        for packet in container.demux(video=0):
+            if packet.size:
+                assert float(packet.duration * packet.time_base) == pytest.approx(1 / 30, abs=0.001)
+
+
 def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
     output = _signer_chapters(tmp_path)               # chapter 1 ends at source 1.2 (frame starts every 1/30 s)
     [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there
