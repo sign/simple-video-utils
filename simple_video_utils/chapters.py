@@ -168,13 +168,16 @@ def slice_chapters(
     for a, b in spans:
         pieces = []
         for chapter in found:
-            if part := chapter.overlap(_exact(a), _exact(b)):
-                # the frames that START in [low, high); chapter bounds are whole ms, so allow half a ms of slack
-                first, last = (math.ceil((chapter.local(t) - Fraction(1, 2000)) * rate) for t in part)
+            # Only stored chapter bounds are rounded to milliseconds; user bounds stay exact.
+            chapter_first, chapter_last = (round(t * rate) for t in (chapter.start, chapter.end))
+            source_end = chapter.source + (chapter_last - chapter_first) / rate
+            low, high = max(_exact(a), chapter.source), min(_exact(b), source_end)
+            if low < high:
+                first, last = (chapter_first + math.ceil((t - chapter.source) * rate) for t in (low, high))
                 if last > first:  # re-encoded: the file's header describes only its first chapter
                     clip = _encode_clip(str(src), float((first + 0.5) / rate), float((last - 0.5) / rate),
                                         float(rate), size)
-                    source_start = chapter.source + (first - round(chapter.start * rate)) / rate
+                    source_start = chapter.source + (first - chapter_first) / rate
                     pieces.append((source_start, clip))
         yield pieces
 

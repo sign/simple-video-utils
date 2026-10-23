@@ -741,6 +741,24 @@ def test_slice_chapters_labels_frames_after_a_rounded_chapter_start(tmp_path):
     assert start == Fraction(41, 30)
 
 
+@pytest.mark.parametrize(("span", "count", "start"), [
+    ((0.3, 0.3001), 1, Fraction(3, 10)),
+    ((0.2001, 0.201), 0, None),
+    ((0.1999, 0.2001), 1, Fraction(1, 5)),
+    ((0.2999, 0.3), 0, None),
+])
+def test_slice_chapters_respects_exact_half_open_user_bounds(tmp_path, span, count, start):
+    pieces = next(slice_chapters(_signer_chapters(tmp_path), [span], size=32))
+    assert sum(_frame_count(data) for _, data in pieces) == count
+    assert [source for source, _ in pieces] == ([] if start is None else [start])
+
+
+def test_slice_chapters_does_not_extend_a_rounded_chapter_end(tmp_path):
+    output = tmp_path / "rounded-end.mkv"
+    write_chapters(SOURCE, output, [ChapterClip(10, 12, (0, 0, 32, 32)), ChapterClip(40, 47, (0, 0, 32, 32))])
+    assert next(slice_chapters(output, [(0.4, 0.4001)], size=32)) == []
+
+
 def test_slice_chapters_skips_an_overlap_holding_no_frame_start(tmp_path):
     output = _signer_chapters(tmp_path)               # chapter 1 ends at source 1.2 (frame starts every 1/30 s)
     [piece], = slice_chapters(output, [(1.19, 1.9)], size=32)   # 0.01 s of chapter 1: no frame starts there
