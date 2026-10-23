@@ -184,8 +184,12 @@ Aligned padding keeps the source chroma samples without resampling. Unaligned
 crops and full-range sources retain high-depth processing for accurate offsets
 and black borders. Scaling preserves the source color matrix, range and color tags.
 
-`list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
-for frames; its generator accommodates chapters with different dimensions.
+`list_chapters` preserves native PyAV chapter dictionaries and adds `source_start`
+and `source_end` in seconds when the chapter has a source `payload`. These use
+the payload's explicit `rate`, or the video's frame rate. Chapters without a
+source payload keep their native fields. Paths, `io.BytesIO`, and reused open
+containers are supported. Use `read_frames_exact` for frames; its generator
+accommodates chapters with different dimensions.
 
 ### Chapters on the Source Timeline
 

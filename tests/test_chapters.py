@@ -636,6 +636,43 @@ def test_read_chapters_places_each_on_the_source_timeline(tmp_path):
     assert read_chapters(SOURCE) == []
 
 
+def test_list_chapters_preserves_native_fields_and_adds_source_times(tmp_path):
+    output = _signer_chapters(tmp_path)
+    with av.open(str(output)) as container:
+        native = container.chapters()
+        actual = list(list_chapters(container))
+        assert next(container.decode(video=0)).width == 48
+    for chapter, original, start in zip(actual, native, [Fraction(1, 5), Fraction(9, 5)], strict=True):
+        assert {key: chapter[key] for key in original} == original
+        assert (chapter["source_start"], chapter["source_end"]) == (start, start + 1)
+    data = io.BytesIO(output.read_bytes())
+    data.seek(0, io.SEEK_END)
+    assert list(list_chapters(data)) == actual
+    assert list(list_chapters(data)) == actual
+
+
+@pytest.mark.parametrize(("metadata", "expected"), [
+    ({"title": "Introduction"}, None),
+    ({"payload": json.dumps({"start_frame": 1250, "rate": "1000"})}, Fraction(5, 4)),
+])
+def test_list_chapters_handles_native_and_explicit_rate_metadata(tmp_path, metadata, expected):
+    output = tmp_path / "metadata.mkv"
+    with av.open(str(SOURCE)) as source, av.open(str(output), "w") as destination:
+        destination.set_chapters([{"id": 0, "start": 0, "end": 1000, "time_base": Fraction(1, 1000),
+                                   "metadata": metadata}])
+        stream = destination.add_stream_from_template(source.streams.video[0])
+        for packet in source.demux(video=0):
+            if packet.dts is not None:
+                packet.stream = stream
+                destination.mux(packet)
+    chapter, = list_chapters(output)
+    if expected is None:
+        assert "source_start" not in chapter
+        assert "source_end" not in chapter
+    else:
+        assert (chapter["source_start"], chapter["source_end"]) == (expected, expected + 1)
+
+
 def test_split_chapters_yields_each_chapter_from_zero(tmp_path):
     pieces = split_chapters(_signer_chapters(tmp_path))
     chapter, data = next(pieces)  # one chapter at a time

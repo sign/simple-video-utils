@@ -14,7 +14,7 @@ import av
 from av.video.reformatter import ColorRange
 
 from simple_video_utils.frames import _rotation_filters
-from simple_video_utils.metadata import _open_video
+from simple_video_utils.metadata import _open_container, _open_video
 from simple_video_utils.slicing import _encode_clip, _iter_packets
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
@@ -38,10 +38,28 @@ class ChapterClip:
         return self.resolution or (right - left, bottom - top)
 
 
-def list_chapters(src: str | Path) -> Iterator[dict]:
-    """Yield PyAV chapter dictionaries (start/end ticks, time_base and metadata)."""
-    with _open_video(str(src)) as container:
-        yield from container.chapters()
+def list_chapters(src: str | Path | io.BytesIO | av.container.InputContainer) -> Iterator[dict]:
+    """Yield PyAV chapter dictionaries, adding source_start/source_end seconds for source-tagged chapters.
+
+    Native fields and metadata are preserved. Source times come from the JSON payload's start_frame at its
+    explicit rate, or the video's rate. Chapters without a source payload retain only their native fields.
+    """
+    if isinstance(src, Path):
+        src = str(src)
+    if isinstance(src, io.BytesIO):
+        src.seek(0)
+    with _open_container(src) as container:
+        rate = container.streams.video[0].average_rate
+        for chapter in container.chapters():
+            tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+            if "payload" in tags:
+                spec = json.loads(tags["payload"])
+                if "start_frame" in spec:
+                    chapter["source_start"] = spec["start_frame"] / Fraction(spec.get("rate", rate))
+                    chapter["source_end"] = chapter["source_start"] + (
+                        chapter["end"] - chapter["start"]
+                    ) * chapter["time_base"]
+            yield chapter
 
 
 @dataclass(frozen=True)
@@ -78,13 +96,8 @@ def _open(src: Source) -> av.container.InputContainer:
 
 
 def _chapters_of(container: av.container.InputContainer) -> list[Chapter]:
-    rate = container.streams.video[0].average_rate
-    found = []
-    for chapter in container.chapters():
-        spec = json.loads({key.lower(): value for key, value in chapter["metadata"].items()}["payload"])
-        found.append(Chapter(chapter["start"] * chapter["time_base"], chapter["end"] * chapter["time_base"],
-                             spec["start_frame"] / Fraction(spec.get("rate", rate))))
-    return found
+    return [Chapter(chapter["start"] * chapter["time_base"], chapter["end"] * chapter["time_base"],
+                    chapter["source_start"]) for chapter in list_chapters(container)]
 
 
 def _require_chapters(container: av.container.InputContainer) -> list[Chapter]:
