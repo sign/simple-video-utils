@@ -6,11 +6,13 @@ from dataclasses import asdict, dataclass
 from fractions import Fraction
 from itertools import chain, islice
 from pathlib import Path
+from typing import BinaryIO
 
 import av
+import numpy as np
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.frames import _rotation_filters
+from simple_video_utils.frames import FrameSize, _frames_to_rgb, _rotation_filters, _select_frames_by_fps, _validate_fps
 from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
@@ -34,10 +36,77 @@ class ChapterClip:
         return self.resolution or (right - left, bottom - top)
 
 
-def list_chapters(src: str | Path) -> Iterator[dict]:
+def list_chapters(src: str | Path | BinaryIO | av.container.InputContainer) -> Iterator[dict]:
     """Yield PyAV chapter dictionaries (start/end ticks, time_base and metadata)."""
-    with _open_video(str(src)) as container:
+    if isinstance(src, av.container.InputContainer):
+        yield from src.chapters()
+        return
+    with _open_video(str(src) if isinstance(src, Path) else src) as container:
         yield from container.chapters()
+
+
+def read_chapters(
+    src: str | Path | BinaryIO, *, fps: float | None = None, size: FrameSize | None = None,
+) -> Iterator[tuple[dict | None, Fraction, Iterator[np.ndarray]]]:
+    """Yield (native chapter, source start seconds, RGB frame iterator) from one continuous video decode.
+
+    Accepts files and incoming streams whose chapter table precedes the media. Consume each frame iterator
+    before advancing to the next chapter. Frames use half-open chapter times, without estimating indices from
+    average FPS, so non-keyframe boundaries and variable cadence work. Native resize and FPS selection are
+    shared with the frame readers; FPS selection restarts per chapter. Use ``stack_frames(frames)`` for a batch.
+
+    Chapters must not overlap and must have positive duration. A file without chapters yields one iterator
+    with chapter None and source start 0. Source starts default to native times; an optional writer payload
+    maps them to the original source timeline. No intermediate clips are produced.
+    """
+    _validate_fps(fps)
+    if size is not None and not isinstance(size, FrameSize):
+        message = "size must be a FrameSize"
+        raise TypeError(message)
+
+    def convert(frames):
+        selected = _select_frames_by_fps(frames, fps) if fps is not None else frames
+        return _frames_to_rgb(selected, size)
+
+    with _open_video(str(src) if isinstance(src, Path) else src) as container:
+        stream = container.streams.video[0]
+        stream.thread_type = "AUTO"
+        decoded = iter(container.decode(video=0))
+        found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
+        if not found:
+            yield None, Fraction(0), convert(decoded)
+            return
+        frame = next(decoded, None)
+        previous_end = None
+        for chapter in found:
+            low, high = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
+            if high <= low or (previous_end is not None and low < previous_end):
+                message = "chapters must not overlap and must have positive duration"
+                raise ValueError(message)
+            previous_end = high
+
+            def native(low=low, high=high):
+                nonlocal frame
+                while frame is not None:
+                    if frame.pts is not None and frame.pts * frame.time_base >= high:
+                        break
+                    current, frame = frame, next(decoded, None)
+                    if current.pts is not None and current.pts * current.time_base >= low:
+                        yield current
+
+            yield chapter, _source_start(chapter, stream.average_rate), convert(native())
+
+
+def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
+    start = chapter["start"] * chapter["time_base"]
+    tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+    try:
+        payload = json.loads(tags.get("payload", "null"))
+        if isinstance(payload, dict) and "start_frame" in payload:
+            return Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
+    except (ValueError, TypeError, ZeroDivisionError):
+        pass  # unrelated payload tags retain the native chapter timeline
+    return start
 
 
 def write_chapters(

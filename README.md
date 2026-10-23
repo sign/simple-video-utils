@@ -184,8 +184,30 @@ Aligned padding keeps the source chroma samples without resampling. Unaligned
 crops and full-range sources retain high-depth processing for accurate offsets
 and black borders. Scaling preserves the source color matrix, range and color tags.
 
-`list_chapters` yields native PyAV chapter dictionaries. Use `read_frames_exact`
-for frames; its generator accommodates chapters with different dimensions.
+`list_chapters` yields native PyAV chapter dictionaries and also accepts an open container
+without rewinding or closing it. To process each chapter separately:
+
+```python
+from simple_video_utils.chapters import read_chapters
+from simple_video_utils.frames import FrameSize, stack_frames
+
+for chapter, source_start, frames in read_chapters(
+    "chapters.mkv", fps=15, size=FrameSize((256, 256)),
+):
+    process_chapter(chapter, source_start, stack_frames(frames))
+```
+
+`read_chapters` decodes the video continuously once, yielding lazy RGB frame iterators
+for native half-open chapter ranges `[start, end)`. Consume each iterator before requesting
+the next chapter. It supports ordinary chapter metadata in any container PyAV can read;
+no signer payload is required. Incoming file objects work when the chapter table precedes
+the media. Ranges must have positive duration and must not overlap.
+
+FPS selection restarts per chapter, and `size` uses the same native-plane resizing as the
+frame readers. `source_start` is a `Fraction` in seconds: the native chapter start unless
+the writer's optional payload supplies `start_frame` (and optionally `rate`). Without
+chapters it yields one `(None, 0, frames)` entry covering the whole video. No clips are
+encoded or temporary files created.
 
 ### Remote Videos
 
