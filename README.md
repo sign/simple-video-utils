@@ -62,7 +62,7 @@ frames = read_frames_batched("video.mp4", size=FrameSize((256, 256)))
 frames = read_frames_batched("video.mp4", size=FrameSize((512, 512), method=Interpolation.BICUBIC))
 ```
 
-Both `read_frames_exact` and `read_frames_batched` accept `size`. Resolution is in display orientation;
+`read_frames_exact`, `read_frames_batched` and `read_frames_from_stream` accept `size`. Resolution is in display orientation;
 the default method is `Interpolation.AREA`. Without `size`, each frame keeps its original dimensions.
 Supply `size` to batch across chapters with different dimensions. Native-plane resizing can produce different
 RGB pixels from resizing after RGB conversion, since chroma is resized at the source pixel format's resolution.
@@ -102,6 +102,26 @@ with open("video.mp4", "rb") as f:
         # Process each frame (numpy array)
         pass
 ```
+
+Pass `return_frame_metadata=True` for native timing and decoded indices:
+
+```python
+from simple_video_utils.frames import FrameSize, read_frames_from_stream
+
+with open("video.mp4", "rb") as stream:
+    meta, frames = read_frames_from_stream(
+        stream, fps=15, size=FrameSize((256, 256)), return_frame_metadata=True,
+    )
+    for frame, info in frames:
+        process(frame, info.index, info.time)
+```
+
+`FrameMetadata` contains `index`, `pts`, and `time_base`; its `time` property is exact
+seconds as a `Fraction`, or `None` when timing is unavailable. Indices count decoded
+frames from the start of the read, before skipping or FPS selection. Metadata describes
+the original frame even when pixels are resized or rotated. The default still yields
+arrays only. An already-open PyAV input container can also be passed; the streaming
+reader preserves its position and leaves it open, without seeking for FPS recovery.
 
 ### Slice into Clips
 
@@ -197,7 +217,7 @@ for chapter, source_start, frames in read_chapters(
     process_chapter(chapter, source_start, stack_frames(frames))
 ```
 
-`read_chapters` decodes the video continuously once, yielding lazy RGB frame iterators
+`read_chapters` reuses `read_frames_from_stream` with frame metadata, yielding lazy RGB frame iterators
 for native half-open chapter ranges `[start, end)`. Consume each iterator before requesting
 the next chapter. It supports ordinary chapter metadata in any container PyAV can read;
 no signer payload is required. Incoming file objects work when the chapter table precedes

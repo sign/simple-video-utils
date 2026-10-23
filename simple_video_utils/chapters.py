@@ -12,7 +12,13 @@ import av
 import numpy as np
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.frames import FrameSize, _frames_to_rgb, _rotation_filters, _select_frames_by_fps, _validate_fps
+from simple_video_utils.frames import (
+    FrameSize,
+    _rotation_filters,
+    _select_frames_by_fps,
+    _validate_fps,
+    read_frames_from_stream,
+)
 from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
@@ -64,17 +70,18 @@ def read_chapters(
         message = "size must be a FrameSize"
         raise TypeError(message)
 
-    def convert(frames):
-        selected = _select_frames_by_fps(frames, fps) if fps is not None else frames
-        return _frames_to_rgb(selected, size)
+    def select(frames):
+        selected = _select_frames_by_fps(frames, fps, get_time=lambda item: item[1].time) if fps is not None else frames
+        return (array for array, _ in selected)
 
     with _open_video(str(src) if isinstance(src, Path) else src) as container:
         stream = container.streams.video[0]
-        stream.thread_type = "AUTO"
-        decoded = iter(container.decode(video=0))
         found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
+        _, decoded = read_frames_from_stream(
+            container, size=size, fps=None if found else fps, return_frame_metadata=bool(found),
+        )
         if not found:
-            yield None, Fraction(0), convert(decoded)
+            yield None, Fraction(0), decoded
             return
         frame = next(decoded, None)
         previous_end = None
@@ -85,16 +92,16 @@ def read_chapters(
                 raise ValueError(message)
             previous_end = high
 
-            def native(low=low, high=high):
+            def chapter_frames(low=low, high=high):
                 nonlocal frame
                 while frame is not None:
-                    if frame.pts is not None and frame.pts * frame.time_base >= high:
+                    if frame[1].time is not None and frame[1].time >= high:
                         break
                     current, frame = frame, next(decoded, None)
-                    if current.pts is not None and current.pts * current.time_base >= low:
+                    if current[1].time is not None and current[1].time >= low:
                         yield current
 
-            yield chapter, _source_start(chapter, stream.average_rate), convert(native())
+            yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
 
 
 def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
