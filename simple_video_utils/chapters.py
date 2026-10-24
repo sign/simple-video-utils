@@ -106,6 +106,29 @@ def read_chapters(
             yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
 
 
+class Timeline:
+    """Seconds on a chaptered video <-> seconds on its source, through each chapter's payload ``start_frame``.
+
+    A source time inside a gap between chapters lands where the next chapter starts. A video without chapters maps to
+    itself.
+    """
+
+    def __init__(self, src: str | Path | BinaryIO):
+        with _open_video(str(src) if isinstance(src, Path) else src) as container:
+            rate = container.streams.video[0].average_rate
+            spans = [(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate))
+                     for c in container.chapters()]
+        self.start, self.end, self.source = np.array(spans or [(0, np.inf, 0)], dtype=float).T
+
+    def to_file(self, t: float) -> float:
+        i = max(int(np.searchsorted(self.source, t, side="right")) - 1, 0)
+        return float(min(self.start[i] + max(t - self.source[i], 0), self.end[i]))
+
+    def to_source(self, t: float | np.ndarray) -> float | np.ndarray:
+        i = np.maximum(np.searchsorted(self.start, t, side="right") - 1, 0)
+        return self.source[i] + t - self.start[i]
+
+
 def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
     start = chapter["start"] * chapter["time_base"]
     tags = {key.lower(): value for key, value in chapter["metadata"].items()}

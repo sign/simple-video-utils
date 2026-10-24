@@ -166,7 +166,7 @@ video = join_videos(clips)
 ```python
 import json
 
-from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.chapters import ChapterClip, Timeline, list_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 write_chapters("video.mp4", "chapters.mkv", [
@@ -182,6 +182,10 @@ for chapter in list_chapters("chapters.mkv"):
 
 for frame in read_frames_exact("chapters.mkv"):
     process(frame)  # each chapter can have a different frame shape
+
+timeline = Timeline("chapters.mkv")
+timeline.to_file(3.0)     # a source second on the file; inside a gap, the next chapter's start
+timeline.to_source(1.2)   # a file second (or an array of them) on the source
 ```
 
 Pass nonempty clips from a video with a nominal frame rate and an
