@@ -183,7 +183,7 @@ for chapter in list_chapters("chapters.mkv"):
 for frame in read_frames_exact("chapters.mkv"):
     process(frame)  # each chapter can have a different frame shape
 
-timeline = Timeline("chapters.mkv")
+timeline = Timeline.read("chapters.mkv")  # Timeline(timeline.chapters) rebuilds it without the file
 timeline.to_file(3.0)     # a source second on the file; inside a gap, the next chapter's start
 timeline.to_source(1.2)   # a file second (or an array of them) on the source
 ```

@@ -113,15 +113,23 @@ class Timeline:
     itself.
     """
 
-    def __init__(self, src: str | Path | BinaryIO):
-        with _open_video(str(src) if isinstance(src, Path) else src) as container:
-            rate = container.streams.video[0].average_rate
-            spans = [(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate))
-                     for c in container.chapters()]
-        start, end, source = np.array(spans, dtype=float).reshape(-1, 3).T
+    def __init__(self, chapters: Sequence[tuple[float, float, float]] = ()):
+        """``chapters``: (file start, file end, source start) seconds each, as ``Timeline.read`` finds them.
+
+        Saved ``chapters`` rebuild a timeline without reopening the video, e.g. from a metadata index.
+        """
+        self.chapters = np.array(chapters, dtype=float).reshape(-1, 3)
+        start, end, source = self.chapters.T
         self.file = np.c_[start, end].ravel()  # each chapter's ends, on the file and on the source
         # milliseconds-rounded chapter ends can overlap the next chapter's source start
         self.source = np.maximum.accumulate(np.c_[source, source + end - start].ravel())
+
+    @classmethod
+    def read(cls, src: str | Path | BinaryIO) -> "Timeline":
+        with _open_video(str(src) if isinstance(src, Path) else src) as container:
+            rate = container.streams.video[0].average_rate
+            return cls([(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate))
+                        for c in container.chapters()])
 
     def to_file(self, t: float) -> float:
         return float(np.interp(t, self.source, self.file)) if len(self.file) else t

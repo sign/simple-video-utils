@@ -635,9 +635,10 @@ def test_timeline_maps_source_and_file_seconds(tmp_path):
     write_chapters(SOURCE, output, [ChapterClip(30, 60, (0, 0, 64, 64)), ChapterClip(90, 120, (0, 0, 64, 64))])
     with av.open(str(SOURCE)) as container:
         rate = float(container.streams.video[0].average_rate)
-    timeline = Timeline(output)
+    timeline = Timeline.read(output)
     one = 30 / rate  # one chapter's length, in seconds
     assert timeline.to_file(45 / rate) == pytest.approx(15 / rate, abs=1e-3)
     assert timeline.to_file(70 / rate) == pytest.approx(one, abs=1e-3)  # inside the gap: the next chapter's start
     assert timeline.to_source(one + 5 / rate) == pytest.approx(95 / rate, abs=1e-3)
-    assert Timeline(SOURCE).to_file(1.5) == 1.5
+    assert Timeline.read(SOURCE).to_file(1.5) == 1.5
+    assert Timeline(timeline.chapters.tolist()).to_file(45 / rate) == timeline.to_file(45 / rate)
