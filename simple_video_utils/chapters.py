@@ -118,15 +118,16 @@ class Timeline:
             rate = container.streams.video[0].average_rate
             spans = [(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate))
                      for c in container.chapters()]
-        self.start, self.end, self.source = np.array(spans or [(0, np.inf, 0)], dtype=float).T
+        start, end, source = np.array(spans, dtype=float).reshape(-1, 3).T
+        self.file = np.c_[start, end].ravel()  # each chapter's ends, on the file and on the source
+        # milliseconds-rounded chapter ends can overlap the next chapter's source start
+        self.source = np.maximum.accumulate(np.c_[source, source + end - start].ravel())
 
     def to_file(self, t: float) -> float:
-        i = max(int(np.searchsorted(self.source, t, side="right")) - 1, 0)
-        return float(min(self.start[i] + max(t - self.source[i], 0), self.end[i]))
+        return float(np.interp(t, self.source, self.file)) if len(self.file) else t
 
     def to_source(self, t: float | np.ndarray) -> float | np.ndarray:
-        i = np.maximum(np.searchsorted(self.start, t, side="right") - 1, 0)
-        return self.source[i] + t - self.start[i]
+        return np.interp(t, self.file, self.source) if len(self.file) else t
 
 
 def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
