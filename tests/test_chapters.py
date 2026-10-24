@@ -642,3 +642,8 @@ def test_timeline_maps_source_and_file_seconds(tmp_path):
     assert timeline.to_source(one + 5 / rate) == pytest.approx(95 / rate, abs=1e-3)
     assert Timeline.read(SOURCE).to_file(1.5) == 1.5
     assert Timeline(timeline.chapters.tolist()).to_file(45 / rate) == timeline.to_file(45 / rate)
+
+
+def test_timeline_rejects_out_of_order_chapters():
+    with pytest.raises(AssertionError):
+        Timeline([(0, 1, 5), (1, 2, 3)])

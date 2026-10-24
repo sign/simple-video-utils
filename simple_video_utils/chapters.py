@@ -120,6 +120,7 @@ class Timeline:
         """
         self.chapters = np.array(chapters, dtype=float).reshape(-1, 3)
         start, end, source = self.chapters.T
+        assert (np.diff(source) >= 0).all(), f"chapters must run forward on the source: {source}"
         self.file = np.c_[start, end].ravel()  # each chapter's ends, on the file and on the source
         # milliseconds-rounded chapter ends can overlap the next chapter's source start
         self.source = np.maximum.accumulate(np.c_[source, source + end - start].ravel())
