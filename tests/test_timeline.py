@@ -149,3 +149,23 @@ def test_stream_windows_report_source_starts_and_skip_removed_gaps(chaptered):
     for clip in clips:
         with av.open(io.BytesIO(clip.data)) as container:
             assert sum(1 for _ in container.decode(video=0)) == 15
+
+
+@pytest.mark.parametrize("size", [None, 64])
+def test_gap_spanning_slices_preserve_source_timing_on_copy_and_resize(chaptered, size):
+    [clip] = slice_video(chaptered, [(1, 3.5)], size=size)
+    with av.open(io.BytesIO(clip)) as container:
+        frames = list(container.decode(video=0))
+    assert len(frames) == 30
+    assert frames[0].time == 0
+    assert frames[15].time == pytest.approx(2, abs=0.001)
+    assert frames[-1].time == pytest.approx(2 + 14 / 30, abs=0.001)
+
+
+def test_stream_window_preserves_an_internal_source_gap(chaptered):
+    with open(chaptered, "rb") as file:
+        [clip] = slice_video_stream(file, duration=4)
+    with av.open(io.BytesIO(clip.data)) as container:
+        frames = list(container.decode(video=0))
+    assert len(frames) == 30
+    assert frames[15].time - frames[0].time == pytest.approx(2, abs=0.001)

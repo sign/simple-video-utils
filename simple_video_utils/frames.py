@@ -311,19 +311,33 @@ def _stream_frames_to_rgb(frames, size, return_frame_metadata, timeline):
     yield from _frames_to_rgb_with_info(items, size)
 
 
+def _frame_source_time(timeline, frame):
+    if frame.pts is None or frame.time_base is None:
+        return None
+    return timeline.to_source(frame.pts * frame.time_base)
+
+
 def _select_frames_by_time(frames, start, end, timeline):
     low = Fraction(str(max(start or 0, 0)))
     high = Fraction(str(end)) if end is not None else None
     for index, frame in frames:
-        if frame.pts is None or frame.time_base is None:
+        time = _frame_source_time(timeline, frame)
+        if time is None:
             continue
-        time = timeline.to_source(frame.pts * frame.time_base)
         # Native chapter/packet times are rounded to the container's clock.
         tolerance = frame.time_base / 2
         if high is not None and time - tolerance > high:
             break
         if time + tolerance >= low:
             yield index, frame
+
+
+def _read_time_range(container, timeline, start, end, *, seek):
+    if seek:
+        stream = container.streams.video[0]
+        file_start = timeline.to_file(max(start or 0, 0))
+        container.seek(round(file_start / stream.time_base), stream=stream, backward=True)
+    return _select_frames_by_time(enumerate(container.decode(video=0)), start, end, timeline)
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -423,18 +437,14 @@ def read_frames_exact(
 
             if has_time_params and timeline.chapters:
                 # Source seconds are not decoded-frame indices in a packed or sparse file.
-                if not return_indices:
-                    file_start = timeline.to_file(max(start_time or 0, 0))
-                    container.seek(round(file_start / stream.time_base), stream=stream, backward=True)
-                indexed = _select_frames_by_time(enumerate(container.decode(video=0)), start_time, end_time, timeline)
+                indexed = _read_time_range(container, timeline, start_time, end_time, seek=not return_indices)
             else:
                 target_start, target_end = (_convert_time_to_frames(start_time, end_time, source_fps)
                                             if has_time_params else frame_range)
                 indexed = _read_frame_range(container, target_start, target_end, source_fps, seek=not timeline.chapters)
             if fps is not None:
                 indexed = _select_frames_by_fps(
-                    indexed, fps, get_time=lambda item: timeline.to_source(item[1].pts * item[1].time_base)
-                    if item[1].pts is not None and item[1].time_base is not None else None,
+                    indexed, fps, get_time=lambda item: _frame_source_time(timeline, item[1]),
                 )
 
             if return_indices:
@@ -724,10 +734,7 @@ def read_frames_from_stream(
         decoded = _prepend(first_frame, decoded)
     frames = islice(enumerate(decoded), skip_frames, None)
     if fps is not None:
-        frames = _select_frames_by_fps(
-            frames, fps, get_time=lambda item: timeline.to_source(item[1].pts * item[1].time_base)
-            if item[1].pts is not None and item[1].time_base is not None else None,
-        )
+        frames = _select_frames_by_fps(frames, fps, get_time=lambda item: _frame_source_time(timeline, item[1]))
 
     def frame_generator():
         try:

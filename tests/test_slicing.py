@@ -80,6 +80,18 @@ def test_slice_chaptered_video_uses_source_times(tmp_path, first, size):
         list(slice_video(str(chaptered), [(2.0, 2.5)], size=size))
 
 
+@pytest.mark.parametrize("size", [None, 64])
+def test_chapter_rounding_does_not_reject_the_exact_source_end(tmp_path, size):
+    source = _write_video(tmp_path / "source.mp4", frames=60, width=32, height=32)
+    chaptered = tmp_path / "chapters.mkv"
+    write_chapters(source, chaptered, [ChapterClip(50, 60, (0, 0, 32, 32))])
+    [clip] = slice_video(str(chaptered), [(1.9, 2.0)], size=size)
+    with av.open(io.BytesIO(clip)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 3
+    with pytest.raises(ValueError, match="out of range"):
+        list(slice_video(str(chaptered), [(1.9, 2.01)], size=size))
+
+
 def test_matching_size_is_copied(tmp_path):
     # Source is already 128x128, so size=128 needs no re-encode.
     square = _write_video(tmp_path / "square.mp4", width=128, height=128, frames=15)

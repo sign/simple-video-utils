@@ -248,6 +248,7 @@ No inference-side offset conversion is needed.
 Frame indices still count retained decoded frames. A time range entirely within a removed
 gap yields no frames (`slice_video` raises `ValueError` for an empty slice). FPS selection
 uses source-video time, and streaming slices report their window starts on that timeline.
+Copied and resized chapter slices preserve internal source-time gaps in their output timestamps.
 Native chapter dictionaries, `FrameMetadata.pts`, `time_base`, and `file_time` retain stored
 timestamps. `VideoMetadata.duration` describes the stored media; slice validation translates
 its endpoint to source time.
