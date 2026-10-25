@@ -6,6 +6,9 @@ import av
 import numpy as np
 import pytest
 
+from simple_video_utils import chapters as chapter_utils
+from simple_video_utils import frames as frame_utils
+from simple_video_utils import slicing as slicing_utils
 from simple_video_utils.chapters import read_chapters
 from simple_video_utils.frames import read_frames_batched, read_frames_exact, read_frames_from_stream
 from simple_video_utils.slicing import slice_video, slice_video_stream
@@ -169,3 +172,84 @@ def test_stream_window_preserves_an_internal_source_gap(chaptered):
         frames = list(container.decode(video=0))
     assert len(frames) == 30
     assert frames[15].time - frames[0].time == pytest.approx(2, abs=0.001)
+
+
+@pytest.mark.parametrize(("rate", "length"), [(Fraction(30), 2), (Fraction(30000, 1001), 2), (Fraction(48), 3)])
+def test_rounded_chapter_boundaries_use_the_decoded_video_clock(tmp_path, monkeypatch, rate, length):
+    path = str(tmp_path / "packed.mp4")
+    with av.open(path, "w") as output:
+        stream = output.add_stream("libx264", rate=rate)
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.max_b_frames = 0
+        for index in range(length + 3):
+            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), index * 30, np.uint8), format="rgb24")
+            frame.pts, frame.time_base = index, 1 / rate
+            output.mux(stream.encode(frame))
+        output.mux(stream.encode())
+    # Exercise real decoded timestamps finer than the writer's millisecond chapter table.
+    # MP4 does not retain arbitrary chapter tags, so attach that table to the open input.
+    def open_with_chapters(src):
+        container = av.open(src)
+        container.set_chapters([
+            {"id": i, "start": int(start * 1000 / rate + Fraction(1, 2)),
+             "end": int(end * 1000 / rate + Fraction(1, 2)), "time_base": Fraction(1, 1000),
+             "metadata": {"payload": json.dumps({"start_frame": original})}}
+            for i, (start, end, original) in enumerate(((0, length, 0), (length, length + 3, 90)))
+        ])
+        return container
+
+    with open_with_chapters(path) as container:
+        timeline = Timeline.read(container)
+        decoded = list(container.decode(video=0))
+        native = decoded[length].pts * decoded[length].time_base
+        assert timeline.to_source(native) == 90 / rate
+        assert timeline.to_file(90 / rate) == native
+        expected = [frame.to_ndarray(format="rgb24") for frame in decoded[length:length + 2]]
+        arrays = list(read_frames_exact(container, start_time=float(90 / rate), end_time=float(91 / rate)))
+        np.testing.assert_array_equal(arrays, expected)
+        container.seek(0)
+        _, frames = read_frames_from_stream(container, return_frame_metadata=True)
+        info = [info for _, info in frames]
+        assert info[length].time == 90 / rate
+
+    monkeypatch.setattr(chapter_utils, "_open_video", open_with_chapters)
+    result = [(start, len(list(frames))) for _, start, frames in read_chapters(path)]
+    assert result == [(0, length), (90 / rate, 3)]
+    monkeypatch.setattr(slicing_utils, "_open_video", open_with_chapters)
+    for size in (None, 64):
+        [clip] = slice_video(path, [(float(90 / rate), float(91 / rate))], size=size)
+        with av.open(io.BytesIO(clip)) as container:
+            actual = list(container.decode(video=0))
+        assert len(actual) == 2
+        assert actual[0].to_ndarray(format="rgb24").mean() == pytest.approx(expected[0].mean(), abs=3)
+
+
+def test_ordinary_chapter_markers_keep_fast_frame_index_seeking(tmp_path, monkeypatch):
+    path = str(tmp_path / "movie.mkv")
+    with av.open(path, "w") as output:
+        output.set_chapters([
+            {"id": i, "start": i * 2500, "end": (i + 1) * 2500, "time_base": Fraction(1, 1000),
+             "metadata": {"title": str(i)}} for i in range(2)
+        ])
+        stream = output.add_stream("libx264", rate=30)
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        for index in range(150):
+            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), index, np.uint8), format="rgb24")
+            output.mux(stream.encode(frame))
+        output.mux(stream.encode())
+    with av.open(path) as container:
+        expected = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)][125:131]
+    seek = frame_utils._seek_near
+    sought = []
+
+    def track_seek(*args):
+        result = seek(*args)
+        sought.append(result)
+        return result
+
+    monkeypatch.setattr(frame_utils, "_seek_near", track_seek)
+    actual = list(read_frames_exact(path, start_frame=125, end_frame=130))
+    assert sought == [True]
+    np.testing.assert_array_equal(actual, expected)

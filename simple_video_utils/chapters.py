@@ -85,8 +85,11 @@ def read_chapters(
             yield None, Fraction(0), decoded
             return
         frame = next(decoded, None)
-        for chapter in found:
-            low, high = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
+        spans = timeline.chapters or tuple(
+            (c["start"] * c["time_base"], c["end"] * c["time_base"], c["start"] * c["time_base"])
+            for c in found
+        )
+        for chapter, (low, high, _) in zip(found, spans, strict=True):
 
             def chapter_frames(low=low, high=high):
                 nonlocal frame

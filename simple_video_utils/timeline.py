@@ -40,6 +40,8 @@ class Timeline:
     ``chapters`` contains (file start, file end, source start) triples. Within a
     chapter only the offset changes. Gaps interpolate between chapter boundaries;
     a removed source gap maps to one file boundary. Without chapters the map is identity.
+    ``read`` aligns writer boundaries to the decoded video clock and ignores ordinary
+    chapter markers without source payloads.
     """
 
     def __init__(self, chapters: Sequence[tuple] = ()):
@@ -60,10 +62,23 @@ class Timeline:
         if not isinstance(src, av.container.InputContainer):
             with _open_video(str(src) if isinstance(src, Path) else src) as container:
                 return cls.read(container)
-        rate = src.streams.video[0].average_rate
+        stream = src.streams.video[0]
+        rate = stream.average_rate
         chapters = sorted(src.chapters(), key=lambda c: c["start"] * c["time_base"])
-        return cls([(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate))
-                    for c in chapters])
+        spans = []
+        mapped = False
+        for chapter in chapters:
+            start, end = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
+            source = _source_start(chapter, rate)
+            if source is not None:
+                mapped = True
+                if rate and stream.time_base:
+                    # The writer rounds chapter ticks, but decoded frames use the video clock.
+                    start, end = (_file_boundary(t, rate, stream.time_base) for t in (start, end))
+            spans.append((start, end, start if source is None else source))
+        timeline = cls(spans)
+        # Ordinary chapter markers need neither mapping nor special frame-index reads.
+        return timeline if mapped else cls()
 
     def _map(self, value, source: bool):
         if isinstance(value, np.ndarray):
@@ -94,8 +109,12 @@ class Timeline:
         return self._map(time, False)
 
 
-def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
-    start = chapter["start"] * chapter["time_base"]
+def _file_boundary(time: Fraction, rate: Fraction, time_base: Fraction) -> Fraction:
+    frame_time = Fraction(round(time * rate)) / rate
+    return int(frame_time / time_base + Fraction(1, 2)) * time_base
+
+
+def _source_start(chapter: dict, rate: Fraction | None) -> Fraction | None:
     tags = {key.lower(): value for key, value in chapter["metadata"].items()}
     try:
         payload = json.loads(tags.get("payload", "null"))
@@ -103,4 +122,4 @@ def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
             return Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
     except (ValueError, TypeError, ZeroDivisionError):
         pass  # unrelated payload tags retain the native chapter timeline
-    return start
+    return None
