@@ -22,7 +22,7 @@ from typing import BinaryIO, NamedTuple
 import av
 import numpy as np
 
-from simple_video_utils.frames import read_frames_exact
+from simple_video_utils.frames import read_frames_exact, read_frames_from_stream
 from simple_video_utils.metadata import _open_video, video_metadata
 
 # MP4 output hides each clip's keyframe lead-in behind an edit list, keeping
@@ -63,7 +63,18 @@ def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
 
 
 def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None) -> bytes:
-    frames = list(read_frames_exact(src, start_time=start, end_time=end))
+    with _open_video(src) as container:
+        if container.chapters():
+            # Sparse chapter timelines cannot be selected by counting decoded frames.
+            stream = container.streams.video[0]
+            start_pts, end_pts = _stream_pts(start, stream), _stream_pts(end, stream)
+            container.seek(start_pts, stream=stream, backward=True)
+            _, decoded = read_frames_from_stream(container, return_frame_metadata=True)
+            low, high = start_pts * stream.time_base, end_pts * stream.time_base
+            frames = [array for array, meta in takewhile(lambda item: item[1].time <= high, decoded)
+                      if meta.time >= low]
+        else:
+            frames = list(read_frames_exact(src, start_time=start, end_time=end))
     if not frames:
         return b""
     height, width = (size, size) if size else frames[0].shape[:2]
@@ -107,7 +118,9 @@ def _stream_pts(seconds: float, stream: av.VideoStream) -> int:
     round, not int: a frame landing exactly on a boundary must not be
     excluded by float noise in the division.
     """
-    return round(seconds / stream.time_base) + (stream.start_time or 0)
+    # Chapter boundaries use the container clock, including any gap before the first frame.
+    origin = 0 if stream.container.chapters() else (stream.start_time or 0)
+    return round(seconds / stream.time_base) + origin
 
 
 def _window(packets: list[av.Packet], start: int) -> list[av.Packet]:
@@ -166,6 +179,9 @@ def slice_video(
     source that is already that size (and unrotated) is stream-copied instead.
     Every slice must be within the video (``0 <= start <= end <= duration``);
     an out-of-range or empty slice raises ``ValueError``.
+
+    Chaptered files use the native chapter clock, preserving source-time gaps from
+    ``write_chapters``. Other files use seconds from the first video frame.
 
     Stream-copied clips keep the lead-in from the keyframe before ``start``
     and a few trailing frames past ``end``; an edit list hides them, so

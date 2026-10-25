@@ -190,15 +190,21 @@ end; boxes are integer `(left, top, right, bottom)` display coordinates.
 Source frames are rotated upright before cropping and padding.
 Box areas outside the source frame become black. `resolution=(width, height)`
 resizes the crop to exactly that size; the default keeps the box size.
-Clips play consecutively, and chapter payload tags retain their source specs.
+Clips must be in source order without overlaps. Chapter boundaries and frame timestamps
+keep each clip at `start_frame / fps` through `end_frame / fps` on the source timeline.
+Gaps contain no encoded filler frames; a player can hold the previous frame until the
+next chapter starts. Chapter payload tags retain their source specs.
 Chapter boundaries use Matroska's millisecond clock. A source that ends before
 a requested trim finishes raises `ValueError`.
 
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
 at `crf=23`, using the source frame rate and pixel format. Each chapter's output
 width and height must be multiples of 16, otherwise `ValueError` is raised. The
-destination must not already exist. Clips in source order share one decode; a clip
-starting before the previous one's end decodes from the start again.
+destination must not already exist. All clips share one source decode.
+
+This replaces the previous packed timeline: regenerate existing chapter files to get
+source-time gaps. `slice_video` uses native chapter times for chaptered inputs, including
+when the first chapter starts after zero; other inputs remain relative to the first video frame.
 
 Aligned padding keeps the source chroma samples without resampling. Unaligned
 crops and full-range sources retain high-depth processing for accurate offsets

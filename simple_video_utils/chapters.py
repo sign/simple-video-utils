@@ -127,7 +127,7 @@ def write_chapters(
     preset: str = "medium",
     thread_type: str = "AUTO",
 ) -> None:
-    """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
+    """Write crops and trims on the source timeline, preserving gaps without encoding filler frames.
 
     Output must not exist, and a failed write removes it. Coordinates refer to the displayed frame, rotation applied,
     as ``video_metadata`` and the frame readers report it, and a rotated source's chapters come out upright.
@@ -138,6 +138,9 @@ def write_chapters(
     # clips are checked before the source is decoded or the output created, so a bad clip costs nothing
     if not clips:
         message = "write_chapters needs at least one clip"
+        raise ValueError(message)
+    if any(left.end_frame > right.start_frame for left, right in pairwise(clips)):
+        message = "clips must be in source order and must not overlap"
         raise ValueError(message)
     for clip in clips:
         left, top, right, bottom = clip.box
@@ -159,16 +162,13 @@ def write_chapters(
             message = "Video has no frame rate information"
             raise ValueError(message)
         chapters = []
-        offset = 0
         for clip in clips:
-            end = offset + clip.end_frame - clip.start_frame
             chapters.append({
                 "id": len(chapters),
-                "start": int(offset * 1000 / rate + Fraction(1, 2)),
-                "end": int(end * 1000 / rate + Fraction(1, 2)),
+                "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
+                "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)),
                 "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
             })
-            offset = end
         with open(out, "xb") as file:
             try:
                 with av.open(file, mode="w", format="matroska") as destination:
@@ -181,19 +181,14 @@ def write_chapters(
                     first = next(decoded, None)
                     rotation = 0 if first is None else first.rotation % 360
                     decoded = chain(() if first is None else (first,), decoded)
-                    source_end = output_start = 0
+                    source_end = 0
                     for clip in clips:
-                        if clip.start_frame < source_end:
-                            source.seek(0, stream=stream)
-                            decoded = source.decode(stream)
-                            source_end = 0
                         # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
                         frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
                         _write_clip(
-                            stream, track, clip, frames, output_start, crf, preset, rate=rate, rotation=rotation,
+                            stream, track, clip, frames, crf, preset, rate=rate, rotation=rotation,
                         )
                         source_end = clip.end_frame
-                        output_start += clip.end_frame - clip.start_frame
             except BaseException:
                 # a trim past the source's end, an unencodable pixel format or an interrupt leaves a truncated MKV,
                 # which "xb" would then refuse to overwrite on retry
@@ -215,7 +210,6 @@ def _write_clip(
     track: av.VideoStream,
     clip: ChapterClip,
     frames: Iterator[av.VideoFrame],
-    start: int,
     crf: int,
     preset: str,
     rate: Fraction,
@@ -283,7 +277,7 @@ def _write_clip(
     # Independent encoders must not reorder packets across chapter boundaries.
     encoder.max_b_frames = 0
     encoder.options = {"crf": str(crf), "preset": preset}
-    indices = range(start, start + clip.end_frame - clip.start_frame)
+    indices = range(clip.start_frame, clip.end_frame)
     for index, frame in zip(indices, frames, strict=True):
         graph.push(frame)
         cropped = graph.pull()

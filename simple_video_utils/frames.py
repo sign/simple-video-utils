@@ -496,13 +496,16 @@ def _count_and_rate_cached(src: str) -> tuple[int, float]:
 
 def _header_frames(container: av.container.InputContainer, stream: av.VideoStream, fps: float) -> int:
     """
-    Estimate missing frame counts from duration; this only sizes the batch.
+    Estimate missing frame counts from chapter spans or duration; this only sizes the batch.
 
     Counting packets via video_metadata would scan the whole file.
     """
     if stream.frames or not fps:
         return stream.frames
-    if stream.duration and stream.time_base:
+    chapters = container.chapters()
+    if chapters:
+        seconds = float(sum((chapter["end"] - chapter["start"]) * chapter["time_base"] for chapter in chapters))
+    elif stream.duration and stream.time_base:
         seconds = float(stream.duration * stream.time_base)
     else:
         seconds = (container.duration or 0) / av.time_base
