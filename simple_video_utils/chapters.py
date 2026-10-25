@@ -20,6 +20,7 @@ from simple_video_utils.frames import (
     read_frames_from_stream,
 )
 from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
+from simple_video_utils.timeline import Timeline
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -75,14 +76,8 @@ def read_chapters(
         return (array for array, _ in selected)
 
     with _open_video(str(src) if isinstance(src, Path) else src) as container:
-        stream = container.streams.video[0]
+        timeline = Timeline.read(container)
         found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
-        if any(chapter["end"] <= chapter["start"] for chapter in found) or any(
-            left["end"] * left["time_base"] > right["start"] * right["time_base"]
-            for left, right in pairwise(found)
-        ):
-            message = "chapters must not overlap and must have positive duration"
-            raise ValueError(message)
         _, decoded = read_frames_from_stream(
             container, size=size, fps=None if found else fps, return_frame_metadata=bool(found),
         )
@@ -96,26 +91,14 @@ def read_chapters(
             def chapter_frames(low=low, high=high):
                 nonlocal frame
                 while frame is not None:
-                    time = frame[1].time
+                    time = frame[1].file_time
                     if time is not None and time >= high:
                         break
                     if time is not None and time >= low:
                         yield frame
                     frame = next(decoded, None)
 
-            yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
-
-
-def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
-    start = chapter["start"] * chapter["time_base"]
-    tags = {key.lower(): value for key, value in chapter["metadata"].items()}
-    try:
-        payload = json.loads(tags.get("payload", "null"))
-        if isinstance(payload, dict) and "start_frame" in payload:
-            return Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
-    except (ValueError, TypeError, ZeroDivisionError):
-        pass  # unrelated payload tags retain the native chapter timeline
-    return start
+            yield chapter, timeline.to_source(low), select(chapter_frames())
 
 
 def write_chapters(

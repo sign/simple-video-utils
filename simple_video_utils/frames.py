@@ -2,7 +2,7 @@ import math
 import operator
 import sys
 from collections.abc import Callable, Generator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from functools import lru_cache
 from itertools import islice, tee
@@ -19,6 +19,7 @@ from simple_video_utils.metadata import (
     video_metadata,
     video_metadata_from_container,
 )
+from simple_video_utils.timeline import Timeline
 
 # For RGB conversion below this frame size, threads=0 (auto, one slice job per CPU)
 # loses to single-threaded: dispatch overhead exceeds the conversion itself —
@@ -50,7 +51,7 @@ class FrameSize:
 
 @dataclass(frozen=True)
 class FrameMetadata:
-    """Native decoded-frame information, before resize, skipping or FPS selection.
+    """Decoded-frame information, before resize, skipping or FPS selection.
 
     ``index`` counts decoded frames from the beginning of this read, starting at zero.
     """
@@ -58,11 +59,18 @@ class FrameMetadata:
     index: int
     pts: int | None
     time_base: Fraction | None
+    _timeline: Timeline | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def file_time(self) -> Fraction | None:
+        """Native presentation time in seconds, when the decoder supplies a timestamp."""
+        return self.pts * self.time_base if self.pts is not None and self.time_base is not None else None
 
     @property
     def time(self) -> Fraction | None:
-        """Exact presentation time in seconds, when the decoder supplies a timestamp."""
-        return self.pts * self.time_base if self.pts is not None and self.time_base is not None else None
+        """Source-video seconds, translated through the chapter payload when present."""
+        time = self.file_time
+        return self._timeline.to_source(time) if time is not None and self._timeline is not None else time
 
 
 def _rotation_filters(graph: av.filter.Graph, rotation: int) -> list[av.filter.context.FilterContext]:
@@ -295,12 +303,27 @@ def _frames_to_rgb_with_info[T](
         yield rgb, info
 
 
-def _stream_frames_to_rgb(frames, size, return_frame_metadata):
+def _stream_frames_to_rgb(frames, size, return_frame_metadata, timeline):
     if not return_frame_metadata:
         yield from _frames_to_rgb((frame for _, frame in frames), size)
         return
-    items = ((FrameMetadata(i, frame.pts, frame.time_base), frame) for i, frame in frames)
+    items = ((FrameMetadata(i, frame.pts, frame.time_base, timeline), frame) for i, frame in frames)
     yield from _frames_to_rgb_with_info(items, size)
+
+
+def _select_frames_by_time(frames, start, end, timeline):
+    low = Fraction(str(max(start or 0, 0)))
+    high = Fraction(str(end)) if end is not None else None
+    for index, frame in frames:
+        if frame.pts is None or frame.time_base is None:
+            continue
+        time = timeline.to_source(frame.pts * frame.time_base)
+        # Native chapter/packet times are rounded to the container's clock.
+        tolerance = frame.time_base / 2
+        if high is not None and time - tolerance > high:
+            break
+        if time + tolerance >= low:
+            yield index, frame
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -331,8 +354,10 @@ def read_frames_exact(
             metadata.open_video) to reuse across metadata and frame reads.
         start_frame: Starting frame index (0-based). Mutually exclusive with start_time.
         end_frame: Ending frame index (inclusive), or None for end of video.
-        start_time: Starting time in seconds. Mutually exclusive with start_frame.
-        end_time: Ending time in seconds, or None for end of video.
+        start_time: Starting source-video time in seconds. Mutually exclusive with start_frame.
+        end_time: Ending source-video time in seconds (inclusive), or None for end of video.
+            Chapter payloads translate historical packed files automatically. Frame indices
+            still enumerate retained decoded frames, independent of source-time gaps.
         thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
         fps: Target frame rate. Drops frames (roughly uniformly, by timestamp)
             to approximate this rate; never duplicates, so a target at or
@@ -382,6 +407,7 @@ def read_frames_exact(
             # thread_type then — the value set at first decode stays in effect.
             if not stream.codec_context.is_open:
                 stream.thread_type = thread_type
+            timeline = Timeline.read(container)
 
             # Get FPS - required for all operations. Some containers
             # (browser-recorded WebM) omit the average rate; _count_and_rate
@@ -395,31 +421,21 @@ def read_frames_exact(
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
 
-            if has_time_params:
-                target_start, target_end = _convert_time_to_frames(start_time, end_time, source_fps)
+            if has_time_params and timeline.chapters:
+                # Source seconds are not decoded-frame indices in a packed or sparse file.
+                if not return_indices:
+                    file_start = timeline.to_file(max(start_time or 0, 0))
+                    container.seek(round(file_start / stream.time_base), stream=stream, backward=True)
+                indexed = _select_frames_by_time(enumerate(container.decode(video=0)), start_time, end_time, timeline)
             else:
-                target_start, target_end = frame_range
-
-            did_seek = _seek_near(target_start, source_fps, stream, container)
-            decoded = container.decode(video=0)
-            if did_seek:
-                origin = float((stream.start_time or 0) * stream.time_base)
-                # guessed_rate (av_guess_frame_rate) recovers the true cadence
-                # when the header's average_rate drifts from the actual frame
-                # timestamps (issue #26) — average_rate would locate the start
-                # frame off by one past each drift point. But when there is no
-                # average_rate at all, guessed_rate is garbage (the time_base
-                # reciprocal — 1000 on Matroska), so only the derived rate can
-                # locate frames.
-                locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
-                frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
-            else:
-                stop = target_end + 1 if target_end is not None else None
-                frames = islice(decoded, target_start, stop)
-
-            indexed = enumerate(frames, start=target_start)
+                target_start, target_end = (_convert_time_to_frames(start_time, end_time, source_fps)
+                                            if has_time_params else frame_range)
+                indexed = _read_frame_range(container, target_start, target_end, source_fps, seek=not timeline.chapters)
             if fps is not None:
-                indexed = _select_frames_by_fps(indexed, fps, get_time=lambda item: item[1].time)
+                indexed = _select_frames_by_fps(
+                    indexed, fps, get_time=lambda item: timeline.to_source(item[1].pts * item[1].time_base)
+                    if item[1].pts is not None and item[1].time_base is not None else None,
+                )
 
             if return_indices:
                 yield from _frames_to_rgb_with_info(indexed, size)
@@ -427,6 +443,22 @@ def read_frames_exact(
                 yield from _frames_to_rgb((frame for _, frame in indexed), size)
 
     return generate()
+
+
+def _read_frame_range(container, target_start, target_end, source_fps, *, seek):
+    stream = container.streams.video[0]
+    did_seek = seek and _seek_near(target_start, source_fps, stream, container)
+    decoded = container.decode(video=0)
+    if did_seek:
+        origin = float((stream.start_time or 0) * stream.time_base)
+        # guessed_rate recovers true cadence when the header average drifts (issue #26),
+        # but is garbage without an average_rate, so missing-rate sources use the decoded rate.
+        locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
+        frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
+    else:
+        stop = target_end + 1 if target_end is not None else None
+        frames = islice(decoded, target_start, stop)
+    return enumerate(frames, start=target_start)
 
 
 def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray:
@@ -616,7 +648,8 @@ def read_frames_from_stream(
 
         size: Resize native planes before RGB conversion, as in read_frames_exact.
         return_frame_metadata: Yield (RGB array, FrameMetadata) instead of just the array.
-            Metadata retains native pts/time_base and the decoded index before skip/FPS selection.
+            ``time`` uses source-video seconds; ``file_time`` and pts/time_base retain native
+            timing. The decoded index is measured before skip/FPS selection.
 
     Returns:
         A tuple of (VideoMetadata, frame_generator).
@@ -656,6 +689,7 @@ def read_frames_from_stream(
     container = stream if reused else _open_video(stream, buffer_size=buffer_size)
     try:
         video = container.streams.video[0]
+        timeline = Timeline.read(container)
         if not video.codec_context.is_open:
             video.thread_type = thread_type
 
@@ -690,11 +724,14 @@ def read_frames_from_stream(
         decoded = _prepend(first_frame, decoded)
     frames = islice(enumerate(decoded), skip_frames, None)
     if fps is not None:
-        frames = _select_frames_by_fps(frames, fps, get_time=lambda item: item[1].time)
+        frames = _select_frames_by_fps(
+            frames, fps, get_time=lambda item: timeline.to_source(item[1].pts * item[1].time_base)
+            if item[1].pts is not None and item[1].time_base is not None else None,
+        )
 
     def frame_generator():
         try:
-            yield from _stream_frames_to_rgb(frames, size, return_frame_metadata)
+            yield from _stream_frames_to_rgb(frames, size, return_frame_metadata, timeline)
         finally:
             if not reused:
                 container.close()
