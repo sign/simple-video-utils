@@ -352,6 +352,37 @@ def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):
         write_chapters(SOURCE, tmp_path / "short.mkv", [ChapterClip(128, 133, (0, 0, 32, 32))])
 
 
+def test_trim_to_source_ends_clips_at_the_last_decoded_frame(tmp_path):
+    source = tmp_path / "source.mkv"
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=3)
+        stream.width, stream.height, stream.pix_fmt = 160, 120, "yuv420p"
+        for index in range(8):
+            frame = av.VideoFrame.from_ndarray(np.full((120, 160, 3), index * 20, dtype=np.uint8), format="rgb24")
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    # the third clip ends past the 8 frames and the fourth starts past them; the sizes change and change back, where
+    # Matroska demuxes the packets without a dts
+    clips = [ChapterClip(0, 3, (-16, 32, 32, 80)), ChapterClip(3, 4, (-16, -16, 0, 0)),
+             ChapterClip(5, 10, (0, 32, 48, 80), payload={"id": 2}), ChapterClip(12, 14, (0, 32, 48, 80))]
+    output = tmp_path / "trimmed.mkv"
+    written = write_chapters(source, output, clips, trim_to_source=True)
+    assert written == [*clips[:2], ChapterClip(5, 8, (0, 32, 48, 80), payload={"id": 2})]
+    tags = [{key.lower(): value for key, value in chapter["metadata"].items()} for chapter in list_chapters(output)]
+    assert [json.loads(tag["payload"]) for tag in tags] == [json.loads(json.dumps(asdict(clip))) for clip in written]
+    with av.open(str(output)) as container:
+        times = [frame.time for frame in container.decode(video=0)]
+    assert times == pytest.approx([index / 3 for index in (0, 1, 2, 3, 5, 6, 7)], abs=0.001)
+    assert [len(list(frames)) for _, _, frames in read_chapters(output)] == [3, 1, 3]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["source.mkv", "trimmed.mkv"]
+
+
+def test_trim_to_source_raises_when_every_clip_starts_past_the_source(tmp_path):
+    with pytest.raises(ValueError, match="every clip starts past"):
+        write_chapters(SOURCE, tmp_path / "past.mkv", [ChapterClip(130, 140, (0, 0, 32, 32))], trim_to_source=True)
+    assert not list(tmp_path.iterdir())
+
+
 @pytest.mark.parametrize("box", [(-4, 0, 28, 32), (11, 6, 43, 38)])
 @pytest.mark.parametrize("pixel_format", ["yuv420p10le", "yuv422p10le"])
 def test_cropping_and_padding_preserve_ten_bit_source_precision(tmp_path, box, pixel_format):
