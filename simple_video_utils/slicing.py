@@ -99,11 +99,16 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
     return buffer.getvalue()
 
 
-def _rebase_pts(pts: int, time_base: Fraction, start: Fraction, timeline: Timeline) -> int:
-    return round((timeline.to_source(pts * time_base) - timeline.to_source(start)) / time_base)
+def _rebase_pts(pts: int, time_base: Fraction, origin: Fraction, timeline: Timeline) -> int:
+    return round((timeline.to_source(pts * time_base) - origin) / time_base)
 
 
-def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int, timeline: Timeline) -> bytes:
+def _origin(seconds: float, stream: av.VideoStream, timeline: Timeline) -> Fraction:
+    """A clip's t=0 on the clock ``_rebase_pts`` measures; source time, so a gap before the first chapter stays."""
+    return Fraction(str(seconds)) if timeline.chapters else _stream_pts(seconds, stream, timeline) * stream.time_base
+
+
+def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], origin: Fraction, timeline: Timeline) -> bytes:
     output = io.BytesIO()
     with _mp4(output, len(packets)) as container:
         destination = container.add_stream_from_template(stream)
@@ -111,8 +116,8 @@ def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int, t
         # lead-in), so rebasing them in place would corrupt the next clip
         for source in packets:
             packet = av.Packet(bytes(source))
-            packet.pts = _rebase_pts(source.pts, source.time_base, start * stream.time_base, timeline)
-            packet.dts = _rebase_pts(source.dts, source.time_base, start * stream.time_base, timeline)
+            packet.pts = _rebase_pts(source.pts, source.time_base, origin, timeline)
+            packet.dts = _rebase_pts(source.dts, source.time_base, origin, timeline)
             packet.duration = source.duration
             packet.time_base = source.time_base
             packet.is_keyframe = source.is_keyframe
@@ -180,7 +185,7 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
             _iter_packets(source, in_stream),
         ))
         clip = _window(packets, start_pts)
-        return _mux_packets(in_stream, clip, start_pts, timeline) if clip else b""
+        return _mux_packets(in_stream, clip, _origin(start, in_stream, timeline), timeline) if clip else b""
 
 
 def slice_video(
@@ -242,16 +247,17 @@ def _copy_windows(container: av.container.InputContainer, source: av.VideoStream
         while (time >= (index + 1) * duration) if time is not None else (packet.dts > end):
             start = _stream_pts(index * duration, source, timeline)
             if clip := _window(packets, start):
-                yield Clip(index * duration, _mux_packets(source, clip, start, timeline))
+                yield Clip(index * duration, _mux_packets(source, clip, _origin(index * duration, source, timeline),
+                                                          timeline))
             index += 1
             end = _stream_pts((index + 1) * duration, source, timeline)
         packets.append(packet)
     start = _stream_pts(index * duration, source, timeline)
     if clip := _window(packets, start):
-        yield Clip(index * duration, _mux_packets(source, clip, start, timeline))
+        yield Clip(index * duration, _mux_packets(source, clip, _origin(index * duration, source, timeline), timeline))
 
 
-def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int, timeline: Timeline) -> bytes:
+def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, origin: Fraction, timeline: Timeline) -> bytes:
     output = io.BytesIO()
     with _mp4(output, len(frames)) as container:
         # rate is nominal metadata; the rebased frame pts carry the real timing,
@@ -261,7 +267,7 @@ def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: i
         reformatter = av.video.reformatter.VideoReformatter()
         for frame in frames:
             video_frame = reformatter.reformat(frame, format="yuv420p")
-            video_frame.pts = _rebase_pts(frame.pts, frame.time_base, start * source.time_base, timeline)
+            video_frame.pts = _rebase_pts(frame.pts, frame.time_base, origin, timeline)
             video_frame.time_base = frame.time_base
             video_frame.pict_type = 0  # let the encoder choose frame types
             container.mux(stream.encode(video_frame))
@@ -281,14 +287,14 @@ def _encode_windows(container: av.container.InputContainer, source: av.VideoStre
         while (time >= (index + 1) * duration) if time is not None else (frame.pts >= end):
             if frames:
                 yield Clip(index * duration,
-                           _encode_window(frames, source, _stream_pts(index * duration, source, timeline), timeline))
+                           _encode_window(frames, source, _origin(index * duration, source, timeline), timeline))
                 frames = []
             index += 1
             end = _stream_pts((index + 1) * duration, source, timeline)
         frames.append(frame)
     if frames:
         yield Clip(index * duration,
-                   _encode_window(frames, source, _stream_pts(index * duration, source, timeline), timeline))
+                   _encode_window(frames, source, _origin(index * duration, source, timeline), timeline))
 
 
 def slice_video_stream(

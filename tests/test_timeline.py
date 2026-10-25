@@ -58,8 +58,25 @@ def test_mapping_round_trip_boundaries_gaps_and_reconstruction():
 
 def test_native_gaps_and_unchaptered_times_are_identity():
     for timeline in (Timeline(), Timeline([(1, 1.5, 1), (3, 3.5, 3)])):
-        for time in (0, 1.2, 2, 3.1, 4):
+        for time in (1, 1.2, 2, 3.1, 3.5):
             assert timeline.to_file(time) == timeline.to_source(time) == Fraction(str(time))
+    for time in (0, 4):
+        assert Timeline().to_file(time) == Fraction(time)
+
+
+@pytest.mark.parametrize("chapters", [[(0, Fraction(1, 2), 1), (Fraction(1, 2), 1, 3)], [(1, 1.5, 1), (3, 3.5, 3)]])
+def test_source_times_outside_the_chapters_clamp_to_the_file_span(chapters):
+    timeline = Timeline(chapters)
+    first, last = timeline.chapters[0][0], timeline.chapters[-1][1]
+    assert timeline.to_file(0) == timeline.to_file(-1) == first
+    assert timeline.to_file(4) == timeline.to_file(100) == last
+    np.testing.assert_allclose(timeline.to_file(np.array([0, 100])), [float(first), float(last)])
+
+
+@pytest.mark.parametrize("time", [float("nan"), float("inf")])
+def test_non_finite_times_are_rejected(time):
+    with pytest.raises((ValueError, OverflowError)):
+        Timeline([(0, 1, 1)]).to_file(time)
 
 
 def test_fractional_cadence_rounding_does_not_move_the_next_chapter_start():
@@ -171,6 +188,7 @@ def test_stream_window_preserves_an_internal_source_gap(chaptered):
     with av.open(io.BytesIO(clip.data)) as container:
         frames = list(container.decode(video=0))
     assert len(frames) == 30
+    assert frames[0].time == pytest.approx(1, abs=0.001)  # the gap before the first chapter
     assert frames[15].time - frames[0].time == pytest.approx(2, abs=0.001)
 
 

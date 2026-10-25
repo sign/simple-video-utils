@@ -86,6 +86,9 @@ class Timeline:
         t = _seconds(value)
         if not self.chapters:
             return t
+        if source:  # outside the chapters, clamp to the file span rather than extrapolate
+            first, last = self.chapters[0], self.chapters[-1]
+            t = min(max(t, first[2]), last[2] + last[1] - last[0])
         starts = self._source if source else self._file
         index = max(bisect_right(starts, t) - 1, 0)
         start, end, original = self.chapters[index]
@@ -98,7 +101,7 @@ class Timeline:
         return output_end + (t - high) * (next_output - output_end) / (next_input - high)
 
     def to_file(self, time: float | Fraction | np.ndarray):
-        """Source-video seconds to file seconds; removed gaps land at the next chapter."""
+        """Source-video seconds to file seconds; removed gaps land at the next chapter, times outside clamp."""
         if not self._forward:
             message = "source-to-file mapping needs chapters in source order"
             raise ValueError(message)
