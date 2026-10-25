@@ -255,7 +255,6 @@ def test_slices_with_chapters_read_back_in_source_frames(layouts, size, start, e
     for path in layouts:
         [clip] = slice_video(path, [(start, end)], size=size, chapters=True)
         with open_video(io.BytesIO(clip)) as container:
-            assert container.streams.video[0].average_rate == 25  # frames play back to back
             _, indices = read_frames_batched(container, return_indices=True, size=SIZE)
         assert indices.tolist() == held
         firsts = [i for i, index in enumerate(held) if not i or held[i - 1] != index - 1]
@@ -264,3 +263,12 @@ def test_slices_with_chapters_read_back_in_source_frames(layouts, size, start, e
         [plain] = slice_video(path, [(start, end)], size=size)
         with av.open(io.BytesIO(plain)) as container:
             assert container.chapters() == []
+
+
+@pytest.mark.parametrize("layout", ["packed", "gapped"])
+def test_short_chaptered_clips_keep_the_exact_source_rate(tmp_path, layout):
+    """MP4 derives a short clip's rate from its duration (about 30.03 here), so chapters carry the source rate."""
+    path = _write(tmp_path / "v.mkv", [(30, 15), (90, 15)], 30, layout=layout)
+    [clip] = slice_video(path, [(1.2, 3.2)], size=64, chapters=True)
+    assert [(float(start), len(list(frames))) for _, start, frames in read_chapters(io.BytesIO(clip))] == [
+        (1.2, 9), (3.0, 7)]

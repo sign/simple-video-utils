@@ -245,6 +245,7 @@ def _clip_chapters(timeline: Timeline, window: tuple[float, float], end: float, 
     start, a re-encode on its first frame. MP4 keeps only chapter titles, so the payload rides in the title.
     """
     first = math.ceil(timeline.to_source(window[0]) * fps - 1e-6)
+    rate = str(Fraction(fps).limit_denominator(1001))  # exact: MP4 derives the clip's rate from its duration
     def at(frame):  # a source frame, on the clock that skips gaps
         return timeline.squeeze(timeline.to_file(frame / fps))
     zero = timeline.squeeze(window[0]) if copied else at(first)
@@ -256,7 +257,7 @@ def _clip_chapters(timeline: Timeline, window: tuple[float, float], end: float, 
             begin = at(low) - zero
             marks.append({"id": len(marks), "start": round(begin * 1000),
                           "end": round((begin + (high - low + 1) / fps) * 1000), "time_base": Fraction(1, 1000),
-                          "metadata": {"title": json.dumps({"start_frame": low})}})
+                          "metadata": {"title": json.dumps({"start_frame": low, "rate": rate})}})
     return marks
 
 
