@@ -1,10 +1,13 @@
+from fractions import Fraction
 from pathlib import Path
 
+import av
 import numpy as np
 import pytest
 
-from simple_video_utils.chapters import ChapterClip, Timeline, write_chapters
+from simple_video_utils.chapters import ChapterClip, write_chapters
 from simple_video_utils.metadata import open_video
+from simple_video_utils.timeline import Timeline
 
 # Two clips of a 60 s source: 10–20 s at file 0–10 s, 40–45 s at file 10–15 s.
 T = Timeline([(0, 10, 10), (10, 15, 40)])
@@ -58,9 +61,29 @@ def test_read_from_written_chapters(tmp_path):
     output = tmp_path / "chapters.mkv"
     write_chapters(source, output, [ChapterClip(30, 60, (0, 0, 64, 64)), ChapterClip(90, 120, (0, 0, 64, 64))])
     timeline = Timeline.read(output)
-    np.testing.assert_allclose(timeline.chapters, [(0, 1, 1), (1, 2, 3)], atol=1e-3)
-    assert timeline.to_file(2.5) == pytest.approx(1, abs=1e-3)
+    np.testing.assert_allclose(timeline.chapters, [(1, 2, 1), (3, 4, 3)], atol=1e-3)  # gapped: file time is source time
+    assert timeline.to_file(2.5) == pytest.approx(3, abs=1e-3)
     with open_video(output, thread_type="NONE") as video:
         np.testing.assert_array_equal(Timeline.read(video).chapters, timeline.chapters)
     np.testing.assert_array_equal(Timeline(timeline.chapters).chapters, timeline.chapters)
     assert Timeline.read(source).chapters.shape == (0, 3)
+
+
+def test_squeeze_and_gaps():
+    gapped = Timeline([(10, 20, 10), (40, 45, 40)])
+    assert gapped.gaps() == 20
+    assert T.gaps() == 0
+    assert [gapped.squeeze(15), gapped.squeeze(42)] == [5, 12]
+    assert [T.squeeze(12), Timeline().squeeze(3)] == [12, 3]
+
+
+def test_ordinary_chapter_markers_map_to_themselves(tmp_path):
+    output = tmp_path / "marked.mkv"
+    with av.open(str(output), "w") as container:
+        container.set_chapters([{"id": 0, "start": 500, "end": 900, "time_base": Fraction(1, 1000), "metadata": {}}])
+        stream = container.add_stream("libx264", rate=10)
+        stream.width = stream.height = 32
+        for _ in range(10):
+            container.mux(stream.encode(av.VideoFrame(32, 32, "yuv420p")))
+        container.mux(stream.encode())
+    assert Timeline.read(output).chapters.shape == (0, 3)

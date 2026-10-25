@@ -8,6 +8,8 @@ from typing import NamedTuple
 import av
 import certifi
 
+from simple_video_utils.timeline import Timeline
+
 
 class VideoMetadata(NamedTuple):
     width: int
@@ -112,7 +114,7 @@ def _count_from_last_packet(
     """Constant-rate frame count from the last packet's timestamp: seeks to the final keyframe, then rewinds."""
     if not fps or not duration or not stream.time_base:
         return None
-    origin = stream.start_time or 0
+    origin, gaps = stream.start_time or 0, Timeline.read(container).gaps()
     try:
         container.seek(origin + int(duration / stream.time_base), stream=stream, backward=True)
         last = max((p.pts for p in container.demux(stream) if p.pts is not None and p.size), default=None)
@@ -120,7 +122,8 @@ def _count_from_last_packet(
         return None
     finally:
         container.seek(0)
-    return None if last is None else round((last - origin) * stream.time_base * fps) + 1
+    # gapped chapters leave seconds without frames
+    return None if last is None else round(((last - origin) * stream.time_base - gaps) * fps) + 1
 
 
 def _count_decoded_frames(container: av.container.InputContainer) -> int | None:

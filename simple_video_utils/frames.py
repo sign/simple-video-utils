@@ -19,6 +19,7 @@ from simple_video_utils.metadata import (
     video_metadata,
     video_metadata_from_container,
 )
+from simple_video_utils.timeline import Timeline
 
 # For RGB conversion below this frame size, threads=0 (auto, one slice job per CPU)
 # loses to single-threaded: dispatch overhead exceeds the conversion itself —
@@ -200,8 +201,7 @@ def _normalize_frame_range(
 
 
 def _seek_near(
-    target_start_frame: int,
-    fps: float,
+    target_time: float,
     stream,
     container,
 ) -> bool:
@@ -218,7 +218,6 @@ def _seek_near(
     min_seek_seconds = 3.0  # Only seek if target is 3+ seconds from start
     seek_buffer_seconds = 1.0  # Seek 1 second before target
 
-    target_time = target_start_frame / fps
     if target_time < min_seek_seconds:
         return False
 
@@ -259,6 +258,7 @@ def _select_frames_by_fps(
     frames: Iterable,
     fps: float,
     get_frame: Callable = lambda frame: frame,
+    clock: Callable = lambda time: time,
 ) -> Generator:
     """
     Downsample to ~fps by keeping the first frame of each 1/fps bucket.
@@ -269,7 +269,8 @@ def _select_frames_by_fps(
     and after seeks.
 
     ``get_frame`` lets the same selection run over ``(index, frame)`` pairs
-    (the return_indices path) — items are yielded as given.
+    (the return_indices path) — items are yielded as given. ``clock`` maps
+    frame seconds first, e.g. ``Timeline.squeeze`` keeps one grid across gaps.
     """
     origin = None
     last_bucket = None
@@ -277,10 +278,11 @@ def _select_frames_by_fps(
         frame = get_frame(item)
         if frame.time is None:
             continue
+        time = clock(frame.time)
         if origin is None:
-            origin = frame.time
+            origin = time
         # one tick of slack: containers round timestamps to their clock (a 15 fps mkv stores 0, 67, 133 ms)
-        bucket = int((frame.time - origin + float(frame.time_base)) * fps)
+        bucket = int((time - origin + float(frame.time_base)) * fps)
         if bucket != last_bucket:
             yield item
             last_bucket = bucket
@@ -401,26 +403,10 @@ def read_frames_exact(
             else:
                 target_start, target_end = frame_range
 
-            did_seek = _seek_near(target_start, source_fps, stream, container)
-            decoded = container.decode(video=0)
-            if did_seek:
-                origin = float((stream.start_time or 0) * stream.time_base)
-                # guessed_rate (av_guess_frame_rate) recovers the true cadence
-                # when the header's average_rate drifts from the actual frame
-                # timestamps (issue #26) — average_rate would locate the start
-                # frame off by one past each drift point. But when there is no
-                # average_rate at all, guessed_rate is garbage (the time_base
-                # reciprocal — 1000 on Matroska), so only the derived rate can
-                # locate frames.
-                locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
-                frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
-            else:
-                stop = target_end + 1 if target_end is not None else None
-                frames = islice(decoded, target_start, stop)
-
-            indexed = enumerate(frames, start=target_start)
+            timeline = Timeline.read(container)
+            indexed = _read_range(container, timeline, source_fps, target_start, target_end)
             if fps is not None:
-                indexed = _select_frames_by_fps(indexed, fps, get_frame=operator.itemgetter(1))
+                indexed = _select_frames_by_fps(indexed, fps, get_frame=operator.itemgetter(1), clock=timeline.squeeze)
 
             if return_indices:
                 yield from _frames_to_rgb_with_info(indexed, size)
@@ -428,6 +414,57 @@ def read_frames_exact(
                 yield from _frames_to_rgb((frame for _, frame in indexed), size)
 
     return generate()
+
+
+def _read_range(container, timeline, source_fps, target_start, target_end):
+    if target_end is not None and target_end < target_start:
+        return iter(())  # a time range between two frames holds none
+    if timeline.chapters.size:
+        return _read_chapters(container, timeline, source_fps, target_start, target_end)
+    return _read_frames(container, source_fps, target_start, target_end)
+
+
+def _read_frames(container, source_fps, target_start, target_end):
+    """(index, frame) for frames [target_start, target_end] of an unchaptered video."""
+    stream = container.streams.video[0]
+    did_seek = _seek_near(target_start / source_fps, stream, container)
+    decoded = container.decode(video=0)
+    if did_seek:
+        origin = float((stream.start_time or 0) * stream.time_base)
+        # guessed_rate (av_guess_frame_rate) recovers the true cadence
+        # when the header's average_rate drifts from the actual frame
+        # timestamps (issue #26) — average_rate would locate the start
+        # frame off by one past each drift point. But when there is no
+        # average_rate at all, guessed_rate is garbage (the time_base
+        # reciprocal — 1000 on Matroska), so only the derived rate can
+        # locate frames.
+        locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
+        frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
+    else:
+        stop = target_end + 1 if target_end is not None else None
+        frames = islice(decoded, target_start, stop)
+    return enumerate(frames, start=target_start)
+
+
+def _read_chapters(container, timeline, rate, target_start, target_end):
+    """(source index, frame) for source frames [target_start, target_end] that a chaptered video holds.
+
+    Each chapter's first frame is located by timestamp and later ones are counted, as after a seek.
+    """
+    stream = container.streams.video[0]
+    origin = float((stream.start_time or 0) * stream.time_base)
+    _seek_near(timeline.to_file(target_start / rate) - origin, stream, container)
+    starts, _, sources = timeline.chapters.T
+    chapter = index = None
+    for frame in container.decode(video=0):
+        # half a frame of slack: chapter starts sit on Matroska's millisecond clock
+        current = max(int(np.searchsorted(starts, frame.time + 0.5 / rate, side="right")) - 1, 0)
+        index = index + 1 if current == chapter else round((sources[current] + frame.time - starts[current]) * rate)
+        chapter = current
+        if target_end is not None and index > target_end:
+            return
+        if index >= target_start:
+            yield index, frame
 
 
 def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray:
@@ -503,7 +540,10 @@ def _header_frames(container: av.container.InputContainer, stream: av.VideoStrea
     """
     if stream.frames or not fps:
         return stream.frames
-    if stream.duration and stream.time_base:
+    chapters = Timeline.read(container).chapters
+    if chapters.size:
+        seconds = float((chapters[:, 1] - chapters[:, 0]).sum())
+    elif stream.duration and stream.time_base:
         seconds = float(stream.duration * stream.time_base)
     else:
         seconds = (container.duration or 0) / av.time_base
@@ -573,8 +613,9 @@ def read_frames_batched(
     else:
         start, end = _normalize_frame_range(start_frame, end_frame)
     if total:
-        end = total - 1 if end is None else min(end, total - 1)
-    hint = max(end - start + 1, 0) if end is not None else 0
+        end = total - 1 if end is None else end
+    # chaptered reads count source frames, so the window can span frames the file doesn't hold
+    hint = max(min(end - start + 1, total or end - start + 1), 0) if end is not None else 0
     if hint and fps is not None and source_fps and fps < source_fps:
         # bucket selection keeps ~one frame per 1/fps; hint tolerates the estimate
         hint = int(hint * fps / source_fps) + 1

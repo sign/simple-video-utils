@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.chapters import ChapterClip, list_chapters, write_chapters
+from simple_video_utils.chapters import ChapterClip, list_chapters, read_chapters, write_chapters
 from simple_video_utils.frames import read_frames_exact
 
 SOURCE = Path(__file__).parent / "assets" / "example.mp4"
@@ -158,8 +158,8 @@ def test_crop_trim_and_read(tmp_path):
     offset = 0
     for chapter, clip in zip(chapters, clips, strict=True):
         count = clip.end_frame - clip.start_frame
-        assert chapter["start"] * chapter["time_base"] == pytest.approx(offset / 30, abs=0.001)
-        assert chapter["end"] * chapter["time_base"] == pytest.approx((offset + count) / 30, abs=0.001)
+        assert chapter["start"] * chapter["time_base"] == pytest.approx(clip.start_frame / 30, abs=0.001)
+        assert chapter["end"] * chapter["time_base"] == pytest.approx(clip.end_frame / 30, abs=0.001)
         tags = {key.lower(): value for key, value in chapter["metadata"].items()}
         assert json.loads(tags["payload"]) == json.loads(json.dumps(asdict(clip)))
         left, top, right, bottom = clip.box
@@ -167,7 +167,8 @@ def test_crop_trim_and_read(tmp_path):
             expected = original[clip.start_frame + index][top:bottom, left:right]
             np.testing.assert_allclose(frames[offset + index], expected, atol=1)
         offset += count
-    selected = list(read_frames_exact(str(output), start_frame=3, end_frame=6))
+    # source frames 33-61: the tail of the first clip and the head of the second; 35-59 are cropped out
+    selected = list(read_frames_exact(str(output), start_frame=33, end_frame=61))
     for frame, expected in zip(selected, frames[3:7], strict=True):
         np.testing.assert_array_equal(frame, expected)
     with av.open(str(output)) as container:
@@ -277,11 +278,15 @@ def test_short_chapters_keep_packet_order_and_seek_to_their_keyframes(tmp_path, 
         stream = container.add_stream("ffv1", rate=rate)
         stream.width = stream.height = 64
         stream.pix_fmt = "yuv420p"
-        for index in range(max(lengths)):
+        for index in range(sum(lengths)):
             frame = av.VideoFrame.from_ndarray(np.full((64, 64, 3), 40 + index * 10, dtype=np.uint8), format="rgb24")
             container.mux(stream.encode(frame))
         container.mux(stream.encode())
-    clips = [ChapterClip(0, length, (0, 0, 32 + (i % 2) * 16, 32)) for i, length in enumerate(lengths)]
+    clips = []
+    offset = 0
+    for i, length in enumerate(lengths):
+        clips.append(ChapterClip(offset, offset + length, (0, 0, 32 + (i % 2) * 16, 32)))
+        offset += length
     output = tmp_path / "chapters.mkv"
     write_chapters(source, output, clips)
     with av.open(str(output)) as container:
@@ -291,7 +296,7 @@ def test_short_chapters_keep_packet_order_and_seek_to_their_keyframes(tmp_path, 
     assert [f.time for f in frames] == pytest.approx([float(i / rate) for i in range(sum(lengths))], abs=0.001)
     assert duration == pytest.approx(float(sum(lengths) / rate), abs=0.001)
     assert [(f.width, f.height) for f in frames] == [
-        (clip.size[0], clip.size[1]) for clip in clips for _ in range(clip.end_frame)
+        (clip.size[0], clip.size[1]) for clip in clips for _ in range(clip.end_frame - clip.start_frame)
     ]
     offset = 0
     for chapter, length in zip(list_chapters(output), lengths, strict=True):
@@ -306,23 +311,41 @@ def test_short_chapters_keep_packet_order_and_seek_to_their_keyframes(tmp_path, 
 
 
 
-def test_clips_out_of_source_order_or_overlapping_keep_their_frames(tmp_path):
-    # the second and third clips start before the previous one ended, so each decodes the source again
-    clips = [
-        ChapterClip(60, 64, (40, 20, 72, 84)),
-        ChapterClip(30, 35, (10, 6, 74, 38)),
-        ChapterClip(32, 36, (10, 6, 74, 38)),
-    ]
+@pytest.mark.parametrize("bounds", [((60, 64), (30, 35)), ((30, 35), (32, 36))])
+def test_clips_out_of_source_order_or_overlapping_are_rejected(tmp_path, bounds):
+    clips = [ChapterClip(start, end, (0, 0, 32, 32)) for start, end in bounds]
     output = tmp_path / "chapters.mkv"
-    write_chapters(SOURCE, output, clips, crf=0)
-    original = list(read_frames_exact(str(SOURCE)))
-    expected = [
-        original[index][clip.box[1] : clip.box[3], clip.box[0] : clip.box[2]]
-        for clip in clips
-        for index in range(clip.start_frame, clip.end_frame)
-    ]
-    for frame, crop in zip(read_frames_exact(str(output)), expected, strict=True):
-        np.testing.assert_allclose(frame, crop, atol=1)
+    with pytest.raises(ValueError, match="source order.*overlap"):
+        write_chapters(SOURCE, output, clips)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("first", [0, 30])
+@pytest.mark.parametrize("rate", [Fraction(30), Fraction(30000, 1001)])
+def test_chapters_preserve_source_timestamps_and_gaps(tmp_path, first, rate):
+    source = tmp_path / "source.mkv"
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=rate)
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        for index in range(105):
+            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), index * 2, dtype=np.uint8), format="rgb24")
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    clips = [ChapterClip(first, first + 15, (0, 0, 32, 32)), ChapterClip(90, 105, (0, 0, 32, 32))]
+    output = tmp_path / "chapters.mkv"
+    write_chapters(source, output, clips, crf=0)
+    with av.open(str(output)) as container:
+        frames = list(container.decode(video=0))
+        assert container.duration / av.time_base == pytest.approx(float(105 / rate), abs=0.002)
+    indices = [i for clip in clips for i in range(clip.start_frame, clip.end_frame)]
+    assert [f.time for f in frames] == pytest.approx([float(i / rate) for i in indices], abs=0.001)
+    expected = list(read_frames_exact(str(source)))
+    for frame, index in zip(frames, indices, strict=True):
+        np.testing.assert_allclose(frame.to_ndarray(format="rgb24"), expected[index], atol=1)
+    chapters = [(start, len(list(frames))) for _, start, frames in read_chapters(output)]
+    assert [float(start) for start, _ in chapters] == pytest.approx([float(first / rate), float(90 / rate)])
+    assert [count for _, count in chapters] == [15, 15]
 
 
 def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):
@@ -511,13 +534,12 @@ def test_rotated_odd_display_edges_write_the_chapters_of_the_upright_copy(tmp_pa
 
 @pytest.mark.parametrize("rotation", [90, 270])
 @pytest.mark.parametrize("clips", [
-    # out of order and overlapping: decoding restarts at frame 0 and must keep turning the frames
-    [ChapterClip(2, 4, (0, 0, 32, 48)), ChapterClip(0, 3, (16, 16, 48, 48), resolution=(16, 16)),
-     ChapterClip(1, 3, (-16, 0, 16, 32))],
+    [ChapterClip(0, 1, (0, 0, 32, 48)), ChapterClip(1, 2, (16, 16, 48, 48), resolution=(16, 16)),
+     ChapterClip(2, 4, (-16, 0, 16, 32))],
     # a gap after frame 0, which the rotation is read from: that frame must be cut once, not twice
     [ChapterClip(0, 1, (0, 0, 32, 32)), ChapterClip(3, 4, (0, 0, 32, 32))],
 ])
-def test_rotated_clips_in_any_order_write_the_chapters_of_the_upright_copy(tmp_path, rotation, clips):
+def test_rotated_chapters_write_the_chapters_of_the_upright_copy(tmp_path, rotation, clips):
     source = tmp_path / "rotated.mp4"
     _write_rotated_noise(source, "yuv420p", rotation)
     _assert_chapters_of_upright_copy(tmp_path, source, rotation, clips)
@@ -572,20 +594,21 @@ def test_chapters_autorotate_before_cropping_and_padding(tmp_path, rotation, res
                 packet.stream = stream
                 destination.mux(packet)
     with av.open(str(source)) as container:
-        stored = next(container.decode(video=0))
-        assert stored.rotation % 360 == rotation
-        shown = np.rot90(stored.to_ndarray(format="rgb24"), rotation // 90)
-    height, width = shown.shape[:2]
+        decoded = container.decode(video=0)
+        stored = [next(decoded), next(decoded)]
+        assert stored[0].rotation % 360 == rotation
+        shown = [np.rot90(frame.to_ndarray(format="rgb24"), rotation // 90) for frame in stored]
+    height, width = shown[0].shape[:2]
     clips = [
         ChapterClip(0, 1, (0, 0, 128, 128)),
-        ChapterClip(0, 1, (-16, height - 32, width + 16, height + 32), resolution=resolution),
+        ChapterClip(1, 2, (-16, height - 32, width + 16, height + 32), resolution=resolution),
     ]
     output = tmp_path / "chapters.mkv"
     write_chapters(source, output, clips, crf=0)
     frames = list(read_frames_exact(str(output)))
-    np.testing.assert_array_equal(frames[0], shown[:128, :128])
+    np.testing.assert_array_equal(frames[0], shown[0][:128, :128])
     if resolution is None:
-        expected = np.pad(shown[-32:], ((0, 32), (16, 16), (0, 0)))
+        expected = np.pad(shown[1][-32:], ((0, 32), (16, 16), (0, 0)))
         np.testing.assert_allclose(frames[1], expected, atol=3)
     else:
         assert frames[1].shape == (64, 64, 3)

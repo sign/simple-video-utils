@@ -59,7 +59,7 @@ frames = list(read_frames_exact("video.mp4", start_time=1.5, end_time=3.0))
 Windows far into a file seek to the nearest keyframe, so a window costs the same at
 any offset. FPS selection keeps the first frame of each `1/fps` bucket of timestamps,
 allowing one container clock tick of rounding, so a target at or above the native rate
-keeps every frame.
+keeps every frame. Gaps between chapters don't restart the grid.
 
 ### Resize While Reading
 
@@ -196,11 +196,15 @@ for frame in read_frames_exact("chapters.mkv"):
     process(frame)  # each chapter can have a different frame shape
 ```
 
-Chapters play back to back, so readers and `slice_video` use the file's own seconds.
-`Timeline` maps seconds on the source video to the file and back:
+A chaptered video is read and sliced in **source** frames and seconds: `start_frame=200`
+means frame 200 of the original video. Frames cropped out of every chapter are simply absent,
+and `return_indices` reports source frame indices. Clips start at t=0 on their first frame
+and keep the gaps between chapters. Files whose chapters play back to back (written before
+0.10) read exactly like files that keep each clip at its source time. `Timeline` exposes the
+mapping:
 
 ```python
-from simple_video_utils.chapters import Timeline
+from simple_video_utils.timeline import Timeline
 
 timeline = Timeline.read("chapters.mkv")   # or an open container; Timeline(timeline.chapters) rebuilds it
 timeline.to_file(3.0)       # inside a gap or before the first chapter: the next chapter's start
@@ -209,6 +213,7 @@ timeline.window(3.0, 4.5)   # (file start, file end), or None when no video cove
 ```
 
 Times past the chapters clamp to the file's span, and non-finite times raise `ValueError`.
+Chapters without a writer payload leave the video on its own timeline.
 
 Pass nonempty clips from a video with a nominal frame rate and an
 H.264-compatible pixel format. Trims use source frame indices with an exclusive
@@ -216,15 +221,15 @@ end; boxes are integer `(left, top, right, bottom)` display coordinates.
 Source frames are rotated upright before cropping and padding.
 Box areas outside the source frame become black. `resolution=(width, height)`
 resizes the crop to exactly that size; the default keeps the box size.
-Clips play consecutively, and chapter payload tags retain their source specs.
+Clips must be in source order without overlaps; each keeps its source timestamps, and gaps
+contain no filler frames. Chapter payload tags retain their source specs.
 Chapter boundaries use Matroska's millisecond clock. A source that ends before
 a requested trim finishes raises `ValueError`.
 
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
 at `crf=23`, using the source frame rate and pixel format. Each chapter's output
 width and height must be multiples of 16, otherwise `ValueError` is raised. The
-destination must not already exist. Clips in source order share one decode; a clip
-starting before the previous one's end decodes from the start again.
+destination must not already exist. All clips share one source decode.
 
 Aligned padding keeps the source chroma samples without resampling. Unaligned
 crops and full-range sources retain high-depth processing for accurate offsets
