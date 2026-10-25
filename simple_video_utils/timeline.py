@@ -94,7 +94,7 @@ def _scalar(t: np.ndarray) -> float | np.ndarray:
 def _payload_start(chapter: dict, rate: Fraction | None) -> Fraction | None:
     tags = {key.lower(): value for key, value in chapter["metadata"].items()}
     try:
-        payload = json.loads(tags.get("payload", "null"))
+        payload = json.loads(tags.get("payload", tags.get("title", "null")))  # MP4 chapters keep only a title
         if isinstance(payload, dict) and "start_frame" in payload:
             return Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
     except (ValueError, TypeError, ZeroDivisionError):
