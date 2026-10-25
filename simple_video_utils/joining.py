@@ -9,7 +9,6 @@ import av
 
 from simple_video_utils.metadata import _open_video
 from simple_video_utils.slicing import _MP4_COPY_CODECS, _iter_packets, _mux_packets
-from simple_video_utils.timeline import Timeline
 
 
 def _packets(container: av.container.InputContainer, time_base: Fraction) -> list[av.Packet]:
@@ -55,7 +54,7 @@ def _copy_join(videos: Sequence[bytes]) -> bytes | None:
                 packet.pts += shift
                 packet.dts += shift
             packets.extend(incoming[overlap:])
-        return _mux_packets(stream, packets, 0, Timeline())
+        return _mux_packets(stream, packets, 0)
 
 
 def _encode_join(videos: Sequence[bytes]) -> bytes:

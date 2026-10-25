@@ -1,6 +1,7 @@
 """Store rectangular crops and time trims as chapters of one Matroska video."""
 
 import json
+import operator
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -20,7 +21,6 @@ from simple_video_utils.frames import (
     read_frames_from_stream,
 )
 from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
-from simple_video_utils.timeline import Timeline
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -72,12 +72,18 @@ def read_chapters(
         raise TypeError(message)
 
     def select(frames):
-        selected = _select_frames_by_fps(frames, fps, get_time=lambda item: item[1].time) if fps is not None else frames
+        selected = _select_frames_by_fps(frames, fps, get_frame=operator.itemgetter(1)) if fps is not None else frames
         return (array for array, _ in selected)
 
     with _open_video(str(src) if isinstance(src, Path) else src) as container:
-        timeline = Timeline.read(container)
+        stream = container.streams.video[0]
         found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
+        if any(chapter["end"] <= chapter["start"] for chapter in found) or any(
+            left["end"] * left["time_base"] > right["start"] * right["time_base"]
+            for left, right in pairwise(found)
+        ):
+            message = "chapters must not overlap and must have positive duration"
+            raise ValueError(message)
         _, decoded = read_frames_from_stream(
             container, size=size, fps=None if found else fps, return_frame_metadata=bool(found),
         )
@@ -85,23 +91,96 @@ def read_chapters(
             yield None, Fraction(0), decoded
             return
         frame = next(decoded, None)
-        spans = timeline.chapters or tuple(
-            (c["start"] * c["time_base"], c["end"] * c["time_base"], c["start"] * c["time_base"])
-            for c in found
-        )
-        for chapter, (low, high, _) in zip(found, spans, strict=True):
+        for chapter in found:
+            low, high = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
 
             def chapter_frames(low=low, high=high):
                 nonlocal frame
                 while frame is not None:
-                    time = frame[1].file_time
+                    time = frame[1].time
                     if time is not None and time >= high:
                         break
                     if time is not None and time >= low:
                         yield frame
                     frame = next(decoded, None)
 
-            yield chapter, timeline.to_source(low), select(chapter_frames())
+            yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
+
+
+def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
+    start = chapter["start"] * chapter["time_base"]
+    tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+    try:
+        payload = json.loads(tags.get("payload", "null"))
+        if isinstance(payload, dict) and "start_frame" in payload:
+            return Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
+    except (ValueError, TypeError, ZeroDivisionError):
+        pass  # unrelated payload tags retain the native chapter timeline
+    return start
+
+
+class Timeline:
+    """Seconds on a chaptered video <-> seconds on its source, through each chapter's payload ``start_frame``.
+
+    Source times before the first chapter or inside a gap land at the next chapter's start; past the last, at the
+    file's end. A video without chapters maps to itself.
+    """
+
+    def __init__(self, chapters: Sequence[tuple[float, float, float]] = ()):
+        """``chapters``: (file start, file end, source start) seconds each, e.g. ``Timeline.read(src).chapters``."""
+        self.chapters = np.array(chapters, dtype=float).reshape(-1, 3)
+        start, end, source = self.chapters.T
+        if (end <= start).any() or (np.diff(source) < 0).any():
+            message = f"chapters must have positive length and run forward on the source: {self.chapters.tolist()}"
+            raise ValueError(message)
+
+    @classmethod
+    def read(cls, src: str | Path | BinaryIO | av.container.InputContainer) -> "Timeline":
+        """Read the chapter table only; an open container is neither rewound nor decoded."""
+        if not isinstance(src, av.container.InputContainer):
+            with _open_video(str(src) if isinstance(src, Path) else src) as container:
+                return cls.read(container)
+        rate = src.streams.video[0].average_rate
+        chapters = sorted(src.chapters(), key=lambda chapter: chapter["start"] * chapter["time_base"])
+        return cls([(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate)) for c in chapters])
+
+    def to_file(self, t: float | np.ndarray) -> float | np.ndarray:
+        """Source seconds on the file."""
+        t = _finite(t)
+        if not len(self.chapters):
+            return t
+        start, end, source = self.chapters.T
+        t = np.clip(t, source[0], source[-1] + end[-1] - start[-1])
+        # the first chapter ending at or after t; a gap before it collapses onto its start
+        i = np.minimum(np.searchsorted(source + end - start, t), len(start) - 1)
+        return _scalar(start[i] + np.maximum(t - source[i], 0))
+
+    def to_source(self, t: float | np.ndarray) -> float | np.ndarray:
+        """File seconds on the source."""
+        t = _finite(t)
+        if not len(self.chapters):
+            return t
+        start, end, source = self.chapters.T
+        t = np.clip(t, start[0], end[-1])
+        i = np.maximum(np.searchsorted(start, t, side="right") - 1, 0)
+        return _scalar(source[i] + t - start[i])
+
+    def window(self, start: float, end: float) -> tuple[float, float] | None:
+        """A source window's file seconds, or None when it holds no video (wholly in a gap or outside the chapters)."""
+        low, high = self.to_file(start), self.to_file(end)
+        return (low, high) if low < high else None
+
+
+def _finite(t: float | np.ndarray) -> float | np.ndarray:
+    array = np.asarray(t, dtype=float)
+    if not np.isfinite(array).all():
+        message = f"times must be finite: {t}"
+        raise ValueError(message)
+    return _scalar(array)
+
+
+def _scalar(t: np.ndarray) -> float | np.ndarray:
+    return float(t) if np.ndim(t) == 0 else t
 
 
 def write_chapters(
@@ -113,7 +192,7 @@ def write_chapters(
     preset: str = "medium",
     thread_type: str = "AUTO",
 ) -> None:
-    """Write crops and trims on the source timeline, preserving gaps without encoding filler frames.
+    """Write crops and trims consecutively, padding outside pixels black and optionally resizing.
 
     Output must not exist, and a failed write removes it. Coordinates refer to the displayed frame, rotation applied,
     as ``video_metadata`` and the frame readers report it, and a rotated source's chapters come out upright.
@@ -124,9 +203,6 @@ def write_chapters(
     # clips are checked before the source is decoded or the output created, so a bad clip costs nothing
     if not clips:
         message = "write_chapters needs at least one clip"
-        raise ValueError(message)
-    if any(left.end_frame > right.start_frame for left, right in pairwise(clips)):
-        message = "clips must be in source order and must not overlap"
         raise ValueError(message)
     for clip in clips:
         left, top, right, bottom = clip.box
@@ -148,13 +224,16 @@ def write_chapters(
             message = "Video has no frame rate information"
             raise ValueError(message)
         chapters = []
+        offset = 0
         for clip in clips:
+            end = offset + clip.end_frame - clip.start_frame
             chapters.append({
                 "id": len(chapters),
-                "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
-                "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)),
+                "start": int(offset * 1000 / rate + Fraction(1, 2)),
+                "end": int(end * 1000 / rate + Fraction(1, 2)),
                 "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
             })
+            offset = end
         with open(out, "xb") as file:
             try:
                 with av.open(file, mode="w", format="matroska") as destination:
@@ -167,14 +246,19 @@ def write_chapters(
                     first = next(decoded, None)
                     rotation = 0 if first is None else first.rotation % 360
                     decoded = chain(() if first is None else (first,), decoded)
-                    source_end = 0
+                    source_end = output_start = 0
                     for clip in clips:
+                        if clip.start_frame < source_end:
+                            source.seek(0, stream=stream)
+                            decoded = source.decode(stream)
+                            source_end = 0
                         # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
                         frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
                         _write_clip(
-                            stream, track, clip, frames, crf, preset, rate=rate, rotation=rotation,
+                            stream, track, clip, frames, output_start, crf, preset, rate=rate, rotation=rotation,
                         )
                         source_end = clip.end_frame
+                        output_start += clip.end_frame - clip.start_frame
             except BaseException:
                 # a trim past the source's end, an unencodable pixel format or an interrupt leaves a truncated MKV,
                 # which "xb" would then refuse to overwrite on retry
@@ -196,6 +280,7 @@ def _write_clip(
     track: av.VideoStream,
     clip: ChapterClip,
     frames: Iterator[av.VideoFrame],
+    start: int,
     crf: int,
     preset: str,
     rate: Fraction,
@@ -263,7 +348,7 @@ def _write_clip(
     # Independent encoders must not reorder packets across chapter boundaries.
     encoder.max_b_frames = 0
     encoder.options = {"crf": str(crf), "preset": preset}
-    indices = range(clip.start_frame, clip.end_frame)
+    indices = range(start, start + clip.end_frame - clip.start_frame)
     for index, frame in zip(indices, frames, strict=True):
         graph.push(frame)
         cropped = graph.pull()
