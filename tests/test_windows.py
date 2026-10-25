@@ -235,3 +235,9 @@ def test_a_slice_wholly_cropped_out_raises(layouts):
     for path in layouts:
         with pytest.raises(ValueError, match="no frames"):
             next(slice_video(path, [(82.0, 98.0)]))
+
+
+def test_nb_frames_counts_only_held_frames(tmp_path):
+    """A gapped file starting late and skipping ahead holds 200 frames, not its 40 s span."""
+    path = _write(tmp_path / "late.mkv", [(500, 100), (900, 100)], layout="gapped")
+    assert video_metadata(path).nb_frames == count_frames(path) == 200
