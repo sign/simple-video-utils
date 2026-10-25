@@ -103,7 +103,7 @@ with open("video.mp4", "rb") as f:
         pass
 ```
 
-Pass `return_frame_metadata=True` for native timing and decoded indices:
+Pass `return_frame_metadata=True` for source-video timing and decoded indices:
 
 ```python
 from simple_video_utils.frames import FrameSize, read_frames_from_stream
@@ -116,8 +116,9 @@ with open("video.mp4", "rb") as stream:
         process(frame, info.index, info.time)
 ```
 
-`FrameMetadata` contains `index`, `pts`, and `time_base`; its `time` property is exact
-seconds as a `Fraction`, or `None` when timing is unavailable. Indices count decoded
+`FrameMetadata` contains `index`, `pts`, and `time_base`; its `time` property is source-video
+seconds as a `Fraction`, translated through chapter payloads, or `None` when timing is
+unavailable. `file_time` is the native `pts * time_base` before translation. Indices count decoded
 frames from the start of the read, before skipping or FPS selection. Metadata describes
 the original frame even when pixels are resized or rotated. The default still yields
 arrays only. An already-open PyAV input container can also be passed; the streaming
@@ -190,15 +191,21 @@ end; boxes are integer `(left, top, right, bottom)` display coordinates.
 Source frames are rotated upright before cropping and padding.
 Box areas outside the source frame become black. `resolution=(width, height)`
 resizes the crop to exactly that size; the default keeps the box size.
-Clips play consecutively, and chapter payload tags retain their source specs.
+Clips must be in source order without overlaps. Chapter boundaries and frame timestamps
+keep each clip at `start_frame / fps` through `end_frame / fps` on the source timeline.
+Gaps contain no encoded filler frames; a player can hold the previous frame until the
+next chapter starts. Chapter payload tags retain their source specs.
 Chapter boundaries use Matroska's millisecond clock. A source that ends before
 a requested trim finishes raises `ValueError`.
 
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
 at `crf=23`, using the source frame rate and pixel format. Each chapter's output
 width and height must be multiples of 16, otherwise `ValueError` is raised. The
-destination must not already exist. Clips in source order share one decode; a clip
-starting before the previous one's end decodes from the start again.
+destination must not already exist. All clips share one source decode.
+
+This replaces the previous packed storage layout. Existing packed files remain readable:
+SVU translates source-video times through their chapter payloads automatically. Regeneration
+is only needed to change playback in an ordinary media player, not for correct SVU reads.
 
 Aligned padding keeps the source chroma samples without resampling. Unaligned
 crops and full-range sources retain high-depth processing for accurate offsets
@@ -228,6 +235,43 @@ frame readers. `source_start` is a `Fraction` in seconds: the native chapter sta
 the writer's optional payload supplies `start_frame` (and optionally `rate`). Without
 chapters it yields one `(None, 0, frames)` entry covering the whole video. No clips are
 encoded or temporary files created.
+
+### Source-Video Time and Stored Time
+
+`start_time` / `end_time` in `read_frames_exact` and `read_frames_batched`, ranges passed to
+`slice_video`, and `FrameMetadata.time` use source-video seconds for chaptered inputs.
+For example, historical clips retaining source spans 0–5s and 10–15s may store the second
+chapter at file time 5s. Asking SVU for 10–11s selects that chapter, and its first frame's
+metadata reports time 10s. The same calls work on new files that retain the timestamp gap.
+No inference-side offset conversion is needed.
+
+Frame indices still count retained decoded frames. A time range entirely within a removed
+gap yields no frames (`slice_video` raises `ValueError` for an empty slice). FPS selection
+uses source-video time, and streaming slices report their window starts on that timeline.
+Copied and resized chapter slices preserve internal source-time gaps in their output timestamps.
+Native chapter dictionaries, `FrameMetadata.pts`, `time_base`, and `file_time` retain stored
+timestamps. `VideoMetadata.duration` describes the stored media; slice validation translates
+its endpoint to source time.
+
+The shared mapping is also available directly, without decoding frames:
+
+```python
+from simple_video_utils.timeline import Timeline
+
+timeline = Timeline.read("chapters.mkv")  # also accepts a stream or an open PyAV container
+file_second = timeline.to_file(10.5)
+source_second = timeline.to_source(file_second)
+saved = timeline.chapters  # (file start, file end, source start) triples
+restored = Timeline(saved)
+```
+
+Scalar mappings return exact `Fraction` seconds; NumPy arrays return floating-point arrays.
+Within a chapter the mapping changes only the offset. Removed gaps map to the shared file
+boundary, which belongs to the next chapter; native gaps interpolate between boundaries.
+Videos without chapters, or chapters without a writer source payload, keep native timing.
+Reporting source times supports reordered source chapters, but inverse source-to-file
+mapping requires source order. Ordinary unchaptered range reads retain their existing
+time origin at the first video frame.
 
 ### Remote Videos
 

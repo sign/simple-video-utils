@@ -5,6 +5,7 @@ import av
 import numpy as np
 import pytest
 
+from simple_video_utils.chapters import ChapterClip, write_chapters
 from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.slicing import slice_video, slice_video_stream
 
@@ -56,6 +57,39 @@ def test_slice_keeps_source_size_by_default(video):
 def test_slice_center_crops_and_resizes(video):
     [clip] = slice_video(video, [(0.0, 0.3)], size=256)
     assert _dims(clip) == (256, 256)
+
+
+@pytest.mark.parametrize("first", [0, 30])
+@pytest.mark.parametrize("size", [None, 64])
+def test_slice_chaptered_video_uses_source_times(tmp_path, first, size):
+    source = _write_video(tmp_path / "source.mp4", frames=120, width=32, height=32)
+    chaptered = tmp_path / "chapters.mkv"
+    write_chapters(source, chaptered, [
+        ChapterClip(first, first + 15, (0, 0, 32, 32)), ChapterClip(90, 105, (0, 0, 32, 32)),
+    ], crf=0)
+    [clip] = slice_video(str(chaptered), [(3.1, 3.4)], size=size)
+    with av.open(str(chaptered)) as container:
+        expected = next(f.to_ndarray(format="rgb24") for f in container.decode(video=0) if f.time >= 3.1)
+    with av.open(io.BytesIO(clip)) as container:
+        frames = list(container.decode(video=0))
+    assert frames[0].time == 0
+    assert 9 <= len(frames) <= 10
+    assert (frames[0].width, frames[0].height) == ((size, size) if size else (32, 32))
+    assert frames[0].to_ndarray(format="rgb24").mean() == pytest.approx(expected.mean(), abs=3)
+    with pytest.raises(ValueError, match="has no frames"):
+        list(slice_video(str(chaptered), [(2.0, 2.5)], size=size))
+
+
+@pytest.mark.parametrize("size", [None, 64])
+def test_chapter_rounding_does_not_reject_the_exact_source_end(tmp_path, size):
+    source = _write_video(tmp_path / "source.mp4", frames=60, width=32, height=32)
+    chaptered = tmp_path / "chapters.mkv"
+    write_chapters(source, chaptered, [ChapterClip(50, 60, (0, 0, 32, 32))])
+    [clip] = slice_video(str(chaptered), [(1.9, 2.0)], size=size)
+    with av.open(io.BytesIO(clip)) as container:
+        assert sum(1 for _ in container.decode(video=0)) == 3
+    with pytest.raises(ValueError, match="out of range"):
+        list(slice_video(str(chaptered), [(1.9, 2.01)], size=size))
 
 
 def test_matching_size_is_copied(tmp_path):
