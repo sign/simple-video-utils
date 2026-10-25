@@ -393,7 +393,8 @@ def read_frames_exact(
             # calls) pay the decode-derived rate once.
             # ponytail: a reused open_video container re-derives per call;
             # cache per container if no-rate files show up in that path.
-            source_fps = float(stream.average_rate or 0) or _count_and_rate(src)[1]
+            timeline = Timeline.read(container)
+            source_fps = float(timeline.rate or stream.average_rate or 0) or _count_and_rate(src)[1]
             if not source_fps:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
@@ -403,7 +404,6 @@ def read_frames_exact(
             else:
                 target_start, target_end = frame_range
 
-            timeline = Timeline.read(container)
             indexed = _read_range(container, timeline, source_fps, target_start, target_end)
             if fps is not None:
                 indexed = _select_frames_by_fps(indexed, fps, get_frame=operator.itemgetter(1), clock=timeline.squeeze)

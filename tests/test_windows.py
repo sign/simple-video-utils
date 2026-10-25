@@ -272,3 +272,14 @@ def test_short_chaptered_clips_keep_the_exact_source_rate(tmp_path, layout):
     [clip] = slice_video(path, [(1.2, 3.2)], size=64, chapters=True)
     assert [(float(start), len(list(frames))) for _, start, frames in read_chapters(io.BytesIO(clip))] == [
         (1.2, 9), (3.0, 7)]
+
+
+
+@pytest.mark.parametrize("size", [None, 64])
+def test_late_short_chaptered_clips_read_back_exact_source_frames(tmp_path, size):
+    """A short clip's MP4 header rate is far off (0.17 fps here); readers take the rate its chapters carry."""
+    path = _write(tmp_path / "v.mkv", [(30, 15), (20000, 600)], 30, layout="gapped")
+    [clip] = slice_video(path, [(666.5, 670.0)], size=size, chapters=True)
+    with open_video(io.BytesIO(clip)) as container:
+        _, indices = read_frames_batched(container, return_indices=True, size=SIZE)
+    assert indices.tolist() == list(range(20000, 20101))

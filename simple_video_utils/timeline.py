@@ -19,9 +19,13 @@ class Timeline:
     """Source times before the first chapter or inside a gap land at the next chapter's start; past the last, at the
     file's end. A video without payload chapters maps to itself."""
 
-    def __init__(self, chapters: Sequence[tuple[float, float, float]] = ()):
-        """``chapters``: (file start, file end, source start) seconds each, e.g. ``Timeline.read(src).chapters``."""
+    def __init__(self, chapters: Sequence[tuple[float, float, float]] = (), rate: Fraction | None = None):
+        """``chapters``: (file start, file end, source start) seconds each, e.g. ``Timeline.read(src).chapters``.
+
+        ``rate``: the source frame rate, when the payloads carry one (a clip's own header rate can be off).
+        """
         self.chapters = np.array(chapters, dtype=float).reshape(-1, 3)
+        self.rate = rate
         start, end, source = self.chapters.T
         if (end <= start).any() or (start[1:] < end[:-1]).any() or (np.diff(source) < 0).any():
             message = f"chapters must have positive length, not overlap, and run forward: {self.chapters.tolist()}"
@@ -37,7 +41,9 @@ class Timeline:
         chapters = sorted(src.chapters(), key=lambda chapter: chapter["start"] * chapter["time_base"])
         if not any(_payload_start(chapter, rate) is not None for chapter in chapters):
             return cls()  # ordinary chapter markers: the file is its own source
-        return cls([(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate)) for c in chapters])
+        rates = {Fraction(payload["rate"]) for payload in map(_payload, chapters) if payload and "rate" in payload}
+        return cls([(c["start"] * c["time_base"], c["end"] * c["time_base"], _source_start(c, rate)) for c in chapters],
+                   rates.pop() if len(rates) == 1 else None)
 
     def to_file(self, t: float | np.ndarray) -> float | np.ndarray:
         """Source seconds on the file."""
@@ -91,15 +97,21 @@ def _scalar(t: np.ndarray) -> float | np.ndarray:
     return float(t) if np.ndim(t) == 0 else t
 
 
-def _payload_start(chapter: dict, rate: Fraction | None) -> Fraction | None:
+def _payload(chapter: dict) -> dict | None:
     tags = {key.lower(): value for key, value in chapter["metadata"].items()}
     try:
         payload = json.loads(tags.get("payload", tags.get("title", "null")))  # MP4 chapters keep only a title
-        if isinstance(payload, dict) and "start_frame" in payload:
-            return Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
+    except ValueError:
+        return None  # unrelated payload tags retain the native chapter timeline
+    return payload if isinstance(payload, dict) and "start_frame" in payload else None
+
+
+def _payload_start(chapter: dict, rate: Fraction | None) -> Fraction | None:
+    payload = _payload(chapter)
+    try:
+        return None if payload is None else Fraction(payload["start_frame"]) / Fraction(payload.get("rate", rate))
     except (ValueError, TypeError, ZeroDivisionError):
-        pass  # unrelated payload tags retain the native chapter timeline
-    return None
+        return None
 
 
 def _source_start(chapter: dict, rate: Fraction | None) -> Fraction:
