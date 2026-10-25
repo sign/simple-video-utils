@@ -1,4 +1,20 @@
-"""Translate between stored chapter timestamps and the original video's seconds."""
+"""Temporary patch to support anomalous historical "packed" chapters.
+
+Packed chapters remove source-time gaps: source spans 0–5s and 10–15s are stored
+at file times 0–5s and 5–10s. Their payloads retain the source offsets, which this
+module uses to translate between file time and original video time.
+
+The new writer generates "gapped" chapters instead: those same spans stay at
+0–5s and 10–15s in both chapter metadata and frame timestamps, with no filler
+frames in the gap. File time already matches original video time.
+
+Once no packed files remain, remove this entire helper and simplify all utils
+that use it to map time: operate directly on native timestamps instead. Keep
+timestamp-based range selection and gap-preserving output timing.
+
+The introducing diff and migration context are in:
+https://github.com/sign/simple-video-utils/pull/82
+"""
 
 import json
 from bisect import bisect_right
