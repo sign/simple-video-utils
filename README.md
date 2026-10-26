@@ -199,7 +199,9 @@ for frame in read_frames_exact("chapters.mkv"):
 A chaptered video is read and sliced in **source** frames and seconds: `start_frame=200`
 means frame 200 of the original video. Frames cropped out of every chapter are simply absent,
 and `return_indices` reports source frame indices. Clips start at t=0 on their first frame
-and keep the gaps between chapters. Files whose chapters play back to back (written before
+and keep the gaps between chapters; `slice_video(..., chapters=True)` instead plays them back
+to back and copies the chapters each clip spans, so readers of the clip (svu, swfast) still see
+source frames. Files whose chapters play back to back (written before
 0.10) read exactly like files that keep each clip at its source time. `Timeline` exposes the
 mapping:
 

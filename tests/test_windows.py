@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from simple_video_utils import frames as frames_module
+from simple_video_utils.chapters import read_chapters
 from simple_video_utils.frames import FrameSize, read_frames_batched, read_frames_exact
 from simple_video_utils.metadata import count_frames, open_video, video_metadata, video_metadata_from_container
 from simple_video_utils.slicing import slice_video
@@ -241,3 +242,44 @@ def test_nb_frames_counts_only_held_frames(tmp_path):
     """A gapped file starting late and skipping ahead holds 200 frames, not its 40 s span."""
     path = _write(tmp_path / "late.mkv", [(500, 100), (900, 100)], layout="gapped")
     assert video_metadata(path).nb_frames == count_frames(path) == 200
+
+
+@pytest.mark.parametrize("size", [None, 64])
+@pytest.mark.parametrize(("start", "end", "held"), [
+    (78.0, 102.0, [*range(1950, 2000), *range(2500, 2551)]),
+    (79.96, 200.5, [1999, *range(2500, 4500), *range(5000, 5013)]),  # three chapters
+    (85.0, 102.0, list(range(2500, 2551))),
+])
+def test_slices_with_chapters_read_back_in_source_frames(layouts, size, start, end, held):
+    """``chapters=True`` copies the chapters a slice spans, so its frames read back as source frames."""
+    for path in layouts:
+        [clip] = slice_video(path, [(start, end)], size=size, chapters=True)
+        with open_video(io.BytesIO(clip)) as container:
+            _, indices = read_frames_batched(container, return_indices=True, size=SIZE)
+        assert indices.tolist() == held
+        firsts = [i for i, index in enumerate(held) if not i or held[i - 1] != index - 1]
+        runs = [(held[a] / 25, b - a) for a, b in zip(firsts, [*firsts[1:], len(held)], strict=True)]
+        assert [(float(start), len(list(frames))) for _, start, frames in read_chapters(io.BytesIO(clip))] == runs
+        [plain] = slice_video(path, [(start, end)], size=size)
+        with av.open(io.BytesIO(plain)) as container:
+            assert container.chapters() == []
+
+
+@pytest.mark.parametrize("layout", ["packed", "gapped"])
+def test_short_chaptered_clips_keep_the_exact_source_rate(tmp_path, layout):
+    """MP4 derives a short clip's rate from its duration (about 30.03 here), so chapters carry the source rate."""
+    path = _write(tmp_path / "v.mkv", [(30, 15), (90, 15)], 30, layout=layout)
+    [clip] = slice_video(path, [(1.2, 3.2)], size=64, chapters=True)
+    assert [(float(start), len(list(frames))) for _, start, frames in read_chapters(io.BytesIO(clip))] == [
+        (1.2, 9), (3.0, 7)]
+
+
+
+@pytest.mark.parametrize("size", [None, 64])
+def test_late_short_chaptered_clips_read_back_exact_source_frames(tmp_path, size):
+    """A short clip's MP4 header rate is far off (0.17 fps here); readers take the rate its chapters carry."""
+    path = _write(tmp_path / "v.mkv", [(30, 15), (20000, 600)], 30, layout="gapped")
+    [clip] = slice_video(path, [(666.5, 670.0)], size=size, chapters=True)
+    with open_video(io.BytesIO(clip)) as container:
+        _, indices = read_frames_batched(container, return_indices=True, size=SIZE)
+    assert indices.tolist() == list(range(20000, 20101))
