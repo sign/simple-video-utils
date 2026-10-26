@@ -167,7 +167,8 @@ def test_crop_trim_and_read(tmp_path):
             expected = original[clip.start_frame + index][top:bottom, left:right]
             np.testing.assert_allclose(frames[offset + index], expected, atol=1)
         offset += count
-    selected = list(read_frames_exact(str(output), start_frame=3, end_frame=6))
+    # source frames 33-61: the tail of the first clip and the head of the second; 35-59 are cropped out
+    selected = list(read_frames_exact(str(output), start_frame=33, end_frame=61))
     for frame, expected in zip(selected, frames[3:7], strict=True):
         np.testing.assert_array_equal(frame, expected)
     with av.open(str(output)) as container:

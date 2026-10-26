@@ -15,6 +15,7 @@ are located with the derived rate.
 """
 
 import io
+import math
 from pathlib import Path
 
 import av
@@ -52,7 +53,7 @@ class TestMissingAverageRate:
     def test_seeked_read_returns_the_right_frames(self):
         meta = video_metadata(LONG_FIXTURE)
         full = list(read_frames_exact(LONG_FIXTURE))
-        start = int(4.0 * meta.fps)  # past min_seek_seconds, so _seek_near fires
+        start = math.ceil(4.0 * meta.fps)  # the first frame at or after 4 s, past min_seek_seconds
 
         seeked = list(read_frames_exact(LONG_FIXTURE, start_time=4.0, end_time=meta.duration))
 

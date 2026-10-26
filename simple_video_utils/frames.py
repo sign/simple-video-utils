@@ -2,7 +2,7 @@ import math
 import operator
 import sys
 from collections.abc import Callable, Generator, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from fractions import Fraction
 from functools import lru_cache
 from itertools import islice, tee
@@ -51,7 +51,7 @@ class FrameSize:
 
 @dataclass(frozen=True)
 class FrameMetadata:
-    """Decoded-frame information, before resize, skipping or FPS selection.
+    """Native decoded-frame information, before resize, skipping or FPS selection.
 
     ``index`` counts decoded frames from the beginning of this read, starting at zero.
     """
@@ -59,18 +59,11 @@ class FrameMetadata:
     index: int
     pts: int | None
     time_base: Fraction | None
-    _timeline: Timeline | None = field(default=None, repr=False, compare=False)
-
-    @property
-    def file_time(self) -> Fraction | None:
-        """Native presentation time in seconds, when the decoder supplies a timestamp."""
-        return self.pts * self.time_base if self.pts is not None and self.time_base is not None else None
 
     @property
     def time(self) -> Fraction | None:
-        """Source-video seconds, translated through the chapter payload when present."""
-        time = self.file_time
-        return self._timeline.to_source(time) if time is not None and self._timeline is not None else time
+        """Exact presentation time in seconds, when the decoder supplies a timestamp."""
+        return self.pts * self.time_base if self.pts is not None and self.time_base is not None else None
 
 
 def _rotation_filters(graph: av.filter.Graph, rotation: int) -> list[av.filter.context.FilterContext]:
@@ -166,8 +159,9 @@ def _convert_time_to_frames(
     # Clamp so a padded window (e.g. clip_start - 0.5s) degrades to "from the
     # beginning" instead of a negative index blowing up islice downstream.
     # Fully-negative ranges were already rejected by _validate_parameters.
-    start = max(int((start_time or 0.0) * fps), 0)
-    end = int(end_time * fps) if end_time is not None else None
+    # frames timed inside [start_time, end_time]; epsilon: 0.7 s at 30 fps is 20.999999999999996 in floats
+    start = max(math.ceil((start_time or 0.0) * fps - 1e-6), 0)
+    end = int(end_time * fps + 1e-6) if end_time is not None else None
     return start, end
 
 
@@ -207,8 +201,7 @@ def _normalize_frame_range(
 
 
 def _seek_near(
-    target_start_frame: int,
-    fps: float,
+    target_time: float,
     stream,
     container,
 ) -> bool:
@@ -225,7 +218,6 @@ def _seek_near(
     min_seek_seconds = 3.0  # Only seek if target is 3+ seconds from start
     seek_buffer_seconds = 1.0  # Seek 1 second before target
 
-    target_time = target_start_frame / fps
     if target_time < min_seek_seconds:
         return False
 
@@ -265,7 +257,8 @@ def _select_frames_by_index(
 def _select_frames_by_fps(
     frames: Iterable,
     fps: float,
-    get_time: Callable = operator.attrgetter("time"),
+    get_frame: Callable = lambda frame: frame,
+    clock: Callable = lambda time: time,
 ) -> Generator:
     """
     Downsample to ~fps by keeping the first frame of each 1/fps bucket.
@@ -275,21 +268,23 @@ def _select_frames_by_fps(
     the first frame's timestamp, so selection stays uniform across VFR gaps
     and after seeks.
 
-    ``get_time`` lets the same selection run over ``(index, frame)`` pairs
-    (the return_indices path) — items are yielded as given.
+    ``get_frame`` lets the same selection run over ``(index, frame)`` pairs
+    (the return_indices path) — items are yielded as given. ``clock`` maps
+    frame seconds first, e.g. ``Timeline.squeeze`` keeps one grid across gaps.
     """
     origin = None
     last_bucket = None
-    for frame in frames:
-        time = get_time(frame)
-        if time is None:
+    for item in frames:
+        frame = get_frame(item)
+        if frame.time is None:
             continue
+        time = clock(frame.time)
         if origin is None:
             origin = time
-        # epsilon absorbs float error when a timestamp lands on a bucket edge
-        bucket = int((time - origin) * fps + 1e-6)
+        # one tick of slack: containers round timestamps to their clock (a 15 fps mkv stores 0, 67, 133 ms)
+        bucket = int((time - origin + float(frame.time_base)) * fps)
         if bucket != last_bucket:
-            yield frame
+            yield item
             last_bucket = bucket
 
 
@@ -303,41 +298,12 @@ def _frames_to_rgb_with_info[T](
         yield rgb, info
 
 
-def _stream_frames_to_rgb(frames, size, return_frame_metadata, timeline):
+def _stream_frames_to_rgb(frames, size, return_frame_metadata):
     if not return_frame_metadata:
         yield from _frames_to_rgb((frame for _, frame in frames), size)
         return
-    items = ((FrameMetadata(i, frame.pts, frame.time_base, timeline), frame) for i, frame in frames)
+    items = ((FrameMetadata(i, frame.pts, frame.time_base), frame) for i, frame in frames)
     yield from _frames_to_rgb_with_info(items, size)
-
-
-def _frame_source_time(timeline, frame):
-    if frame.pts is None or frame.time_base is None:
-        return None
-    return timeline.to_source(frame.pts * frame.time_base)
-
-
-def _select_frames_by_time(frames, start, end, timeline):
-    low = Fraction(str(max(start or 0, 0)))
-    high = Fraction(str(end)) if end is not None else None
-    for index, frame in frames:
-        time = _frame_source_time(timeline, frame)
-        if time is None:
-            continue
-        # Native chapter/packet times are rounded to the container's clock.
-        tolerance = frame.time_base / 2
-        if high is not None and time - tolerance > high:
-            break
-        if time + tolerance >= low:
-            yield index, frame
-
-
-def _read_time_range(container, timeline, start, end, *, seek):
-    if seek:
-        stream = container.streams.video[0]
-        file_start = timeline.to_file(max(start or 0, 0))
-        container.seek(round(file_start / stream.time_base), stream=stream, backward=True)
-    return _select_frames_by_time(enumerate(container.decode(video=0)), start, end, timeline)
 
 
 def _validate_fps(fps: float | None) -> None:
@@ -368,10 +334,9 @@ def read_frames_exact(
             metadata.open_video) to reuse across metadata and frame reads.
         start_frame: Starting frame index (0-based). Mutually exclusive with start_time.
         end_frame: Ending frame index (inclusive), or None for end of video.
-        start_time: Starting source-video time in seconds. Mutually exclusive with start_frame.
-        end_time: Ending source-video time in seconds (inclusive), or None for end of video.
-            Chapter payloads translate historical packed files automatically. Frame indices
-            still enumerate retained decoded frames, independent of source-time gaps.
+        start_time: Starting time in seconds. Mutually exclusive with start_frame.
+        end_time: Ending time in seconds, or None for end of video. A time range selects
+            the frames timed inside it: frames ceil(start_time * fps) through floor(end_time * fps).
         thread_type: PyAV thread type for decoding ("AUTO", "FRAME", "SLICE", or "NONE").
         fps: Target frame rate. Drops frames (roughly uniformly, by timestamp)
             to approximate this rate; never duplicates, so a target at or
@@ -416,12 +381,10 @@ def read_frames_exact(
     def generate() -> Generator[np.ndarray, None, None]:
         with _open_container(src) as container:
             stream = container.streams.video[0]
-            # A reused container's codec may already be open (e.g. metadata's
-            # rotation probe decoded a frame) and PyAV forbids changing
-            # thread_type then — the value set at first decode stays in effect.
-            if not stream.codec_context.is_open:
+            # A reused container keeps its owner's policy (open_video's thread_type,
+            # e.g. "NONE" for forked workers), even before its codec has opened.
+            if not isinstance(src, av.container.InputContainer):
                 stream.thread_type = thread_type
-            timeline = Timeline.read(container)
 
             # Get FPS - required for all operations. Some containers
             # (browser-recorded WebM) omit the average rate; _count_and_rate
@@ -430,22 +393,20 @@ def read_frames_exact(
             # calls) pay the decode-derived rate once.
             # ponytail: a reused open_video container re-derives per call;
             # cache per container if no-rate files show up in that path.
-            source_fps = float(stream.average_rate or 0) or _count_and_rate(src)[1]
+            timeline = Timeline.read(container)
+            source_fps = float(timeline.rate or stream.average_rate or 0) or _count_and_rate(src)[1]
             if not source_fps:
                 msg = "Video has no FPS information"
                 raise ValueError(msg)
 
-            if has_time_params and timeline.chapters:
-                # Source seconds are not decoded-frame indices in a packed or sparse file.
-                indexed = _read_time_range(container, timeline, start_time, end_time, seek=not return_indices)
+            if has_time_params:
+                target_start, target_end = _convert_time_to_frames(start_time, end_time, source_fps)
             else:
-                target_start, target_end = (_convert_time_to_frames(start_time, end_time, source_fps)
-                                            if has_time_params else frame_range)
-                indexed = _read_frame_range(container, target_start, target_end, source_fps, seek=not timeline.chapters)
+                target_start, target_end = frame_range
+
+            indexed = _read_range(container, timeline, source_fps, target_start, target_end)
             if fps is not None:
-                indexed = _select_frames_by_fps(
-                    indexed, fps, get_time=lambda item: _frame_source_time(timeline, item[1]),
-                )
+                indexed = _select_frames_by_fps(indexed, fps, get_frame=operator.itemgetter(1), clock=timeline.squeeze)
 
             if return_indices:
                 yield from _frames_to_rgb_with_info(indexed, size)
@@ -455,20 +416,55 @@ def read_frames_exact(
     return generate()
 
 
-def _read_frame_range(container, target_start, target_end, source_fps, *, seek):
+def _read_range(container, timeline, source_fps, target_start, target_end):
+    if target_end is not None and target_end < target_start:
+        return iter(())  # a time range between two frames holds none
+    if timeline.chapters.size:
+        return _read_chapters(container, timeline, source_fps, target_start, target_end)
+    return _read_frames(container, source_fps, target_start, target_end)
+
+
+def _read_frames(container, source_fps, target_start, target_end):
+    """(index, frame) for frames [target_start, target_end] of an unchaptered video."""
     stream = container.streams.video[0]
-    did_seek = seek and _seek_near(target_start, source_fps, stream, container)
+    did_seek = _seek_near(target_start / source_fps, stream, container)
     decoded = container.decode(video=0)
     if did_seek:
         origin = float((stream.start_time or 0) * stream.time_base)
-        # guessed_rate recovers true cadence when the header average drifts (issue #26),
-        # but is garbage without an average_rate, so missing-rate sources use the decoded rate.
+        # guessed_rate (av_guess_frame_rate) recovers the true cadence
+        # when the header's average_rate drifts from the actual frame
+        # timestamps (issue #26) — average_rate would locate the start
+        # frame off by one past each drift point. But when there is no
+        # average_rate at all, guessed_rate is garbage (the time_base
+        # reciprocal — 1000 on Matroska), so only the derived rate can
+        # locate frames.
         locate_fps = float(stream.guessed_rate) if stream.average_rate and stream.guessed_rate else source_fps
         frames = _select_frames_by_index(decoded, origin, locate_fps, target_start, target_end)
     else:
         stop = target_end + 1 if target_end is not None else None
         frames = islice(decoded, target_start, stop)
     return enumerate(frames, start=target_start)
+
+
+def _read_chapters(container, timeline, rate, target_start, target_end):
+    """(source index, frame) for source frames [target_start, target_end] that a chaptered video holds.
+
+    Each chapter's first frame is located by timestamp and later ones are counted, as after a seek.
+    """
+    stream = container.streams.video[0]
+    origin = float((stream.start_time or 0) * stream.time_base)
+    _seek_near(timeline.to_file(target_start / rate) - origin, stream, container)
+    starts, _, sources = timeline.chapters.T
+    chapter = index = None
+    for frame in container.decode(video=0):
+        # half a frame of slack: chapter starts sit on Matroska's millisecond clock
+        current = max(int(np.searchsorted(starts, frame.time + 0.5 / rate, side="right")) - 1, 0)
+        index = index + 1 if current == chapter else round((sources[current] + frame.time - starts[current]) * rate)
+        chapter = current
+        if target_end is not None and index > target_end:
+            return
+        if index >= target_start:
+            yield index, frame
 
 
 def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray:
@@ -538,15 +534,15 @@ def _count_and_rate_cached(src: str) -> tuple[int, float]:
 
 def _header_frames(container: av.container.InputContainer, stream: av.VideoStream, fps: float) -> int:
     """
-    Estimate missing frame counts from chapter spans or duration; this only sizes the batch.
+    Estimate missing frame counts from duration; this only sizes the batch.
 
     Counting packets via video_metadata would scan the whole file.
     """
     if stream.frames or not fps:
         return stream.frames
-    chapters = container.chapters()
-    if chapters:
-        seconds = float(sum((chapter["end"] - chapter["start"]) * chapter["time_base"] for chapter in chapters))
+    chapters = Timeline.read(container).chapters
+    if chapters.size:
+        seconds = float((chapters[:, 1] - chapters[:, 0]).sum())
     elif stream.duration and stream.time_base:
         seconds = float(stream.duration * stream.time_base)
     else:
@@ -617,8 +613,9 @@ def read_frames_batched(
     else:
         start, end = _normalize_frame_range(start_frame, end_frame)
     if total:
-        end = total - 1 if end is None else min(end, total - 1)
-    hint = max(end - start + 1, 0) if end is not None else 0
+        end = total - 1 if end is None else end
+    # chaptered reads count source frames, so the window can span frames the file doesn't hold
+    hint = max(min(end - start + 1, total or end - start + 1), 0) if end is not None else 0
     if hint and fps is not None and source_fps and fps < source_fps:
         # bucket selection keeps ~one frame per 1/fps; hint tolerates the estimate
         hint = int(hint * fps / source_fps) + 1
@@ -658,8 +655,7 @@ def read_frames_from_stream(
 
         size: Resize native planes before RGB conversion, as in read_frames_exact.
         return_frame_metadata: Yield (RGB array, FrameMetadata) instead of just the array.
-            ``time`` uses source-video seconds; ``file_time`` and pts/time_base retain native
-            timing. The decoded index is measured before skip/FPS selection.
+            Metadata retains native pts/time_base and the decoded index before skip/FPS selection.
 
     Returns:
         A tuple of (VideoMetadata, frame_generator).
@@ -699,8 +695,7 @@ def read_frames_from_stream(
     container = stream if reused else _open_video(stream, buffer_size=buffer_size)
     try:
         video = container.streams.video[0]
-        timeline = Timeline.read(container)
-        if not video.codec_context.is_open:
+        if not reused:
             video.thread_type = thread_type
 
         if seekable and not container.streams.video[0].average_rate:
@@ -734,11 +729,11 @@ def read_frames_from_stream(
         decoded = _prepend(first_frame, decoded)
     frames = islice(enumerate(decoded), skip_frames, None)
     if fps is not None:
-        frames = _select_frames_by_fps(frames, fps, get_time=lambda item: _frame_source_time(timeline, item[1]))
+        frames = _select_frames_by_fps(frames, fps, get_frame=operator.itemgetter(1))
 
     def frame_generator():
         try:
-            yield from _stream_frames_to_rgb(frames, size, return_frame_metadata, timeline)
+            yield from _stream_frames_to_rgb(frames, size, return_frame_metadata)
         finally:
             if not reused:
                 container.close()

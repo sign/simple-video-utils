@@ -1,255 +1,89 @@
-import io
-import json
 from fractions import Fraction
+from pathlib import Path
 
 import av
 import numpy as np
 import pytest
 
-from simple_video_utils import chapters as chapter_utils
-from simple_video_utils import frames as frame_utils
-from simple_video_utils import slicing as slicing_utils
-from simple_video_utils.chapters import read_chapters
-from simple_video_utils.frames import read_frames_batched, read_frames_exact, read_frames_from_stream
-from simple_video_utils.slicing import slice_video, slice_video_stream
+from simple_video_utils.chapters import ChapterClip, write_chapters
+from simple_video_utils.metadata import open_video
 from simple_video_utils.timeline import Timeline
 
-
-@pytest.fixture(params=[("packed", "libx264"), ("gaps", "libx264"), ("packed", "vp8"), ("gaps", "vp8")])
-def chaptered(tmp_path, request):
-    """The same source frames, stored using either historical or current writer timing."""
-    path = tmp_path / "chapters.mkv"
-    layout, codec = request.param
-    starts = (0, 15) if layout == "packed" else (30, 90)
-    with av.open(str(path), "w") as container:
-        container.set_chapters([
-            {"id": i, "start": start, "end": start + 15, "time_base": Fraction(1, 30),
-             "metadata": {"PAYLOAD": json.dumps({"start_frame": original})}}
-            for i, (start, original) in enumerate(zip(starts, (30, 90), strict=True))
-        ])
-        stream = container.add_stream(codec, rate=30)
-        stream.width = stream.height = 32
-        stream.pix_fmt = "yuv420p"
-        stream.codec_context.max_b_frames = 0
-        stream.codec_context.gop_size = 15
-        for start, original in zip(starts, (30, 90), strict=True):
-            for offset in range(15):
-                frame = av.VideoFrame.from_ndarray(
-                    np.full((32, 32, 3), (original + offset) * 2, dtype=np.uint8), format="rgb24",
-                )
-                frame.pts, frame.time_base = start + offset, Fraction(1, 30)
-                container.mux(stream.encode(frame))
-        container.mux(stream.encode())
-    return str(path)
+# Two clips of a 60 s source: 10–20 s at file 0–10 s, 40–45 s at file 10–15 s.
+T = Timeline([(0, 10, 10), (10, 15, 40)])
 
 
-def test_mapping_round_trip_boundaries_gaps_and_reconstruction():
-    timeline = Timeline([(0, Fraction(1, 2), 1), (Fraction(1, 2), 1, 3)])
-    assert timeline.to_file(1.2) == Fraction(1, 5)
-    assert timeline.to_source(Fraction(1, 5)) == Fraction(6, 5)
-    assert timeline.to_file(2) == Fraction(1, 2)
-    assert timeline.to_source(Fraction(1, 2)) == 3
-    assert timeline.to_file(3.1) == Fraction(3, 5)
-    assert timeline.to_file(3.5) == 1
-    assert Timeline(timeline.chapters).to_source(Fraction(3, 5)) == Fraction(31, 10)
-    np.testing.assert_allclose(timeline.to_source(np.array([[0.2, 0.6]])), [[1.2, 3.1]])
-    np.testing.assert_allclose(timeline.to_file(np.array([1.2, 2, 3.1])), [0.2, 0.5, 0.6])
+def test_to_file_maps_chapters_and_collapses_gaps():
+    assert T.to_file(12) == 2
+    assert T.to_file(41) == 11
+    assert T.to_file(30) == T.to_file(40) == 10  # inside the gap: the next chapter's start
 
 
-def test_native_gaps_and_unchaptered_times_are_identity():
-    for timeline in (Timeline(), Timeline([(1, 1.5, 1), (3, 3.5, 3)])):
-        for time in (0, 1.2, 2, 3.1, 4):
-            assert timeline.to_file(time) == timeline.to_source(time) == Fraction(str(time))
+def test_to_file_clamps_outside_the_chapters():
+    assert T.to_file(5) == T.to_file(-1) == 0
+    assert T.to_file(50) == T.to_file(1e9) == 15
+    np.testing.assert_array_equal(T.to_file(np.array([0, 12, 30, 99])), [0, 2, 10, 15])
 
 
-def test_fractional_cadence_rounding_does_not_move_the_next_chapter_start():
-    timeline = Timeline([(0, Fraction(334, 1000), 0), (Fraction(334, 1000), Fraction(667, 1000), Fraction(1001, 3000))])
-    assert timeline.to_file(Fraction(1001, 3000)) == Fraction(334, 1000)
-    assert timeline.to_source(Fraction(334, 1000)) == Fraction(1001, 3000)
+def test_window_is_none_without_video():
+    assert T.window(12, 41) == (2, 11)
+    assert T.window(25, 35) is None  # wholly in the gap
+    assert T.window(0, 9) is None  # before the first chapter
+    assert T.window(45, 50) is None  # past the last
 
 
-@pytest.mark.parametrize("chapters", [[(0, 0, 1)], [(0, 1, 1), (0.5, 1.5, 2)], [(0, 1)]])
-def test_invalid_native_chapters_are_rejected(chapters):
-    with pytest.raises(ValueError, match="chapters must"):
+def test_to_source_inverts_and_clamps():
+    assert T.to_source(2) == 12
+    np.testing.assert_array_equal(T.to_source(np.array([-1, 0, 9.5, 10, 14, 16])), [10, 10, 19.5, 40, 44, 45])
+
+
+@pytest.mark.parametrize("time", [float("nan"), float("inf"), -float("inf")])
+def test_non_finite_times_raise(time):
+    with pytest.raises(ValueError, match="finite"):
+        T.to_file(time)
+    with pytest.raises(ValueError, match="finite"):
+        Timeline().to_source(np.array([1.0, time]))
+
+
+def test_without_chapters_times_map_to_themselves():
+    assert Timeline().to_file(7.5) == Timeline().to_source(7.5) == 7.5
+    assert Timeline().window(1, 2) == (1, 2)
+
+
+@pytest.mark.parametrize("chapters", [[(0, 1, 5), (1, 2, 3)], [(1, 1, 0)]])
+def test_backward_or_empty_chapters_raise(chapters):
+    with pytest.raises(ValueError, match="chapters"):
         Timeline(chapters)
 
 
-def test_backward_source_chapters_still_report_times_but_cannot_be_inverted():
-    timeline = Timeline([(0, 1, 5), (1, 2, 3)])
-    assert timeline.to_source(1.2) == Fraction(16, 5)
-    with pytest.raises(ValueError, match="source order"):
-        timeline.to_file(3.2)
+def test_read_from_written_chapters(tmp_path):
+    source = Path(__file__).parent / "assets" / "example.mp4"  # 30 fps
+    output = tmp_path / "chapters.mkv"
+    write_chapters(source, output, [ChapterClip(30, 60, (0, 0, 64, 64)), ChapterClip(90, 120, (0, 0, 64, 64))])
+    timeline = Timeline.read(output)
+    np.testing.assert_allclose(timeline.chapters, [(1, 2, 1), (3, 4, 3)], atol=1e-3)  # gapped: file time is source time
+    assert timeline.to_file(2.5) == pytest.approx(3, abs=1e-3)
+    with open_video(output, thread_type="NONE") as video:
+        np.testing.assert_array_equal(Timeline.read(video).chapters, timeline.chapters)
+    np.testing.assert_array_equal(Timeline(timeline.chapters).chapters, timeline.chapters)
+    assert Timeline.read(source).chapters.shape == (0, 3)
 
 
-def test_timeline_read_preserves_open_container_position(chaptered):
-    with av.open(chaptered) as container:
-        decoded = container.decode(video=0)
-        first = next(decoded)
-        timeline = Timeline.read(container)
-        assert next(decoded).pts > first.pts
-        assert timeline.chapters == Timeline.read(chaptered).chapters
+def test_squeeze_and_gaps():
+    gapped = Timeline([(10, 20, 10), (40, 45, 40)])
+    assert gapped.gaps() == 20
+    assert T.gaps() == 0
+    assert [gapped.squeeze(15), gapped.squeeze(42)] == [5, 12]
+    assert [T.squeeze(12), Timeline().squeeze(3)] == [12, 3]
 
 
-def test_time_reads_and_batch_indices_use_original_video_seconds(chaptered):
-    all_frames = list(read_frames_exact(chaptered))
-    result = list(read_frames_exact(chaptered, start_time=3.1, end_time=3.3, return_indices=True))
-    assert [index for _, index in result] == list(range(18, 25))
-    np.testing.assert_array_equal([frame for frame, _ in result], all_frames[18:25])
-    frames, indices = read_frames_batched(chaptered, start_time=3.1, end_time=3.3, return_indices=True)
-    np.testing.assert_array_equal(frames, all_frames[18:25])
-    np.testing.assert_array_equal(indices, np.arange(18, 25))
-    np.testing.assert_array_equal(list(read_frames_exact(chaptered, start_time=2)), all_frames[15:])
-    np.testing.assert_array_equal(list(read_frames_exact(chaptered, end_time=2)), all_frames[:15])
-    assert list(read_frames_exact(chaptered, start_time=2, end_time=2.5)) == []
-
-
-def test_metadata_exposes_source_time_and_retains_native_time(chaptered):
-    with open(chaptered, "rb") as file:
-        _, frames = read_frames_from_stream(file, return_frame_metadata=True)
-        info = [metadata for _, metadata in frames]
-    timeline = Timeline.read(chaptered)
-    assert info[0].time == 1
-    assert info[15].time == 3
-    assert info[18].time == Fraction(31, 10)
-    assert all(frame.file_time == frame.pts * frame.time_base for frame in info)
-    assert info[18].file_time == timeline.to_file(Fraction(31, 10))
-    assert [frame.index for frame in info] == list(range(30))
-
-
-def test_chapter_iteration_uses_native_boundaries_and_source_starts(chaptered):
-    result = [(start, len(list(frames))) for _, start, frames in read_chapters(chaptered)]
-    assert result == [(1, 15), (3, 15)]
-
-
-def test_fps_selection_uses_source_time_for_both_layouts(chaptered):
-    with open(chaptered, "rb") as file:
-        _, frames = read_frames_from_stream(file, fps=7, return_frame_metadata=True)
-        indices = [info.index for _, info in frames]
-    assert indices == [0, 5, 9, 13, 15, 20, 24, 28]
-    selected = list(read_frames_exact(chaptered, fps=7, return_indices=True))
-    assert [index for _, index in selected] == indices
-
-
-@pytest.mark.parametrize("size", [None, 64])
-def test_slices_use_source_times_and_do_not_include_the_next_chapter_from_a_gap(chaptered, size):
-    for bounds, count, mean in (((3.1, 3.3), 7, 186), ((1.1, 2.5), 12, 66)):
-        [clip] = slice_video(chaptered, [bounds], size=size)
-        with av.open(io.BytesIO(clip)) as container:
-            frames = list(container.decode(video=0))
-        assert len(frames) == count
-        assert frames[0].time == 0
-        assert frames[0].to_ndarray(format="rgb24").mean() == pytest.approx(mean, abs=3)
-    with pytest.raises(ValueError, match="has no frames"):
-        list(slice_video(chaptered, [(2, 2.5)], size=size))
-    with pytest.raises(ValueError, match="out of range"):
-        list(slice_video(chaptered, [(3, 4)], size=size))
-
-
-def test_stream_windows_report_source_starts_and_skip_removed_gaps(chaptered):
-    with open(chaptered, "rb") as file:
-        clips = list(slice_video_stream(file, duration=0.5))
-    assert [clip.start for clip in clips] == [1, 3]
-    for clip in clips:
-        with av.open(io.BytesIO(clip.data)) as container:
-            assert sum(1 for _ in container.decode(video=0)) == 15
-
-
-@pytest.mark.parametrize("size", [None, 64])
-def test_gap_spanning_slices_preserve_source_timing_on_copy_and_resize(chaptered, size):
-    [clip] = slice_video(chaptered, [(1, 3.5)], size=size)
-    with av.open(io.BytesIO(clip)) as container:
-        frames = list(container.decode(video=0))
-    assert len(frames) == 30
-    assert frames[0].time == 0
-    assert frames[15].time == pytest.approx(2, abs=0.001)
-    assert frames[-1].time == pytest.approx(2 + 14 / 30, abs=0.001)
-
-
-def test_stream_window_preserves_an_internal_source_gap(chaptered):
-    with open(chaptered, "rb") as file:
-        [clip] = slice_video_stream(file, duration=4)
-    with av.open(io.BytesIO(clip.data)) as container:
-        frames = list(container.decode(video=0))
-    assert len(frames) == 30
-    assert frames[15].time - frames[0].time == pytest.approx(2, abs=0.001)
-
-
-@pytest.mark.parametrize(("rate", "length"), [(Fraction(30), 2), (Fraction(30000, 1001), 2), (Fraction(48), 3)])
-def test_rounded_chapter_boundaries_use_the_decoded_video_clock(tmp_path, monkeypatch, rate, length):
-    path = str(tmp_path / "packed.mp4")
-    with av.open(path, "w") as output:
-        stream = output.add_stream("libx264", rate=rate)
+def test_ordinary_chapter_markers_map_to_themselves(tmp_path):
+    output = tmp_path / "marked.mkv"
+    with av.open(str(output), "w") as container:
+        container.set_chapters([{"id": 0, "start": 500, "end": 900, "time_base": Fraction(1, 1000), "metadata": {}}])
+        stream = container.add_stream("libx264", rate=10)
         stream.width = stream.height = 32
-        stream.pix_fmt = "yuv420p"
-        stream.codec_context.max_b_frames = 0
-        for index in range(length + 3):
-            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), index * 30, np.uint8), format="rgb24")
-            frame.pts, frame.time_base = index, 1 / rate
-            output.mux(stream.encode(frame))
-        output.mux(stream.encode())
-    # Exercise real decoded timestamps finer than the writer's millisecond chapter table.
-    # MP4 does not retain arbitrary chapter tags, so attach that table to the open input.
-    def open_with_chapters(src):
-        container = av.open(src)
-        container.set_chapters([
-            {"id": i, "start": int(start * 1000 / rate + Fraction(1, 2)),
-             "end": int(end * 1000 / rate + Fraction(1, 2)), "time_base": Fraction(1, 1000),
-             "metadata": {"payload": json.dumps({"start_frame": original})}}
-            for i, (start, end, original) in enumerate(((0, length, 0), (length, length + 3, 90)))
-        ])
-        return container
-
-    with open_with_chapters(path) as container:
-        timeline = Timeline.read(container)
-        decoded = list(container.decode(video=0))
-        native = decoded[length].pts * decoded[length].time_base
-        assert timeline.to_source(native) == 90 / rate
-        assert timeline.to_file(90 / rate) == native
-        expected = [frame.to_ndarray(format="rgb24") for frame in decoded[length:length + 2]]
-        arrays = list(read_frames_exact(container, start_time=float(90 / rate), end_time=float(91 / rate)))
-        np.testing.assert_array_equal(arrays, expected)
-        container.seek(0)
-        _, frames = read_frames_from_stream(container, return_frame_metadata=True)
-        info = [info for _, info in frames]
-        assert info[length].time == 90 / rate
-
-    monkeypatch.setattr(chapter_utils, "_open_video", open_with_chapters)
-    result = [(start, len(list(frames))) for _, start, frames in read_chapters(path)]
-    assert result == [(0, length), (90 / rate, 3)]
-    monkeypatch.setattr(slicing_utils, "_open_video", open_with_chapters)
-    for size in (None, 64):
-        [clip] = slice_video(path, [(float(90 / rate), float(91 / rate))], size=size)
-        with av.open(io.BytesIO(clip)) as container:
-            actual = list(container.decode(video=0))
-        assert len(actual) == 2
-        assert actual[0].to_ndarray(format="rgb24").mean() == pytest.approx(expected[0].mean(), abs=3)
-
-
-def test_ordinary_chapter_markers_keep_fast_frame_index_seeking(tmp_path, monkeypatch):
-    path = str(tmp_path / "movie.mkv")
-    with av.open(path, "w") as output:
-        output.set_chapters([
-            {"id": i, "start": i * 2500, "end": (i + 1) * 2500, "time_base": Fraction(1, 1000),
-             "metadata": {"title": str(i)}} for i in range(2)
-        ])
-        stream = output.add_stream("libx264", rate=30)
-        stream.width = stream.height = 32
-        stream.pix_fmt = "yuv420p"
-        for index in range(150):
-            frame = av.VideoFrame.from_ndarray(np.full((32, 32, 3), index, np.uint8), format="rgb24")
-            output.mux(stream.encode(frame))
-        output.mux(stream.encode())
-    with av.open(path) as container:
-        expected = [f.to_ndarray(format="rgb24") for f in container.decode(video=0)][125:131]
-    seek = frame_utils._seek_near
-    sought = []
-
-    def track_seek(*args):
-        result = seek(*args)
-        sought.append(result)
-        return result
-
-    monkeypatch.setattr(frame_utils, "_seek_near", track_seek)
-    actual = list(read_frames_exact(path, start_frame=125, end_frame=130))
-    assert sought == [True]
-    np.testing.assert_array_equal(actual, expected)
+        for _ in range(10):
+            container.mux(stream.encode(av.VideoFrame(32, 32, "yuv420p")))
+        container.mux(stream.encode())
+    assert Timeline.read(output).chapters.shape == (0, 3)

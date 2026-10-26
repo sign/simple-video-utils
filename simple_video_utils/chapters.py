@@ -1,6 +1,7 @@
 """Store rectangular crops and time trims as chapters of one Matroska video."""
 
 import json
+import operator
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from fractions import Fraction
@@ -20,7 +21,7 @@ from simple_video_utils.frames import (
     read_frames_from_stream,
 )
 from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
-from simple_video_utils.timeline import Timeline
+from simple_video_utils.timeline import _source_start
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -72,12 +73,18 @@ def read_chapters(
         raise TypeError(message)
 
     def select(frames):
-        selected = _select_frames_by_fps(frames, fps, get_time=lambda item: item[1].time) if fps is not None else frames
+        selected = _select_frames_by_fps(frames, fps, get_frame=operator.itemgetter(1)) if fps is not None else frames
         return (array for array, _ in selected)
 
     with _open_video(str(src) if isinstance(src, Path) else src) as container:
-        timeline = Timeline.read(container)
+        stream = container.streams.video[0]
         found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
+        if any(chapter["end"] <= chapter["start"] for chapter in found) or any(
+            left["end"] * left["time_base"] > right["start"] * right["time_base"]
+            for left, right in pairwise(found)
+        ):
+            message = "chapters must not overlap and must have positive duration"
+            raise ValueError(message)
         _, decoded = read_frames_from_stream(
             container, size=size, fps=None if found else fps, return_frame_metadata=bool(found),
         )
@@ -85,23 +92,20 @@ def read_chapters(
             yield None, Fraction(0), decoded
             return
         frame = next(decoded, None)
-        spans = timeline.chapters or tuple(
-            (c["start"] * c["time_base"], c["end"] * c["time_base"], c["start"] * c["time_base"])
-            for c in found
-        )
-        for chapter, (low, high, _) in zip(found, spans, strict=True):
+        for chapter in found:
+            low, high = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
 
             def chapter_frames(low=low, high=high):
                 nonlocal frame
                 while frame is not None:
-                    time = frame[1].file_time
+                    time = frame[1].time
                     if time is not None and time >= high:
                         break
                     if time is not None and time >= low:
                         yield frame
                     frame = next(decoded, None)
 
-            yield chapter, timeline.to_source(low), select(chapter_frames())
+            yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
 
 
 def write_chapters(

@@ -8,6 +8,8 @@ from typing import NamedTuple
 import av
 import certifi
 
+from simple_video_utils.timeline import Timeline
+
 
 class VideoMetadata(NamedTuple):
     width: int
@@ -106,20 +108,22 @@ def open_video(source: str | io.BytesIO, thread_type: str = "AUTO"):
         container.close()
 
 
-def _count_video_packets(container: av.container.InputContainer) -> int | None:
-    """
-    Count video packets by demuxing (no decoding), then rewind.
-
-    Video codecs carry one frame per packet, so this approximates the frame
-    count — but buggy files can carry trailing packets that never decode.
-    Requires a seekable container; returns None if demuxing fails.
-    """
+def _count_from_last_packet(
+    container: av.container.InputContainer, stream: av.VideoStream, fps: float, duration: float | None,
+) -> int | None:
+    """Constant-rate frame count from the last packet's timestamp: seeks to the final keyframe, then rewinds."""
+    if not fps or not duration or not stream.time_base:
+        return None
+    origin, gaps = stream.start_time or 0, Timeline.read(container).gaps()
     try:
-        return sum(1 for packet in container.demux(video=0) if packet.size)
+        container.seek(origin + int(duration / stream.time_base), stream=stream, backward=True)
+        last = max((p.pts for p in container.demux(stream) if p.pts is not None and p.size), default=None)
     except (av.FFmpegError, OSError):
         return None
     finally:
         container.seek(0)
+    # gapped chapters leave seconds without frames
+    return None if last is None else round(((last - origin) * stream.time_base - gaps) * fps) + 1
 
 
 def _count_decoded_frames(container: av.container.InputContainer) -> int | None:
@@ -139,25 +143,22 @@ def _best_effort_nb_frames(
 
     Container headers can lie: some MOV/MP4 files declare more frames than
     actually decode, and Matroska/WebM headers often omit the count entirely.
-    Cross-check the cheap candidate (header, else packet count) against
-    duration × fps; on agreement trust it, on disagreement decode for the
-    ground truth. Non-seekable input can't rewind, so it gets the cheap
-    signals only.
+    A header count is cross-checked against duration × fps; on disagreement
+    the whole stream is decoded for the ground truth. Without a header count,
+    the last packet's timestamp gives it, so opening reads the final GOP
+    rather than the whole file. Non-seekable input gets the cheap signals only.
     """
     header = stream.frames if stream.frames > 0 else None
     derived = round(duration * fps) if duration and fps else None
 
-    if not seekable:
-        return header if header is not None else derived
-
-    candidate = header if header is not None else _count_video_packets(container)
-    if candidate is None:
-        return derived
-    if derived is None or abs(candidate - derived) <= 1:
-        return candidate
+    if header is None:
+        tail = _count_from_last_packet(container, stream, fps, duration) if seekable else None
+        return tail if tail is not None else derived
+    if not seekable or derived is None or abs(header - derived) <= 1:
+        return header
 
     decoded = _count_decoded_frames(container)
-    return decoded if decoded is not None else candidate
+    return decoded if decoded is not None else header
 
 
 def _decoded_rate_and_count(

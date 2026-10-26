@@ -13,8 +13,9 @@ Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
 """
 
 import io
+import json
 import math
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from fractions import Fraction
 from itertools import takewhile
 from typing import BinaryIO, NamedTuple
@@ -22,7 +23,7 @@ from typing import BinaryIO, NamedTuple
 import av
 import numpy as np
 
-from simple_video_utils.frames import _read_time_range, _stream_frames_to_rgb, read_frames_exact
+from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.metadata import _open_video, video_metadata
 from simple_video_utils.timeline import Timeline
 
@@ -56,63 +57,55 @@ def _center_crop_square(frame: np.ndarray) -> np.ndarray:
     return frame[top : top + side, left : left + side]
 
 
-def _mp4(buffer: io.BytesIO, samples: int) -> av.container.OutputContainer:
+def _mp4(buffer: io.BytesIO, samples: int, marks: Sequence[dict] = ()) -> av.container.OutputContainer:
     """An MP4 muxer that puts ``moov`` first: libav reserves the room up front and seeks back into it
     on close (``faststart`` would need a real file). The room bounds the sample tables: ~13 bytes
     per sample for H.264 plus ~700 fixed, so 32 per sample plus 4 KiB is a comfortable ceiling."""
-    return av.open(buffer, mode="w", format="mp4", options={"moov_size": str(4096 + 32 * samples)})
+    output = av.open(buffer, mode="w", format="mp4", options={"moov_size": str(4096 + 32 * samples)})
+    if marks:
+        output.set_chapters(marks)
+    return output
 
 
-def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None) -> bytes:
-    times = None
-    with _open_video(src) as container:
-        timeline = Timeline.read(container)
-        if timeline.chapters:
-            detailed = list(_stream_frames_to_rgb(
-                _read_time_range(container, timeline, start, end, seek=True), None, True, timeline,
-            ))
-            frames = [array for array, _ in detailed]
-            times = [info.time for _, info in detailed]
-        else:
-            frames = list(read_frames_exact(container, start_time=start, end_time=end))
+def _encode_clip(src: str, start: float, end: float, fps: float, size: int | None, marks: Sequence[dict] = ()) -> bytes:
+    frames = list(read_frames_exact(src, start_time=start, end_time=end, return_indices=True))
     if not frames:
         return b""
-    height, width = (size, size) if size else frames[0].shape[:2]
+    height, width = (size, size) if size else frames[0][0].shape[:2]
     buffer = io.BytesIO()
-    with _mp4(buffer, len(frames)) as output:
-        stream = output.add_stream("h264", rate=Fraction(fps).limit_denominator(1000))
+    rate = Fraction(fps).limit_denominator(1000)
+    with _mp4(buffer, len(frames), marks) as output:
+        stream = output.add_stream("h264", rate=rate)
         stream.width, stream.height = width, height
         stream.pix_fmt = "yuv420p"
-        if times is not None:
-            stream.codec_context.time_base = Fraction(1, 1_000_000)
         # One reformatter per clip so the swscale context is built once, not
         # per frame (same fix as _frames_to_rgb) — byte-identical output.
         reformatter = av.video.reformatter.VideoReformatter()
-        for index, frame in enumerate(frames):
+        for position, (frame, index) in enumerate(frames):
             array = _center_crop_square(frame) if size else frame
-            video_frame = av.VideoFrame.from_ndarray(array, format="rgb24")
-            if times is not None:
-                video_frame.time_base = stream.codec_context.time_base
-                video_frame.pts = round((times[index] - times[0]) / video_frame.time_base)
-            output.mux(stream.encode(reformatter.reformat(video_frame, width=width, height=height)))
+            video_frame = reformatter.reformat(av.VideoFrame.from_ndarray(array, format="rgb24"), width=width,
+                                               height=height)
+            # source frame indices: frames cropped out of a chaptered video stay a gap, unless chapters say where
+            video_frame.pts = (position if marks else index - frames[0][1])
+            video_frame.time_base = 1 / rate
+            output.mux(stream.encode(video_frame))
         output.mux(stream.encode())
     return buffer.getvalue()
 
 
-def _rebase_pts(pts: int, time_base: Fraction, start: Fraction, timeline: Timeline) -> int:
-    return round((timeline.to_source(pts * time_base) - timeline.to_source(start)) / time_base)
-
-
-def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int, timeline: Timeline) -> bytes:
+def _mux_packets(
+    stream: av.VideoStream, packets: list[av.Packet], start: int, clock: Callable | None = None,
+    marks: Sequence[dict] = (),
+) -> bytes:
     output = io.BytesIO()
-    with _mp4(output, len(packets)) as container:
+    with _mp4(output, len(packets), marks) as container:
         destination = container.add_stream_from_template(stream)
         # mux a copy: the source packets are shared between clips (the keyframe
         # lead-in), so rebasing them in place would corrupt the next clip
         for source in packets:
             packet = av.Packet(bytes(source))
-            packet.pts = _rebase_pts(source.pts, source.time_base, start * stream.time_base, timeline)
-            packet.dts = _rebase_pts(source.dts, source.time_base, start * stream.time_base, timeline)
+            packet.pts = _rebase(source.pts, start, source.time_base, clock)
+            packet.dts = _rebase(source.dts, start, source.time_base, clock)
             packet.duration = source.duration
             packet.time_base = source.time_base
             packet.is_keyframe = source.is_keyframe
@@ -121,15 +114,19 @@ def _mux_packets(stream: av.VideoStream, packets: list[av.Packet], start: int, t
     return output.getvalue()
 
 
-def _stream_pts(seconds: float, stream: av.VideoStream, timeline: Timeline) -> int:
+def _rebase(pts: int, start: int, time_base: Fraction, clock: Callable | None) -> int:
+    """``pts`` relative to ``start`` on ``clock``, which maps file seconds (to the source, or past gaps)."""
+    if clock is None:
+        return pts - start
+    return round((clock(pts * time_base) - clock(start * time_base)) / time_base)
+
+
+def _stream_pts(seconds: float, stream: av.VideoStream) -> int:
     """``seconds`` on the stream's absolute pts timeline.
 
     round, not int: a frame landing exactly on a boundary must not be
     excluded by float noise in the division.
     """
-    # Chapter boundaries use the container clock, including any gap before the first frame.
-    if timeline.chapters:
-        return round(timeline.to_file(seconds) / stream.time_base)
     return round(seconds / stream.time_base) + (stream.start_time or 0)
 
 
@@ -151,7 +148,9 @@ def _iter_packets(container: av.container.InputContainer, stream: av.VideoStream
             yield packet
 
 
-def _copy_clip(src: str, start: float, end: float) -> bytes:
+def _copy_clip(
+    src: str, start: float, end: float, timeline: Timeline, source_end: float, marks: Sequence[dict] = (),
+) -> bytes:
     """
     Remux [start, end] seconds without re-encoding.
 
@@ -169,24 +168,24 @@ def _copy_clip(src: str, start: float, end: float) -> bytes:
     """
     with _open_video(src) as source:
         in_stream = source.streams.video[0]
-        timeline = Timeline.read(source)
-        start_pts = _stream_pts(start, in_stream, timeline)
-        end_pts = _stream_pts(end, in_stream, timeline)
-        source_end = Fraction(str(end))
+        start_pts = _stream_pts(start, in_stream)
+        end_pts = _stream_pts(end, in_stream)
         source.seek(start_pts, stream=in_stream, backward=True)
-        packets = list(takewhile(
-            lambda p: p.dts <= end_pts and (not timeline.chapters or
-                timeline.to_source(p.dts * p.time_base) <= source_end + p.time_base / 2),
-            _iter_packets(source, in_stream),
-        ))
+        # on the source clock: a packed chapter's end is the next chapter's first frame
+        packets = list(takewhile(lambda p: p.dts <= end_pts and (not timeline.chapters.size or timeline.to_source(
+            p.dts * p.time_base) <= source_end + p.time_base / 2), _iter_packets(source, in_stream)))
         clip = _window(packets, start_pts)
-        return _mux_packets(in_stream, clip, start_pts, timeline) if clip else b""
+        # gaps between chapters stay gaps, unless chapters say where each stretch came from
+        clock = (timeline.squeeze if marks else timeline.to_source) if timeline.chapters.size else None
+        return _mux_packets(in_stream, clip, start_pts, clock, marks) if clip else b""
 
 
 def slice_video(
     src: str,
     slices: Sequence[tuple[float, float]],
     size: int | None = None,
+    *,
+    chapters: bool = False,
 ) -> Iterator[bytes]:
     """Yield one MP4 clip (bytes) per (start, end) second range, in order.
 
@@ -196,9 +195,11 @@ def slice_video(
     Every slice must be within the video (``0 <= start <= end <= duration``);
     an out-of-range or empty slice raises ``ValueError``.
 
-    Chaptered files use source-video seconds, translating through chapter payloads
-    for packed files and preserving source-time gaps in newer files. Other files
-    use seconds from the first video frame. A range wholly in a removed gap is empty.
+    A chaptered video takes source seconds: a slice holds the frames its chapters
+    keep, starts at t=0 on the first of them, and keeps gaps between chapters.
+    A slice wholly cropped out has no frames. ``chapters=True`` gives each clip the
+    chapters it spans, timed on the clip, so readers map its frames back to source
+    frames (svu's readers and swfast both do).
 
     Stream-copied clips keep the lead-in from the keyframe before ``start``
     and a few trailing frames past ``end``; an edit list hides them, so
@@ -210,24 +211,54 @@ def slice_video(
     """
     meta = video_metadata(src)
     with _open_video(src) as container:
-        codec = container.streams.video[0].codec_context.name
+        stream = container.streams.video[0]
+        codec = stream.codec_context.name
         timeline = Timeline.read(container)
-    duration = float(timeline.to_source(meta.duration)) if meta.duration is not None else None
-    # Rounded chapter starts/ends can move the translated endpoint by one native tick.
-    tolerance = float(Fraction(meta.time_base)) if timeline.chapters and meta.time_base else 0
+        origin = float((stream.start_time or 0) * stream.time_base)
+    held = timeline.chapters
+    duration = held[-1, 2] + held[-1, 1] - held[-1, 0] if held.size else meta.duration
     should_copy = codec in _MP4_COPY_CODECS and (
         size is None or (meta.width == meta.height == size and meta.rotation == 0)
     )
 
     for start, end in slices:
-        if start < 0 or end <= start or (duration is not None and end > duration + tolerance):
+        if start < 0 or end <= start or (duration is not None and end > duration):
             msg = f"slice ({start}, {end}) out of range [0, {duration}]"
             raise ValueError(msg)
-        clip = _copy_clip(src, start, end) if should_copy else _encode_clip(src, start, end, meta.fps, size)
+        window = timeline.window(start, end)
+        marks = _clip_chapters(timeline, window, end, meta.fps, should_copy) if chapters and window else ()
+        if window is None:
+            clip = b""
+        elif should_copy:
+            # chapter seconds are on the file's clock; _stream_pts counts from its first frame
+            clip = _copy_clip(src, *(t - origin if held.size else t for t in window), timeline, end, marks)
+        else:
+            clip = _encode_clip(src, start, end, meta.fps, size, marks)
         if not clip:
             msg = f"slice ({start}, {end}) has no frames"
             raise ValueError(msg)
         yield clip
+
+
+def _clip_chapters(timeline: Timeline, window: tuple[float, float], end: float, fps: float, copied: bool) -> list[dict]:
+    """The source chapters a slice spans, on its clip, whose frames play back to back: a copy starts at the slice
+    start, a re-encode on its first frame. MP4 keeps only chapter titles, so the payload rides in the title.
+    """
+    first = math.ceil(timeline.to_source(window[0]) * fps - 1e-6)
+    rate = str(Fraction(fps).limit_denominator(1001))  # exact: MP4 derives the clip's rate from its duration
+    def at(frame):  # a source frame, on the clock that skips gaps
+        return timeline.squeeze(timeline.to_file(frame / fps))
+    zero = timeline.squeeze(window[0]) if copied else at(first)
+    marks = []
+    for file_start, file_end, source in timeline.chapters:
+        low = max(first, math.ceil(source * fps - 1e-6))
+        high = min(math.floor(end * fps + 1e-6), round((source + file_end - file_start) * fps) - 1)  # last frame
+        if low <= high:
+            begin = at(low) - zero
+            marks.append({"id": len(marks), "start": round(begin * 1000),
+                          "end": round((begin + (high - low + 1) / fps) * 1000), "time_base": Fraction(1, 1000),
+                          "metadata": {"title": json.dumps({"start_frame": low, "rate": rate})}})
+    return marks
 
 
 def _copy_windows(container: av.container.InputContainer, source: av.VideoStream,
@@ -235,23 +266,21 @@ def _copy_windows(container: av.container.InputContainer, source: av.VideoStream
     """Packet-copied windows: lossless, keyframe lead-in hidden by an edit list."""
     packets: list[av.Packet] = []
     index = 0
-    timeline = Timeline.read(container)
-    end = _stream_pts(duration, source, timeline)
+    end = _stream_pts(duration, source)
     for packet in _iter_packets(container, source):
-        time = timeline.to_source(packet.dts * packet.time_base) if timeline.chapters else None
-        while (time >= (index + 1) * duration) if time is not None else (packet.dts > end):
-            start = _stream_pts(index * duration, source, timeline)
+        while packet.dts > end:
+            start = _stream_pts(index * duration, source)
             if clip := _window(packets, start):
-                yield Clip(index * duration, _mux_packets(source, clip, start, timeline))
+                yield Clip(index * duration, _mux_packets(source, clip, start))
             index += 1
-            end = _stream_pts((index + 1) * duration, source, timeline)
+            end = _stream_pts((index + 1) * duration, source)
         packets.append(packet)
-    start = _stream_pts(index * duration, source, timeline)
+    start = _stream_pts(index * duration, source)
     if clip := _window(packets, start):
-        yield Clip(index * duration, _mux_packets(source, clip, start, timeline))
+        yield Clip(index * duration, _mux_packets(source, clip, start))
 
 
-def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int, timeline: Timeline) -> bytes:
+def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: int) -> bytes:
     output = io.BytesIO()
     with _mp4(output, len(frames)) as container:
         # rate is nominal metadata; the rebased frame pts carry the real timing,
@@ -261,7 +290,7 @@ def _encode_window(frames: list[av.VideoFrame], source: av.VideoStream, start: i
         reformatter = av.video.reformatter.VideoReformatter()
         for frame in frames:
             video_frame = reformatter.reformat(frame, format="yuv420p")
-            video_frame.pts = _rebase_pts(frame.pts, frame.time_base, start * source.time_base, timeline)
+            video_frame.pts = frame.pts - start
             video_frame.time_base = frame.time_base
             video_frame.pict_type = 0  # let the encoder choose frame types
             container.mux(stream.encode(video_frame))
@@ -274,21 +303,19 @@ def _encode_windows(container: av.container.InputContainer, source: av.VideoStre
     """Frame-exact windows for codecs MP4 can't carry: decode and re-encode."""
     frames: list[av.VideoFrame] = []
     index = 0
-    timeline = Timeline.read(container)
-    end = _stream_pts(duration, source, timeline)
+    end = _stream_pts(duration, source)
     for frame in container.decode(source):
-        time = timeline.to_source(frame.pts * frame.time_base) if timeline.chapters else None
-        while (time >= (index + 1) * duration) if time is not None else (frame.pts >= end):
+        while frame.pts >= end:
             if frames:
                 yield Clip(index * duration,
-                           _encode_window(frames, source, _stream_pts(index * duration, source, timeline), timeline))
+                           _encode_window(frames, source, _stream_pts(index * duration, source)))
                 frames = []
             index += 1
-            end = _stream_pts((index + 1) * duration, source, timeline)
+            end = _stream_pts((index + 1) * duration, source)
         frames.append(frame)
     if frames:
         yield Clip(index * duration,
-                   _encode_window(frames, source, _stream_pts(index * duration, source, timeline), timeline))
+                   _encode_window(frames, source, _stream_pts(index * duration, source)))
 
 
 def slice_video_stream(
