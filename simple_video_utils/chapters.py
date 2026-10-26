@@ -3,7 +3,7 @@
 import json
 import operator
 from collections.abc import Iterator, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from itertools import chain, islice, pairwise
 from pathlib import Path
@@ -116,14 +116,19 @@ def write_chapters(
     crf: int = 23,
     preset: str = "medium",
     thread_type: str = "AUTO",
-) -> None:
-    """Write crops and trims on the source timeline, preserving gaps without encoding filler frames.
+    trim_to_source: bool = False,
+) -> list[ChapterClip]:
+    """Write crops and trims on the source timeline, preserving gaps without encoding filler frames, and return the
+    clips written.
 
     Output must not exist, and a failed write removes it. Coordinates refer to the displayed frame, rotation applied,
     as ``video_metadata`` and the frame readers report it, and a rotated source's chapters come out upright.
     Each chapter stores its source specification in a JSON ``payload`` tag.
     ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
     "FRAME", "SLICE" or "NONE"); the frames do not change.
+    A clip past the last frame the source decodes raises, unless ``trim_to_source``: then it ends at that frame, a
+    clip starting past it is dropped, and the returned clips, chapters and payloads say so. Headers can count frames
+    that never decode, and this spares counting them by decoding the source twice.
     """
     # clips are checked before the source is decoded or the output created, so a bad clip costs nothing
     if not clips:
@@ -151,18 +156,10 @@ def write_chapters(
         if not rate:
             message = "Video has no frame rate information"
             raise ValueError(message)
-        chapters = []
-        for clip in clips:
-            chapters.append({
-                "id": len(chapters),
-                "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
-                "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)),
-                "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
-            })
         with open(out, "xb") as file:
             try:
                 with av.open(file, mode="w", format="matroska") as destination:
-                    destination.set_chapters(chapters)
+                    destination.set_chapters(_chapters(clips, rate=rate))
                     width, height = clips[0].size
                     # The muxer takes the header (avcC) from the first clip's packets.
                     track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
@@ -171,20 +168,84 @@ def write_chapters(
                     first = next(decoded, None)
                     rotation = 0 if first is None else first.rotation % 360
                     decoded = chain(() if first is None else (first,), decoded)
-                    source_end = 0
-                    for clip in clips:
-                        # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
-                        frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-                        _write_clip(
-                            stream, track, clip, frames, crf, preset, rate=rate, rotation=rotation,
-                        )
-                        source_end = clip.end_frame
+                    written = _write_clips(
+                        stream, track, clips, decoded, crf, preset, rate=rate, rotation=rotation, trim=trim_to_source,
+                    )
+                if written != list(clips):
+                    # Matroska writes its chapters in the header, before the frames that showed them wrong
+                    file.flush()
+                    _remux_with_chapters(Path(out), _chapters(written, rate=rate))
             except BaseException:
                 # a trim past the source's end, an unencodable pixel format or an interrupt leaves a truncated MKV,
                 # which "xb" would then refuse to overwrite on retry
                 file.close()
                 Path(out).unlink()
                 raise
+    return written
+
+
+def _write_clips(
+    source: av.VideoStream,
+    track: av.VideoStream,
+    clips: Sequence[ChapterClip],
+    decoded: Iterator[av.VideoFrame],
+    crf: int,
+    preset: str,
+    rate: Fraction,
+    rotation: int,
+    trim: bool,
+) -> list[ChapterClip]:
+    """Write `clips` from the source's `decoded` frames and return them, trimmed at its end when `trim`."""
+    written, source_end = [], 0
+    for clip in clips:
+        # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
+        frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
+        head = list(islice(frames, 1))
+        if not head and trim:
+            break
+        count = _write_clip(
+            source, track, clip, chain(head, frames), crf, preset, rate=rate, rotation=rotation, strict=not trim,
+        )
+        written.append(replace(clip, end_frame=clip.start_frame + count))
+        if count < clip.end_frame - clip.start_frame:
+            break
+        source_end = clip.end_frame
+    if not written:
+        message = "every clip starts past the last frame the source decodes"
+        raise ValueError(message)
+    return written
+
+
+def _chapters(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
+    """The chapter table of `clips` on the source timeline, each with its source specification as a payload."""
+    return [
+        {
+            "id": index,
+            "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
+            "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)),
+            "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
+        }
+        for index, clip in enumerate(clips)
+    ]
+
+
+def _remux_with_chapters(path: Path, chapters: list[dict]) -> None:
+    """Copy `path`'s packets, timestamps kept, into a file with `chapters` that replaces it."""
+    staged = path.with_name(f"{path.name}.part")
+    try:
+        with av.open(str(path)) as source, av.open(str(staged), mode="w", format="matroska") as destination:
+            destination.set_chapters(chapters)
+            stream = source.streams.video[0]
+            track = destination.add_stream_from_template(stream)
+            for packet in source.demux(stream):
+                # the demuxer ends with an empty packet that only flushes
+                if not packet.size:
+                    continue
+                packet.stream = track
+                destination.mux(packet)
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
 
 
 
@@ -204,7 +265,8 @@ def _write_clip(
     preset: str,
     rate: Fraction,
     rotation: int = 0,
-) -> None:
+    strict: bool = True,
+) -> int:
     graph = av.filter.Graph()
     left, top, right, bottom = clip.box
     # a rotated source is turned upright first, as FFmpeg autorotates it, then cut like a source stored upright
@@ -268,7 +330,9 @@ def _write_clip(
     encoder.max_b_frames = 0
     encoder.options = {"crf": str(crf), "preset": preset}
     indices = range(clip.start_frame, clip.end_frame)
-    for index, frame in zip(indices, frames, strict=True):
+    count = 0
+    for index, frame in zip(indices, frames, strict=strict):
+        count += 1
         graph.push(frame)
         cropped = graph.pull()
         cropped.pts = index
@@ -280,3 +344,4 @@ def _write_clip(
     for packet in encoder.encode():
         packet.stream = track
         track.container.mux(packet)
+    return count
