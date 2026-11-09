@@ -351,6 +351,91 @@ def test_chapters_preserve_source_timestamps_and_gaps(tmp_path, first, rate):
 def test_truncated_trim_raises_instead_of_writing_misleading_chapters(tmp_path):
     with pytest.raises(ValueError, match="shorter"):
         write_chapters(SOURCE, tmp_path / "short.mkv", [ChapterClip(128, 133, (0, 0, 32, 32))])
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("rate", [Fraction(3), Fraction(30000, 1001)])
+def test_trim_to_source_ends_clips_at_the_last_decoded_frame(tmp_path, rate):
+    source = tmp_path / "source.mkv"
+    with av.open(str(source), "w") as container:
+        stream = container.add_stream("ffv1", rate=rate)
+        stream.width, stream.height, stream.pix_fmt = 160, 120, "yuv420p"
+        for index in range(8):
+            frame = av.VideoFrame.from_ndarray(np.full((120, 160, 3), index * 20, dtype=np.uint8), format="rgb24")
+            container.mux(stream.encode(frame))
+        container.mux(stream.encode())
+    # the third clip ends past the 8 frames and the fourth starts past them; the sizes change and change back, where
+    # Matroska demuxes the packets without a dts
+    clips = [ChapterClip(0, 3, (-16, 32, 32, 80)), ChapterClip(3, 4, (-16, -16, 0, 0)),
+             ChapterClip(5, 10, (0, 32, 48, 80), payload={"id": 2}), ChapterClip(12, 14, (0, 32, 48, 80))]
+    output = tmp_path / "trimmed.mkv"
+    written = write_chapters(source, output, clips, trim_to_source=True)
+    assert written == [*clips[:2], ChapterClip(5, 8, (0, 32, 48, 80), payload={"id": 2})]
+    chapters = list(list_chapters(output))
+    bounds = [float(chapter[key] * chapter["time_base"]) for chapter in chapters for key in ("start", "end")]
+    assert bounds == pytest.approx([float(index / rate) for index in (0, 3, 3, 4, 5, 8)], abs=0.001)
+    tags = [{key.lower(): value for key, value in chapter["metadata"].items()} for chapter in chapters]
+    assert [json.loads(tag["payload"]) for tag in tags] == [json.loads(json.dumps(asdict(clip))) for clip in written]
+    with av.open(str(output)) as container:
+        times = [frame.time for frame in container.decode(video=0)]
+    assert times == pytest.approx([float(index / rate) for index in (0, 1, 2, 3, 5, 6, 7)], abs=0.001)
+    assert [len(list(frames)) for _, _, frames in read_chapters(output)] == [3, 1, 3]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["source.mkv", "trimmed.mkv"]
+    reference = tmp_path / "reference.mkv"
+    write_chapters(source, reference, written)
+    for actual, expected in zip(read_frames_exact(output), read_frames_exact(reference), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("start", [130, 135])
+def test_trim_to_source_raises_when_every_clip_starts_past_the_source(tmp_path, start):
+    with pytest.raises(ValueError, match="every clip starts past"):
+        write_chapters(SOURCE, tmp_path / "past.mkv", [ChapterClip(start, 140, (0, 0, 32, 32))], trim_to_source=True)
+    assert not list(tmp_path.iterdir())
+
+
+def test_trim_to_source_drops_a_clip_when_the_source_ends_in_a_gap(tmp_path):
+    output = tmp_path / "gap.mkv"
+    clips = [ChapterClip(125, 128, (0, 0, 32, 32)), ChapterClip(135, 140, (0, 0, 32, 32))]
+    assert write_chapters(SOURCE, output, clips, trim_to_source=True) == clips[:1]
+    assert [len(list(frames)) for _, _, frames in read_chapters(output)] == [3]
+    assert len(list(list_chapters(output))) == 1
+
+
+@pytest.mark.parametrize("trim_to_source", [False, True])
+def test_complete_clips_are_returned_without_remuxing(tmp_path, monkeypatch, trim_to_source):
+    monkeypatch.setattr("simple_video_utils.chapters._remux_with_chapters", lambda *_: pytest.fail("unexpected remux"))
+    clips = [ChapterClip(125, 130, (0, 0, 32, 32))]
+    assert write_chapters(SOURCE, tmp_path / "complete.mkv", clips, trim_to_source=trim_to_source) == clips
+
+
+@pytest.mark.parametrize("trim_to_source", [False, True])
+def test_write_chapters_does_not_overwrite_existing_output(tmp_path, trim_to_source):
+    output = tmp_path / "existing.mkv"
+    output.write_bytes(b"keep existing output")
+    with pytest.raises(FileExistsError):
+        write_chapters(SOURCE, output, [ChapterClip(128, 140, (0, 0, 32, 32))], trim_to_source=trim_to_source)
+    assert output.read_bytes() == b"keep existing output"
+
+
+def test_trim_to_source_preserves_existing_part_file(tmp_path):
+    output = tmp_path / "trimmed.mkv"
+    existing = tmp_path / "trimmed.mkv.part"
+    existing.write_bytes(b"keep existing data")
+    assert write_chapters(SOURCE, output, [ChapterClip(128, 140, (0, 0, 32, 32))], trim_to_source=True)
+    assert existing.read_bytes() == b"keep existing data"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["trimmed.mkv", "trimmed.mkv.part"]
+
+
+def test_failed_remux_removes_output_and_temporary_files(tmp_path, monkeypatch):
+    def fail_replace(self, target):
+        message = "remux replacement failed"
+        raise OSError(message)
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="remux replacement failed"):
+        write_chapters(SOURCE, tmp_path / "failed.mkv", [ChapterClip(128, 140, (0, 0, 32, 32))], trim_to_source=True)
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.mark.parametrize("box", [(-4, 0, 28, 32), (11, 6, 43, 38)])

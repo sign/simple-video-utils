@@ -226,7 +226,11 @@ resizes the crop to exactly that size; the default keeps the box size.
 Clips must be in source order without overlaps; each keeps its source timestamps, and gaps
 contain no filler frames. Chapter payload tags retain their source specs.
 Chapter boundaries use Matroska's millisecond clock. A source that ends before
-a requested trim finishes raises `ValueError`.
+a requested trim finishes raises `ValueError`. Pass `trim_to_source=True` to shorten
+clips to the last decoded frame and drop clips starting past it, without a separate
+frame-counting pass. If every clip is dropped, it raises `ValueError`.
+`write_chapters` returns the clips actually written; chapter times and payloads
+match those clips.
 
 Requires PyAV 19+. Output is a new, video-only Matroska file encoded as H.264
 at `crf=23`, using the source frame rate and pixel format. Each chapter's output
