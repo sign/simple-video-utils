@@ -77,7 +77,8 @@ class Timeline:
             return t
         start, end, _ = self.chapters.T
         i = max(np.searchsorted(start, t, side="right") - 1, 0)
-        return float(t - start[i] + (end[:i] - start[:i]).sum())
+        # a gap's time (or a chapter start a float-ulp early) stops the clock at its chapter's end
+        return float(min(t, end[i]) - start[i] + (end[:i] - start[:i]).sum())
 
     def gaps(self) -> float:
         """Seconds between chapters that hold no frames."""
