@@ -75,6 +75,8 @@ def test_squeeze_and_gaps():
     assert T.gaps() == 0
     assert [gapped.squeeze(15), gapped.squeeze(42)] == [5, 12]
     assert [T.squeeze(12), Timeline().squeeze(3)] == [12, 3]
+    # gap time, or a chapter start a float-ulp early, holds at the previous chapter's end (stays monotonic)
+    assert [gapped.squeeze(30), gapped.squeeze(np.nextafter(40, 0)), gapped.squeeze(40)] == [10, 10, 10]
 
 
 def test_ordinary_chapter_markers_map_to_themselves(tmp_path):
