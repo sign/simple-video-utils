@@ -16,24 +16,24 @@ import io
 import json
 import math
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Sequence
-from contextlib import closing
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from fractions import Fraction
-from itertools import chain, takewhile
+from itertools import takewhile
 from typing import BinaryIO, NamedTuple
 
 import av
 import numpy as np
 
 from simple_video_utils.frames import read_frames_exact
-from simple_video_utils.metadata import _open_video, video_metadata
+from simple_video_utils.metadata import _open_video, video_metadata, video_metadata_from_container
 from simple_video_utils.timeline import Timeline
 
 # MP4 output hides each clip's keyframe lead-in behind an edit list, keeping
 # packet copy frame-accurate for players — but only for codecs MP4 can carry.
 # Everything else is re-encoded so clips stay exact: WebM has no edit list (a
-# copied VP8/VP9 clip would visibly start at the previous keyframe), and PyAV
-# can't mux VP9 into MP4 anyway. The ideal source is H.264 in a streamable
+# copied VP8/VP9 clip would visibly start at the previous keyframe), and the eager API keeps its H.264
+# fallback for VP9. The ideal source is H.264 in a streamable
 # MP4 (faststart/fragmented) or MPEG-TS: opens without seeking and always
 # takes the lossless copy path.
 _MP4_COPY_CODECS = {"h264", "hevc", "av1", "mpeg4"}
@@ -73,30 +73,36 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
     frames = list(read_frames_exact(src, start_time=start, end_time=end, return_indices=True))
     if not frames:
         return b""
+    height, width = (size, size) if size else frames[0][0].shape[:2]
     buffer = io.BytesIO()
     rate = Fraction(fps).limit_denominator(1000)
     with _mp4(buffer, len(frames), marks) as output:
         stream = output.add_stream("h264", rate=rate)
-        output.mux(_encode_frames(frames, stream, rate, size, packed=bool(marks)))
+        stream.width, stream.height = width, height
+        stream.pix_fmt = "yuv420p"
+        # One reformatter per clip so the swscale context is built once, not
+        # per frame (same fix as _frames_to_rgb) — byte-identical output.
+        reformatter = av.video.reformatter.VideoReformatter()
+        for position, (frame, index) in enumerate(frames):
+            array = _center_crop_square(frame) if size else frame
+            video_frame = reformatter.reformat(av.VideoFrame.from_ndarray(array, format="rgb24"), width=width,
+                                               height=height)
+            # source frame indices: frames cropped out of a chaptered video stay a gap, unless chapters say where
+            video_frame.pts = (position if marks else index - frames[0][1])
+            video_frame.time_base = 1 / rate
+            output.mux(stream.encode(video_frame))
+        output.mux(stream.encode())
     return buffer.getvalue()
 
 
-def _encode_frames(frames, stream: av.VideoStream, rate: Fraction, size: int | None, *, packed: bool):
-    """Share geometry and source-frame timing between buffered and fragmented slices."""
-    frames = iter(frames)
-    first = next(frames)
-    stream.height, stream.width = (size, size) if size else first[0].shape[:2]
-    stream.pix_fmt = "yuv420p"
-    reformatter = av.video.reformatter.VideoReformatter()
-    for position, (array, index) in enumerate(chain((first,), frames)):
-        array = _center_crop_square(array) if size else array
-        frame = reformatter.reformat(av.VideoFrame.from_ndarray(array, format="rgb24"),
-                                      width=stream.width, height=stream.height)
-        # Chaptered clips play back to back; otherwise source-frame gaps stay gaps.
-        frame.pts = position if packed else index - first[1]
-        frame.time_base = 1 / rate
-        yield from stream.encode(frame)
-    yield from stream.encode()
+def _copy_packet(source, destination, start, clock):
+    # A packet may be reused by the next slice's keyframe lead-in.
+    packet = av.Packet(bytes(source))
+    packet.pts = _rebase(source.pts, start, source.time_base, clock)
+    packet.dts = _rebase(source.dts, start, source.time_base, clock)
+    packet.duration, packet.time_base = source.duration, source.time_base
+    packet.is_keyframe, packet.stream = source.is_keyframe, destination
+    return packet
 
 
 def _mux_packets(
@@ -109,14 +115,7 @@ def _mux_packets(
         # mux a copy: the source packets are shared between clips (the keyframe
         # lead-in), so rebasing them in place would corrupt the next clip
         for source in packets:
-            packet = av.Packet(bytes(source))
-            packet.pts = _rebase(source.pts, start, source.time_base, clock)
-            packet.dts = _rebase(source.dts, start, source.time_base, clock)
-            packet.duration = source.duration
-            packet.time_base = source.time_base
-            packet.is_keyframe = source.is_keyframe
-            packet.stream = destination
-            container.mux(packet)
+            container.mux(_copy_packet(source, destination, start, clock))
     return output.getvalue()
 
 
@@ -149,9 +148,32 @@ def _window(packets: list[av.Packet], start: int) -> list[av.Packet]:
 
 
 def _iter_packets(container: av.container.InputContainer, stream: av.VideoStream) -> Iterator[av.Packet]:
+    # Matroska may omit the first decode timestamps after a seek. Keep its
+    # short reorder prefix until a known DTS lets us recover them backwards.
+    pending = []
     for packet in container.demux(stream):
-        if packet.pts is not None and packet.dts is not None and packet.size:
-            yield packet
+        if packet.pts is None or not packet.size:
+            continue
+        if packet.dts is None:
+            pending.append(packet)
+            if len(pending) > 32:
+                message = "Cannot recover video decode timestamps within 32 packets"
+                raise ValueError(message)
+            continue
+        dts = packet.dts
+        for previous in reversed(pending):
+            step = previous.duration or packet.duration
+            if not step:
+                message = "Cannot recover video decode timestamps without packet durations"
+                raise ValueError(message)
+            dts -= step
+            previous.dts = dts
+        yield from pending
+        pending.clear()
+        yield packet
+    if pending:
+        message = "Video ended before its decode timestamps could be recovered"
+        raise ValueError(message)
 
 
 def _copy_clip(
@@ -353,16 +375,39 @@ def slice_video_stream(
         yield from windows(container, source, duration)
 
 
-class _FragmentSink(io.RawIOBase):
-    def __init__(self):
-        super().__init__()
+class _SliceOutput(io.RawIOBase):
+    """Keep final MP4 headers on the first pass; emit only sequential media on replay."""
+
+    def __init__(self, header_size: int, *, record: bool):
+        self.position = self.length = 0
+        self.header_size = header_size
+        self.header = bytearray(header_size) if record else None
         self.pending = deque()
 
     def writable(self):
         return True
 
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.position
+
+    def seek(self, offset, whence=0):
+        self.position = offset + (self.position if whence == 1 else self.length if whence == 2 else 0)
+        return self.position
+
     def write(self, data):
-        self.pending.append(bytes(data))
+        end = self.position + len(data)
+        if self.header is not None:
+            if self.position < self.header_size:
+                self.header[self.position:min(end, self.header_size)] = data[:self.header_size - self.position]
+        elif end > self.header_size:
+            if max(self.position, self.header_size) < self.length:
+                message = "MP4 muxer attempted to rewrite already-streamed media"
+                raise OSError(message)
+            self.pending.append(bytes(data[max(0, self.header_size - self.position):]))
+        self.position, self.length = end, max(self.length, end)
         return len(data)
 
     def drain(self):
@@ -370,64 +415,139 @@ class _FragmentSink(io.RawIOBase):
             yield self.pending.popleft()
 
 
-def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = False) -> Generator[bytes, None, float]:
-    """Yield the bytes of one continuous MP4 slice as small fragments, on demand.
+def _slice_packets(source, stream, begin, stop, timeline, end, keyframe=None):
+    source.seek(begin if keyframe is None else keyframe, stream=stream, backward=True)
+    ready = keyframe is None
+    for packet in _iter_packets(source, stream):
+        if packet.dts > stop or (timeline.chapters.size and timeline.to_source(
+                packet.dts * packet.time_base) > end + packet.time_base / 2):
+            break
+        if not ready:
+            ready = packet.is_keyframe and packet.pts == keyframe
+        if ready:
+            yield packet
 
-    Unlike ``slice_video``, this never collects a complete clip or its frames.
-    It incrementally re-encodes H.264 (CRF 18), trading lossless packet copying
-    for bounded buffers and exact frame boundaries. ``start`` and ``end`` use
-    source seconds and include the frames timed inside the range, as in
-    ``read_frames_exact``. ``chapters=True`` keeps source chapter offsets while
-    playing their frames back to back. Otherwise chapter gaps stay in the PTS.
 
-    Output is a fragmented MP4 that a non-seekable reader can demux. Close the
-    iterator when stopping early to release its decoder and encoder. Reopening
-    it against the same source produces the same bytes. The generator returns
-    the encoded duration in seconds after its final fragment.
-    """
-    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
-        message = "slice times must be finite and satisfy 0 <= start < end"
+def _write_slice(output, stream, packets, samples, begin, clock, marks):
+    with _mp4(output, samples, marks) as container:
+        destination = container.add_stream_from_template(stream)
+        count = 0
+        for source in packets:
+            count += 1
+            container.mux(_copy_packet(source, destination, begin, clock))
+            yield from output.drain()
+        if count != samples:
+            message = "Video source changed between slice reads"
+            raise OSError(message)
+    yield from output.drain()
+
+
+def _slice_stats(packets, begin, stop):
+    samples, keyframe, visible = 0, None, False
+    for packet in packets:
+        if packet.is_keyframe and packet.pts <= begin:
+            samples, keyframe, visible = 0, packet.pts, False
+        samples += 1
+        visible |= begin <= packet.pts <= stop
+    if not visible:
+        message = "slice has no frames"
         raise ValueError(message)
-    meta = video_metadata(src)
-    timeline = Timeline.read(src)
-    rate = timeline.rate or Fraction(meta.fps).limit_denominator(1001)
-    if rate <= 0:
-        message = "Video has no FPS information"
-        raise ValueError(message)
-    held = timeline.chapters
-    duration = float(held[-1, 2] + held[-1, 1] - held[-1, 0]) if held.size else meta.duration
-    if duration is not None and end > duration:
-        message = f"slice ({start}, {end}) out of range [0, {duration}]"
-        raise ValueError(message)
-    window = timeline.window(start, end)
-    if window is None:
-        message = f"slice ({start}, {end}) has no frames"
-        raise ValueError(message)
-    marks = _clip_chapters(timeline, window, end, float(rate), copied=False) if chapters else []
-    sink = _FragmentSink()
-    # A fixed fragment duration bounds libav's mux buffer even for a source with a long GOP.
-    options = {"movflags": "frag_keyframe+empty_moov+default_base_moof", "frag_duration": "1000000"}
-    with closing(read_frames_exact(src, start_time=start, end_time=end, return_indices=True,
-                                   thread_type="NONE")) as frames:
-        first = next(frames, None)
-        if first is None:
-            message = f"slice ({start}, {end}) has no frames"
+    return samples, keyframe
+
+
+@dataclass
+class _Slice:
+    """A replayable lossless slice. Cache scalars, never headers or encoded media."""
+
+    src: str
+    start: float
+    end: float
+    chapters: bool = False
+    _stats: tuple | None = field(default=None, init=False, repr=False)
+    _length: int | None = field(default=None, init=False, repr=False)
+    _duration: float | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self):
+        if not math.isfinite(self.start) or not math.isfinite(self.end) or self.start < 0 or self.end <= self.start:
+            message = "slice times must be finite and satisfy 0 <= start < end"
             raise ValueError(message)
-        with av.open(sink, mode="w", format="mp4", options=options) as output:
-            # Encoded bytes identify cache entries and must survive independent replays.
-            output.flags |= av.container.Flags.bitexact.value
-            if marks:
-                output.set_chapters(marks)
-            stream = output.add_stream("h264", rate=rate)
-            stream.options = {"preset": "fast", "crf": "18", "threads": "1"}
-            stream.codec_context.flags |= av.codec.context.Flags.bitexact.value
-            stream.codec_context.max_b_frames = 0
-            stream.codec_context.gop_size = max(1, round(rate))
-            duration = 0.0
-            for packet in _encode_frames(chain((first,), frames), stream, rate, None, packed=bool(marks)):
-                if packet.pts is not None and packet.time_base is not None:
-                    duration = max(duration, float((packet.pts + (packet.duration or 1)) * packet.time_base))
-                output.mux(packet)
-                yield from sink.drain()
-        yield from sink.drain()
-    return duration
+
+    def _plan(self, source):
+        stream = source.streams.video[0]
+        timeline = Timeline.read(source)
+        held = timeline.chapters
+        duration = (float(held[-1, 2] + held[-1, 1] - held[-1, 0]) if held.size else
+                    float(stream.duration * stream.time_base) if stream.duration is not None else
+                    source.duration / av.time_base if source.duration is not None else None)
+        if duration is not None and self.end > duration:
+            message = f"slice ({self.start}, {self.end}) out of range [0, {duration}]"
+            raise ValueError(message)
+        window = timeline.window(self.start, self.end)
+        if window is None:
+            message = f"slice ({self.start}, {self.end}) has no frames"
+            raise ValueError(message)
+        rate = timeline.rate or stream.average_rate or stream.guessed_rate
+        if self.chapters and held.size and not rate:
+            message = "Chapter mapping requires a source frame rate"
+            raise ValueError(message)
+        marks = (_clip_chapters(timeline, window, self.end, float(rate), copied=True)
+                 if self.chapters and held.size else [])
+        origin = float((stream.start_time or 0) * stream.time_base)
+        low, high = (time - origin if held.size else time for time in window)
+        begin, stop = _stream_pts(low, stream), _stream_pts(high, stream)
+        clock = (timeline.squeeze if marks else timeline.to_source) if held.size else None
+        if self._stats is None:
+            self._stats = _slice_stats(
+                _slice_packets(source, stream, begin, stop, timeline, self.end), begin, stop)
+        return stream, timeline, begin, stop, clock, marks
+
+    def duration_seconds(self):
+        if self._duration is None:
+            with _open_video(self.src) as source:
+                self._header(source, *self._plan(source))
+        return self._duration
+
+    def size_bytes(self):
+        self.duration_seconds()
+        return self._length
+
+    def _header(self, source, stream, timeline, begin, stop, clock, marks):
+        samples, keyframe = self._stats
+        # _mp4 reserves 4096 + 32 bytes/sample; the extra covers ftyp, mdat and its size patch.
+        header_size = 4096 + 32 * samples + 1024
+        recorded = _SliceOutput(header_size, record=True)
+        packets = _slice_packets(source, stream, begin, stop, timeline, self.end, keyframe)
+        for _ in _write_slice(recorded, stream, packets, samples, begin, clock, marks):
+            pass
+        assert recorded.header is not None
+        header = bytes(recorded.header[:min(recorded.length, header_size)])
+        length, header_size = recorded.length, len(header)
+        del recorded
+        if self._length is not None and length != self._length:
+            message = "Video source changed between slice reads"
+            raise OSError(message)
+        self._length = length
+        with av.open(io.BytesIO(header), mode="r") as container:
+            self._duration = video_metadata_from_container(container, rotation=0).duration
+        if self._duration is None:
+            message = "Could not determine slice duration"
+            raise ValueError(message)
+        return header
+
+    def __call__(self):
+        with _open_video(self.src) as source:
+            plan = self._plan(source)
+            stream, timeline, begin, stop, clock, marks = plan
+            header = self._header(source, *plan)
+            length, header_size = self._length, len(header)
+            samples, keyframe = self._stats
+            yield header
+            del header
+            if header_size < length:
+                output = _SliceOutput(header_size, record=False)
+                yield from _write_slice(output, stream,
+                                        _slice_packets(source, stream, begin, stop, timeline, self.end, keyframe),
+                                        samples, begin, clock, marks)
+                if output.length != length:
+                    message = "Video source changed while replaying the slice"
+                    raise OSError(message)

@@ -1,22 +1,17 @@
-"""Replayable video bodies with bounded async reads and content fingerprints."""
+"""A video backed by bytes, binary I/O or a replayable slice."""
 
-import asyncio
 import hashlib
 import io
-import threading
-from _thread import LockType
-from collections.abc import AsyncGenerator, Callable, Generator, Iterator
+from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO, cast
 
-import anyio
 
-
-@dataclass
+@dataclass(eq=False)
 class Video:
     """One video backed by bytes, binary I/O, or a replayable byte-generator factory.
 
-    Caller-owned I/O stays open. Seekable I/O replays from its initial position;
+    Caller-owned I/O stays open and has one shared cursor. Seekable I/O replays from byte zero;
     non-seekable I/O supports one read. A generator factory must reproduce the
     same bytes on every pass. Close readers when stopping consumption early.
     """
@@ -27,32 +22,30 @@ class Video:
     size: int | None = None
     digest: str | None = None
 
-    _start: int | None = field(default=None, init=False, repr=False)
+    _seekable: bool = field(default=False, init=False, repr=False)
+    _reading: bool = field(default=False, init=False, repr=False)
     _consumed: bool = field(default=False, init=False, repr=False)
-    _duration_from_source: bool = field(default=False, init=False, repr=False)
-    _io_lock: LockType = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
         if isinstance(self.source, bytes):
             self.size = len(self.source)
         if not isinstance(self.source, bytes) and not callable(self.source) and self.source.seekable():
-            self._start = self.source.tell()
+            self._seekable = True
 
     @classmethod
     def from_slice(cls, src: str, start: float, end: float, *, chapters: bool = False) -> "Video":
-        """Bind a lazy slice whose duration comes from its encoded frame timestamps."""
-        from simple_video_utils.slicing import slice_video_chunks
+        """Bind a lossless MP4 slice; read it lazily without retaining its media.
 
-        def produce():
-            body.duration = yield from slice_video_chunks(src, start, end, chapters=chapters)
+        The source must remain unchanged. MP4-unsupported codecs raise rather than
+        re-encode. Only MP4 headers/sample tables and the current packet are buffered.
+        """
+        from simple_video_utils.slicing import _Slice
 
-        body = cls(produce)
-        body._duration_from_source = True
-        return body
+        return cls(_Slice(src, start, end, chapters))
 
     @property
     def replayable(self) -> bool:
-        return isinstance(self.source, bytes) or callable(self.source) or self._start is not None
+        return isinstance(self.source, bytes) or callable(self.source) or self._seekable
 
     def iter_bytes(self) -> Generator[bytes, None, None]:
         """Read bounded pieces; a factory gives concurrent readers independent decoders."""
@@ -60,14 +53,20 @@ class Video:
             for start in range(0, len(self.source), 64 * 1024):
                 yield self.source[start:start + 64 * 1024]
         elif callable(self.source):
-            yield from self.source()
-        else:
-            if not self._io_lock.acquire(blocking=False):
-                message = "Video I/O is already being consumed; use independent sources for concurrent readers"
-                raise RuntimeError(message)
+            chunks = self.source()
             try:
-                if self._start is not None:
-                    self.source.seek(self._start)
+                yield from _coalesce(chunks)
+            finally:
+                if close := getattr(chunks, "close", None):
+                    close()
+        else:
+            if self._reading:
+                message = "Video I/O already has an active reader"
+                raise ValueError(message)
+            self._reading = True
+            try:
+                if self._seekable:
+                    self.source.seek(0)
                 elif self._consumed:
                     message = "Non-seekable video cannot be replayed"
                     raise ValueError(message)
@@ -75,14 +74,17 @@ class Video:
                 while chunk := self.source.read(64 * 1024):
                     yield chunk
             finally:
-                self._io_lock.release()
+                self._reading = False
 
-    async def duration_seconds(self) -> float:
+    def duration_seconds(self) -> float:
         if self.duration is None:
-            if self._duration_from_source:
-                await self.fingerprint()
+            from simple_video_utils.slicing import _Slice
+
+            if isinstance(self.source, _Slice):
+                self.duration = self.source.duration_seconds()
+                self.size = self.source.size_bytes()
             else:
-                self.duration = await _run_sync(self._measure_duration)
+                self.duration = self._measure_duration()
         assert self.duration is not None
         return self.duration
 
@@ -91,25 +93,24 @@ class Video:
 
         from simple_video_utils.metadata import video_metadata_from_container
 
-        if not isinstance(self.source, bytes) and self._start is None:
+        if self._reading:
+            message = "Video I/O already has an active reader"
+            raise ValueError(message)
+        if not isinstance(self.source, bytes) and not self._seekable:
             message = "Supply duration for a generated or non-seekable video"
             raise ValueError(message)
-        shared_io = not isinstance(self.source, bytes)
-        if shared_io and not self._io_lock.acquire(blocking=False):
-            message = "Video I/O is already being consumed"
-            raise RuntimeError(message)
+        source = io.BytesIO(self.source) if isinstance(self.source, bytes) else cast(BinaryIO, self.source)
+        position = source.tell()
+        self._reading = True
         try:
-            source = io.BytesIO(self.source) if isinstance(self.source, bytes) else cast(BinaryIO, self.source)
-            position = source.tell()
-            source.seek(0 if self._start is None else self._start)
-            try:
-                with av.open(source, mode="r") as container:
-                    meta = video_metadata_from_container(container)
-            finally:
-                source.seek(position)
+            source.seek(0)
+            with av.open(source, mode="r") as container:
+                meta = video_metadata_from_container(container, rotation=0)
         finally:
-            if shared_io:
-                self._io_lock.release()
+            try:
+                source.seek(position)
+            finally:
+                self._reading = False
         if meta.duration is not None:
             return meta.duration
         if meta.nb_frames and meta.fps:
@@ -117,34 +118,42 @@ class Video:
         message = "Could not determine video duration"
         raise ValueError(message)
 
-    async def chunks(self) -> AsyncGenerator[bytes, None]:
-        iterator = self.iter_bytes()
-        end = object()
-        try:
-            while (chunk := await _run_sync(next, iterator, end)) is not end:
-                yield cast(bytes, chunk)
-        finally:
-            with anyio.CancelScope(shield=True):
-                await _run_sync(iterator.close)
+    def size_bytes(self) -> int:
+        """Measure length without retaining media; slices need no content hash."""
+        if self.size is None:
+            from simple_video_utils.slicing import _Slice
 
-    async def fingerprint(self) -> str:
+            if isinstance(self.source, _Slice):
+                self.size = self.source.size_bytes()
+            else:
+                self.fingerprint()
+        assert self.size is not None
+        return self.size
+
+    def fingerprint(self) -> str:
         if not self.replayable:
             message = "Fingerprinting requires a replayable video source"
             raise ValueError(message)
-        if self.digest is None:
+        if self.digest is None or self.size is None:
             digest, size = hashlib.md5(), 0
-            async for chunk in self.chunks():
+            for chunk in self.iter_bytes():
                 digest.update(chunk)
                 size += len(chunk)
             self.digest, self.size = digest.hexdigest(), size
         return self.digest
 
 
-async def _run_sync(function, *args):
-    # Both ASGI scope cancellation and TaskGroup cancellation must join decoder work.
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
-    try:
-        return await asyncio.shield(task)
-    finally:
-        with anyio.CancelScope(shield=True):
-            await task
+def _coalesce(chunks):
+    """Keep transport chunks bounded without one scheduler hop per media packet."""
+    pending = bytearray()
+    for chunk in chunks:
+        view = memoryview(chunk)
+        while view:
+            count = min(len(view), 64 * 1024 - len(pending))
+            pending.extend(view[:count])
+            view = view[count:]
+            if len(pending) == 64 * 1024:
+                yield bytes(pending)
+                pending.clear()
+    if pending:
+        yield bytes(pending)
