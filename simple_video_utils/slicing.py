@@ -15,9 +15,11 @@ Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
 import io
 import json
 import math
-from collections.abc import Callable, Iterator, Sequence
+from collections import deque
+from collections.abc import Callable, Generator, Iterator, Sequence
+from contextlib import closing
 from fractions import Fraction
-from itertools import takewhile
+from itertools import chain, takewhile
 from typing import BinaryIO, NamedTuple
 
 import av
@@ -71,26 +73,30 @@ def _encode_clip(src: str, start: float, end: float, fps: float, size: int | Non
     frames = list(read_frames_exact(src, start_time=start, end_time=end, return_indices=True))
     if not frames:
         return b""
-    height, width = (size, size) if size else frames[0][0].shape[:2]
     buffer = io.BytesIO()
     rate = Fraction(fps).limit_denominator(1000)
     with _mp4(buffer, len(frames), marks) as output:
         stream = output.add_stream("h264", rate=rate)
-        stream.width, stream.height = width, height
-        stream.pix_fmt = "yuv420p"
-        # One reformatter per clip so the swscale context is built once, not
-        # per frame (same fix as _frames_to_rgb) — byte-identical output.
-        reformatter = av.video.reformatter.VideoReformatter()
-        for position, (frame, index) in enumerate(frames):
-            array = _center_crop_square(frame) if size else frame
-            video_frame = reformatter.reformat(av.VideoFrame.from_ndarray(array, format="rgb24"), width=width,
-                                               height=height)
-            # source frame indices: frames cropped out of a chaptered video stay a gap, unless chapters say where
-            video_frame.pts = (position if marks else index - frames[0][1])
-            video_frame.time_base = 1 / rate
-            output.mux(stream.encode(video_frame))
-        output.mux(stream.encode())
+        output.mux(_encode_frames(frames, stream, rate, size, packed=bool(marks)))
     return buffer.getvalue()
+
+
+def _encode_frames(frames, stream: av.VideoStream, rate: Fraction, size: int | None, *, packed: bool):
+    """Share geometry and source-frame timing between buffered and fragmented slices."""
+    frames = iter(frames)
+    first = next(frames)
+    stream.height, stream.width = (size, size) if size else first[0].shape[:2]
+    stream.pix_fmt = "yuv420p"
+    reformatter = av.video.reformatter.VideoReformatter()
+    for position, (array, index) in enumerate(chain((first,), frames)):
+        array = _center_crop_square(array) if size else array
+        frame = reformatter.reformat(av.VideoFrame.from_ndarray(array, format="rgb24"),
+                                      width=stream.width, height=stream.height)
+        # Chaptered clips play back to back; otherwise source-frame gaps stay gaps.
+        frame.pts = position if packed else index - first[1]
+        frame.time_base = 1 / rate
+        yield from stream.encode(frame)
+    yield from stream.encode()
 
 
 def _mux_packets(
@@ -345,3 +351,75 @@ def slice_video_stream(
         source = container.streams.video[0]
         windows = _copy_windows if source.codec_context.name in _MP4_COPY_CODECS else _encode_windows
         yield from windows(container, source, duration)
+
+
+class _FragmentSink(io.RawIOBase):
+    def __init__(self):
+        super().__init__()
+        self.pending = deque()
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        self.pending.append(bytes(data))
+        return len(data)
+
+    def drain(self):
+        while self.pending:
+            yield self.pending.popleft()
+
+
+def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = False) -> Generator[bytes, None, None]:
+    """Yield the bytes of one continuous MP4 slice as small fragments, on demand.
+
+    Unlike ``slice_video``, this never collects a complete clip or its frames.
+    It incrementally re-encodes H.264 (CRF 18), trading lossless packet copying
+    for bounded buffers and exact frame boundaries. ``start`` and ``end`` use
+    source seconds and include the frames timed inside the range, as in
+    ``read_frames_exact``. ``chapters=True`` keeps source chapter offsets while
+    playing their frames back to back. Otherwise chapter gaps stay in the PTS.
+
+    Output is a fragmented MP4 that a non-seekable reader can demux. Close the
+    iterator when stopping early to release its decoder and encoder. Reopening
+    it against the same source produces the same bytes.
+    """
+    if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+        message = "slice times must be finite and satisfy 0 <= start < end"
+        raise ValueError(message)
+    meta = video_metadata(src)
+    timeline = Timeline.read(src)
+    rate = timeline.rate or Fraction(meta.fps).limit_denominator(1001)
+    if rate <= 0:
+        message = "Video has no FPS information"
+        raise ValueError(message)
+    held = timeline.chapters
+    duration = float(held[-1, 2] + held[-1, 1] - held[-1, 0]) if held.size else meta.duration
+    if duration is not None and end > duration:
+        message = f"slice ({start}, {end}) out of range [0, {duration}]"
+        raise ValueError(message)
+    window = timeline.window(start, end)
+    if window is None:
+        message = f"slice ({start}, {end}) has no frames"
+        raise ValueError(message)
+    marks = _clip_chapters(timeline, window, end, float(rate), copied=False) if chapters else []
+    sink = _FragmentSink()
+    # A fixed fragment duration bounds libav's mux buffer even for a source with a long GOP.
+    options = {"movflags": "frag_keyframe+empty_moov+default_base_moof", "frag_duration": "1000000"}
+    with closing(read_frames_exact(src, start_time=start, end_time=end, return_indices=True,
+                                   thread_type="NONE")) as frames:
+        first = next(frames, None)
+        if first is None:
+            message = f"slice ({start}, {end}) has no frames"
+            raise ValueError(message)
+        with av.open(sink, mode="w", format="mp4", options=options) as output:
+            if marks:
+                output.set_chapters(marks)
+            stream = output.add_stream("h264", rate=rate)
+            stream.options = {"preset": "fast", "crf": "18", "threads": "1"}
+            stream.codec_context.max_b_frames = 0
+            stream.codec_context.gop_size = max(1, round(rate))
+            for packet in _encode_frames(chain((first,), frames), stream, rate, None, packed=bool(marks)):
+                output.mux(packet)
+                yield from sink.drain()
+        yield from sink.drain()

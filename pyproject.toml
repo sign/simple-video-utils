@@ -12,6 +12,7 @@ dependencies = [
     "av>=19.0.0",
     "certifi", # HTTPS trust roots when Python has no default CA file (e.g. standalone builds)
     "numpy",
+    "anyio", # shield async decoder cleanup from ASGI cancellation
 ]
 
 [project.optional-dependencies]
