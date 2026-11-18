@@ -413,10 +413,13 @@ def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = F
             message = f"slice ({start}, {end}) has no frames"
             raise ValueError(message)
         with av.open(sink, mode="w", format="mp4", options=options) as output:
+            # Encoded bytes identify cache entries and must survive independent replays.
+            output.flags |= av.container.Flags.bitexact.value
             if marks:
                 output.set_chapters(marks)
             stream = output.add_stream("h264", rate=rate)
             stream.options = {"preset": "fast", "crf": "18", "threads": "1"}
+            stream.codec_context.flags |= av.codec.context.Flags.bitexact.value
             stream.codec_context.max_b_frames = 0
             stream.codec_context.gop_size = max(1, round(rate))
             for packet in _encode_frames(chain((first,), frames), stream, rate, None, packed=bool(marks)):

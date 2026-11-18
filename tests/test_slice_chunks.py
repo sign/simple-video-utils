@@ -138,7 +138,7 @@ async def test_slice_and_async_body_fingerprint_replay(source):
     body = Video(produce, 2)
     digest = await body.fingerprint()
     await asyncio.sleep(1.1)  # A new wall-clock second must not change container metadata.
-    for _ in range(3):
+    for _ in range(10):
         data = b"".join([part async for part in body.chunks()])
         expected = b"".join(passes[0])
         differences = [(index, left, right) for index, (left, right) in enumerate(zip(expected, data, strict=False))
