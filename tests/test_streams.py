@@ -186,3 +186,25 @@ def test_factory_is_coalesced_and_closed_on_early_stop():
     assert len(next(reader)) == 65536
     reader.close()
     assert closed == [True]
+
+
+@pytest.mark.parametrize("kind", ["bytes", "io"])
+def test_browser_video_without_duration_or_rate_uses_decoded_fallback(kind):
+    import io
+    from pathlib import Path
+
+    import av
+
+    data = (Path(__file__).parent / "assets" / "mediarecorder-no-average-rate.webm").read_bytes()
+    # Hide the 32-bit Matroska Duration element under an unknown, equally sized ID.
+    # Browser/live recordings may omit it; changing its ID leaves media untouched.
+    assert data.count(b"\x44\x89\x84") == 1
+    data = data.replace(b"\x44\x89\x84", b"\x4a\xbc\x84")
+    with av.open(io.BytesIO(data)) as container:
+        assert container.duration is None
+        assert not container.streams.video[0].average_rate
+        frames = list(container.decode(video=0))
+    expected = len(frames) * (frames[-1].time - frames[0].time) / (len(frames) - 1)
+    body = Video(data if kind == "bytes" else io.BytesIO(data))
+    assert body.duration_seconds() == pytest.approx(expected)
+    assert b"".join(body.iter_bytes()) == data

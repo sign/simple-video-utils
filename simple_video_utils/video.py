@@ -106,6 +106,8 @@ class Video:
             source.seek(0)
             with av.open(source, mode="r") as container:
                 meta = video_metadata_from_container(container, rotation=0)
+                if meta.duration is None and not (meta.nb_frames and meta.fps):
+                    meta = video_metadata_from_container(container)
         finally:
             try:
                 source.seek(position)
