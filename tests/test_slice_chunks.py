@@ -123,13 +123,29 @@ def test_existing_codecs_rotation_and_missing_rate(name):
 
 @pytest.mark.anyio
 async def test_slice_and_async_body_fingerprint_replay(source):
+    import asyncio
     import hashlib
 
-    body = Video(lambda: slice_video_chunks(source, 0, 2), 2)
+    passes = []
+
+    def produce():
+        chunks = []
+        passes.append(chunks)
+        for chunk in slice_video_chunks(source, 0, 2):
+            chunks.append(chunk)
+            yield chunk
+
+    body = Video(produce, 2)
     digest = await body.fingerprint()
-    data = b"".join([part async for part in body.chunks()])
-    assert digest == hashlib.md5(data).hexdigest()
-    assert body.size == len(data)
+    await asyncio.sleep(1.1)  # A new wall-clock second must not change container metadata.
+    for _ in range(3):
+        data = b"".join([part async for part in body.chunks()])
+        expected = b"".join(passes[0])
+        differences = [(index, left, right) for index, (left, right) in enumerate(zip(expected, data, strict=False))
+                       if left != right][:16]
+        assert digest == hashlib.md5(data).hexdigest(), (len(expected), len(data), differences)
+        assert body.size == len(data)
+
 
 
 @pytest.fixture
