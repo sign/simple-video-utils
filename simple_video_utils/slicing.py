@@ -15,7 +15,6 @@ Every clip is a streamable MP4 (``moov`` before ``mdat``): a progressive reader
 import io
 import json
 import math
-from collections import deque
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
@@ -382,7 +381,7 @@ class _SliceOutput(io.RawIOBase):
         self.position = self.length = 0
         self.header_size = header_size
         self.header = bytearray(header_size) if record else None
-        self.pending = deque()
+        self.pending = bytearray()
 
     def writable(self):
         return True
@@ -406,13 +405,17 @@ class _SliceOutput(io.RawIOBase):
             if max(self.position, self.header_size) < self.length:
                 message = "MP4 muxer attempted to rewrite already-streamed media"
                 raise OSError(message)
-            self.pending.append(bytes(data[max(0, self.header_size - self.position):]))
+            self.pending.extend(memoryview(data)[max(0, self.header_size - self.position):])
         self.position, self.length = end, max(self.length, end)
         return len(data)
 
-    def drain(self):
-        while self.pending:
-            yield self.pending.popleft()
+    def drain(self, *, final=False):
+        # Batch small muxer writes within a slice. A caller's own byte stream
+        # controls when its chunks are ready for consumption.
+        if len(self.pending) >= 64 * 1024 or (final and self.pending):
+            data = bytes(self.pending)
+            self.pending.clear()
+            yield data
 
 
 def _slice_packets(source, stream, begin, stop, timeline, end, keyframe=None):
@@ -439,7 +442,7 @@ def _write_slice(output, stream, packets, samples, begin, clock, marks):
         if count != samples:
             message = "Video source changed between slice reads"
             raise OSError(message)
-    yield from output.drain()
+    yield from output.drain(final=True)
 
 
 def _slice_stats(packets, begin, stop):

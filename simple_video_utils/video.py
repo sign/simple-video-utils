@@ -50,12 +50,12 @@ class Video:
     def iter_bytes(self) -> Generator[bytes, None, None]:
         """Read bounded pieces; a factory gives concurrent readers independent decoders."""
         if isinstance(self.source, bytes):
-            for start in range(0, len(self.source), 64 * 1024):
-                yield self.source[start:start + 64 * 1024]
+            yield from _pieces(self.source)
         elif callable(self.source):
             chunks = self.source()
             try:
-                yield from _coalesce(chunks)
+                for chunk in chunks:
+                    yield from _pieces(chunk)
             finally:
                 if close := getattr(chunks, "close", None):
                     close()
@@ -145,17 +145,6 @@ class Video:
         return self.digest
 
 
-def _coalesce(chunks):
-    """Keep transport chunks bounded without one scheduler hop per media packet."""
-    pending = bytearray()
-    for chunk in chunks:
-        view = memoryview(chunk)
-        while view:
-            count = min(len(view), 64 * 1024 - len(pending))
-            pending.extend(view[:count])
-            view = view[count:]
-            if len(pending) == 64 * 1024:
-                yield bytes(pending)
-                pending.clear()
-    if pending:
-        yield bytes(pending)
+def _pieces(data: bytes) -> Iterator[bytes]:
+    for start in range(0, len(data), 64 * 1024):
+        yield data[start:start + 64 * 1024]

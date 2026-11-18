@@ -172,18 +172,18 @@ def test_io_cannot_be_probed_or_read_by_two_consumers():
     assert len(b"".join(body.iter_bytes())) == 65537
 
 
-def test_factory_is_coalesced_and_closed_on_early_stop():
+def test_first_factory_chunk_is_delivered_before_requesting_another():
     closed = []
 
     def source():
         try:
-            for _ in range(65537):
-                yield b"a"
+            yield b"header"
+            pytest.fail("reader requested more media before delivering the header")
         finally:
             closed.append(True)
 
     reader = Video(source).iter_bytes()
-    assert len(next(reader)) == 65536
+    assert next(reader) == b"header"
     reader.close()
     assert closed == [True]
 
