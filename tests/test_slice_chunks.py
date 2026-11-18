@@ -151,3 +151,26 @@ async def test_slice_and_async_body_fingerprint_replay(source):
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_video_slice_duration_includes_boundary_frame(source):
+    body = Video.from_slice(source, 0, 5)
+    assert body.duration is None  # binding the slice must not decode frames
+    assert await body.duration_seconds() == pytest.approx(151 / 30)
+    assert body.duration > 5
+    assert body.digest is not None  # the same pass measured content identity and duration
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("chapters", [False, True])
+async def test_video_slice_duration_uses_output_timestamps_across_gaps(tmp_path, chapters):
+    path = tmp_path / "source.mkv"
+    _write_video(path, frames=15, starts=(30, 300), sources=(30, 300))
+    body = Video.from_slice(str(path), 1.2, 10.2, chapters=chapters)
+    expected = 16 / 30 if chapters else 271 / 30
+    assert await body.duration_seconds() == pytest.approx(expected)
+    data = b"".join([part async for part in body.chunks()])
+    with av.open(io.BytesIO(data), mode="r") as container:
+        frames = list(container.decode(video=0))
+        assert frames[-1].time + 1 / 30 == pytest.approx(expected)

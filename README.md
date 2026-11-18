@@ -192,14 +192,16 @@ Non-seekable I/O supports one read and requires a supplied duration when duratio
 is needed. Its `replayable` property is false; fingerprinting and a second read
 fail explicitly rather than silently consuming or retrying from the middle.
 
-For generated slices, supply the known duration and reopen the generator on
-every pass. Fingerprinting retains only the MD5 and size, never payload bytes:
+For generated slices, use `Video.from_slice()` to derive duration from encoded
+frame timestamps. Inclusive boundaries and removed chapter gaps mean the actual
+duration can differ from `end - start`. A bounded fingerprint pass measures it
+without retaining payload bytes, and delivery reopens the generator:
 
 ```python
 from contextlib import aclosing
 from simple_video_utils import Video
 
-body = Video(lambda: slice_video_chunks("video.mp4", 600, 1200, chapters=True), duration=600)
+body = Video.from_slice("video.mp4", 600, 1200, chapters=True)
 
 async def upload():
     digest = await body.fingerprint()  # a bounded pass; subsequent reads regenerate the slice

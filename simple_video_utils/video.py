@@ -5,7 +5,7 @@ import hashlib
 import io
 import threading
 from _thread import LockType
-from collections.abc import AsyncGenerator, Callable, Generator
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO, cast
 
@@ -21,7 +21,7 @@ class Video:
     same bytes on every pass. Close readers when stopping consumption early.
     """
 
-    source: bytes | BinaryIO | Callable[[], Generator[bytes, None, None]]
+    source: bytes | BinaryIO | Callable[[], Iterator[bytes]]
     duration: float | None = None
     media_type: str = "video/mp4"
     size: int | None = None
@@ -29,6 +29,7 @@ class Video:
 
     _start: int | None = field(default=None, init=False, repr=False)
     _consumed: bool = field(default=False, init=False, repr=False)
+    _duration_from_source: bool = field(default=False, init=False, repr=False)
     _io_lock: LockType = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self):
@@ -36,6 +37,18 @@ class Video:
             self.size = len(self.source)
         if not isinstance(self.source, bytes) and not callable(self.source) and self.source.seekable():
             self._start = self.source.tell()
+
+    @classmethod
+    def from_slice(cls, src: str, start: float, end: float, *, chapters: bool = False) -> "Video":
+        """Bind a lazy slice whose duration comes from its encoded frame timestamps."""
+        from simple_video_utils.slicing import slice_video_chunks
+
+        def produce():
+            body.duration = yield from slice_video_chunks(src, start, end, chapters=chapters)
+
+        body = cls(produce)
+        body._duration_from_source = True
+        return body
 
     @property
     def replayable(self) -> bool:
@@ -66,7 +79,11 @@ class Video:
 
     async def duration_seconds(self) -> float:
         if self.duration is None:
-            self.duration = await _run_sync(self._measure_duration)
+            if self._duration_from_source:
+                await self.fingerprint()
+            else:
+                self.duration = await _run_sync(self._measure_duration)
+        assert self.duration is not None
         return self.duration
 
     def _measure_duration(self) -> float:

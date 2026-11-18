@@ -370,7 +370,7 @@ class _FragmentSink(io.RawIOBase):
             yield self.pending.popleft()
 
 
-def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = False) -> Generator[bytes, None, None]:
+def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = False) -> Generator[bytes, None, float]:
     """Yield the bytes of one continuous MP4 slice as small fragments, on demand.
 
     Unlike ``slice_video``, this never collects a complete clip or its frames.
@@ -382,7 +382,8 @@ def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = F
 
     Output is a fragmented MP4 that a non-seekable reader can demux. Close the
     iterator when stopping early to release its decoder and encoder. Reopening
-    it against the same source produces the same bytes.
+    it against the same source produces the same bytes. The generator returns
+    the encoded duration in seconds after its final fragment.
     """
     if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
         message = "slice times must be finite and satisfy 0 <= start < end"
@@ -422,7 +423,11 @@ def slice_video_chunks(src: str, start: float, end: float, *, chapters: bool = F
             stream.codec_context.flags |= av.codec.context.Flags.bitexact.value
             stream.codec_context.max_b_frames = 0
             stream.codec_context.gop_size = max(1, round(rate))
+            duration = 0.0
             for packet in _encode_frames(chain((first,), frames), stream, rate, None, packed=bool(marks)):
+                if packet.pts is not None and packet.time_base is not None:
+                    duration = max(duration, float((packet.pts + (packet.duration or 1)) * packet.time_base))
                 output.mux(packet)
                 yield from sink.drain()
         yield from sink.drain()
+    return duration
