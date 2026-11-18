@@ -206,3 +206,24 @@ async def test_duration_probe_rejects_a_generated_source_without_consuming_it():
     with pytest.raises(ValueError, match="Supply duration"):
         await body.duration_seconds()
     assert opened == []
+
+
+@pytest.mark.anyio
+async def test_bytes_allow_concurrent_duration_probes():
+    from pathlib import Path
+
+    body = Video((Path(__file__).parent / "assets" / "example-short.mp4").read_bytes())
+    first, second = await asyncio.gather(body.duration_seconds(), body.duration_seconds())
+    assert first == second > 0
+
+
+@pytest.mark.anyio
+async def test_io_duration_probe_preserves_callers_position():
+    import io
+    from pathlib import Path
+
+    source = io.BytesIO((Path(__file__).parent / "assets" / "example-short.mp4").read_bytes())
+    body = Video(source)
+    source.seek(10)
+    assert await body.duration_seconds() > 0
+    assert source.tell() == 10

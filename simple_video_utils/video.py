@@ -77,19 +77,22 @@ class Video:
         if not isinstance(self.source, bytes) and self._start is None:
             message = "Supply duration for a generated or non-seekable video"
             raise ValueError(message)
-        if not self._io_lock.acquire(blocking=False):
+        shared_io = not isinstance(self.source, bytes)
+        if shared_io and not self._io_lock.acquire(blocking=False):
             message = "Video I/O is already being consumed"
             raise RuntimeError(message)
         try:
             source = io.BytesIO(self.source) if isinstance(self.source, bytes) else cast(BinaryIO, self.source)
+            position = source.tell()
             source.seek(0 if self._start is None else self._start)
             try:
                 with av.open(source, mode="r") as container:
                     meta = video_metadata_from_container(container)
             finally:
-                source.seek(0 if self._start is None else self._start)
+                source.seek(position)
         finally:
-            self._io_lock.release()
+            if shared_io:
+                self._io_lock.release()
         if meta.duration is not None:
             return meta.duration
         if meta.nb_frames and meta.fps:
