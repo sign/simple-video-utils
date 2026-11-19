@@ -84,6 +84,32 @@ def _packets(video: Video, begin: int, end: int, keyframe: tuple | None = None) 
             yield packet
 
 
+def _keyframe_header(stream: av.VideoStream, packet: av.Packet) -> tuple[bytes, int, int] | None:
+    """(avcC, width, height) of the H.264 parameter sets `packet` carries, when they are not the stream's own.
+
+    A file whose chapters differ in size has one header, the first chapter's, and each later keyframe carries its own.
+    """
+    own = stream.codec_context.extradata
+    if stream.codec_context.name != "h264" or not own or own[0] != 1:
+        return None
+    size, data, sets, at = (own[4] & 3) + 1, bytes(packet), {7: [], 8: []}, 0  # 7: sequence sets, 8: picture sets
+    while at + size <= len(data):
+        length = int.from_bytes(data[at:at + size])
+        unit = data[at + size:at + size + length]
+        at += size + length
+        if unit and unit[0] & 31 in sets:
+            sets[unit[0] & 31].append(unit)
+    if not sets[7] or not sets[8] or sets[7][0] in own:
+        return None
+    header = bytes([1, *sets[7][0][1:4], 0xFC | (size - 1)])
+    for kind, mask in ((7, 0xE0), (8, 0)):
+        header += bytes([mask | len(sets[kind])]) + b"".join(len(unit).to_bytes(2) + unit for unit in sets[kind])
+    decoder = av.CodecContext.create("h264", "r")  # the size is in the sequence set: let libav read it
+    decoder.extradata = header
+    frame = (decoder.decode(av.Packet(data)) + decoder.decode(None))[0]
+    return header, frame.width, frame.height
+
+
 class Slice:
     """Seconds [start, stop) of a video as a streamable MP4 (moov first), produced as it is read.
 
@@ -92,8 +118,8 @@ class Slice:
     starts on its first frame and holds the frames from the keyframe before that one, hidden behind an edit list.
     With B-frames it also holds the later frames its last ones are predicted from, and those stay visible: a few
     frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it spans
-    come along, so `Video` reads exactly the frames in range from a chaptered slice. The source must not change
-    between reads.
+    come along, so `Video` reads exactly the frames in range from a chaptered slice. Where chapters differ in size
+    the clip's header describes the chapter it starts in. The source must not change between reads.
     """
 
     def __init__(self, src: str | os.PathLike | bytes, start: float, stop: float):
@@ -171,6 +197,10 @@ class Slice:
             if video.stream.codec_context.codec_tag == "hvc1":  # the muxer would write hev1, which Apple refuses
                 track.codec_context.codec_tag = "hvc1"
             for packet in islice(_packets(video, begin, end, keyframe), samples):
+                if samples == self._plan[0] and (header := _keyframe_header(video.stream, packet)):
+                    # the stream's header is its first chapter's: Apple's players refuse a clip that contradicts it
+                    context = track.codec_context
+                    context.extradata, context.width, context.height = header
                 samples -= 1
                 packet.pts, packet.dts, packet.stream = packet.pts - first, packet.dts - first, track
                 output.mux(packet)

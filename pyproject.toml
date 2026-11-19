@@ -7,7 +7,7 @@ authors = [
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12" # PyAV 19 needs 3.12
 dependencies = [
     "av>=19.0.0", # the display matrix in the stream header, without decoding a frame
     "certifi", # HTTPS trust roots when Python has no default CA file (e.g. standalone builds)

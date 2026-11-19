@@ -367,8 +367,11 @@ def test_metadata_does_not_depend_on_what_was_read(gapped):
 @pytest.mark.parametrize("wrap", [str, lambda path: Pipe(Path(path).read_bytes())])
 def test_chapter_frames_reads_each_chapter_from_one_decode(gapped, wrap):
     with Video(wrap(gapped)) as video:
-        chapters = [(chapter.id, [frame.shape for frame in frames]) for chapter, frames in video.chapter_frames()]
-    assert chapters == [(1, [(128, 160, 3)] * 20), (2, [(208, 256, 3)] * 35), (3, [(240, 320, 3)] * 28)]
+        chapters = [(chapter.id, [(frame.shape, index) for frame, index in frames])
+                    for chapter, frames in video.chapter_frames()]
+    assert chapters == [(1, [((128, 160, 3), index) for index in range(20)]),
+                        (2, [((208, 256, 3), index) for index in range(45, 80)]),
+                        (3, [((240, 320, 3), index) for index in range(100, 128)])]
 
 
 def test_fps_starts_over_in_each_chapter(gapped):

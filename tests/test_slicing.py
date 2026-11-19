@@ -1,4 +1,5 @@
 import io
+import struct
 from fractions import Fraction
 from itertools import pairwise
 from pathlib import Path
@@ -169,6 +170,19 @@ def test_frame_count_leaves_out_the_frames_a_slice_hides(source, gapped):
         for wrap in (bytes, Pipe):
             with Video(wrap(b"".join(clip))) as video:
                 assert video.meta.nb_frames == count == sum(1 for _ in video.frames())
+
+
+def test_slice_header_describes_the_chapter_it_starts_in(gapped):
+    # the file's one header is its first chapter's, 160x128; Apple's players refuse a clip whose frames contradict it
+    def declared(clip: bytes) -> tuple[int, int]:
+        entry = clip.index(b"avc1", clip.index(b"stsd"))
+        return struct.unpack(">HH", clip[entry + 28:entry + 32])
+
+    assert declared(b"".join(Slice(gapped, 0.1, 0.5))) == (160, 128)
+    third = b"".join(Slice(gapped, 100 / 30, 110 / 30))
+    assert declared(third) == (320, 240)
+    assert read(third).shape == (10, 240, 320, 3)
+    assert third == b"".join(Slice(gapped, 100 / 30, 110 / 30)), "and it still replays byte for byte"
 
 
 def test_slice_starting_in_a_gap_starts_on_its_first_frame(gapped):

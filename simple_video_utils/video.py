@@ -447,13 +447,14 @@ class Video:
         return Frames(frames, np.array(numbers, dtype=np.int64))
 
     def chapter_frames(self, fps=None, size=None, keep_last=False) -> Iterator[tuple[Chapter | None, Iterator]]:
-        """(chapter, its RGB frames) per chapter, from one decode, so it works on a stream that cannot seek.
+        """(chapter, its frames) per chapter, from one decode, so it works on a stream that cannot seek.
 
-        A file without chapters yields (None, frames) once. Each iterator ends when the next chapter is asked for.
+        The frames are (array, index) pairs, as from `frames()`. A file without chapters yields (None, frames) once.
+        Each iterator ends when the next chapter is asked for.
         """
         frames = self._frames(*self._range(0, None, False, fps, size, keep_last), False, fps, size, keep_last)
         for number, group in groupby(frames, key=operator.itemgetter(1)):
-            yield (None if number is None else self.chapters[number]), (array for _, _, array in group)
+            yield (None if number is None else self.chapters[number]), ((array, index) for index, _, array in group)
 
     def keyframes(self) -> list[int]:
         """Frame indices of the keyframes, the same indices reads use. Packets are read, nothing is decoded."""

@@ -3,7 +3,7 @@
 Read, slice and crop videos for sign language processing. One class over [PyAV](https://pyav.org), under 900 lines.
 
 ```bash
-pip install simple-video-utils  # Python 3.14+
+pip install simple-video-utils  # Python 3.12+
 ```
 
 ```python
@@ -77,7 +77,7 @@ with Video("cropped.mkv") as video:
     video.chapters                                    # [Chapter(id, start, end, source, payload), ...]
     video.read(30, 90)                                # the first chapter, by source frame index
     for chapter, frames in video.chapter_frames(fps=15, size=(256, 256)):
-        ...                                           # one decode, so it works on a stream
+        ...                                           # (array, index) pairs; one decode, so it works on a stream
 ```
 
 `box` is `(left, top, right, bottom)` in displayed pixels and may reach past the frame, which pads with black. Sizes
@@ -107,7 +107,9 @@ it can be read from a pipe. It starts on its first frame and keeps the frames fr
 behind an edit list. With B-frames it also keeps the later frames its last ones are predicted from, and those stay
 visible: a few frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it
 spans come along, so reading a chaptered clip gives exactly the frames in range, with the source's frame indices.
-Times are matched at the precision of the file's clock. Codecs MP4 cannot carry raise.
+Times are matched at the precision of the file's clock. Codecs MP4 cannot carry raise. In a file whose chapters differ
+in size, the clip's header describes the chapter it starts in, so a slice within one chapter plays everywhere; one
+that runs into a chapter of another size plays only in FFmpeg-based players.
 
 ## From 0.x
 
