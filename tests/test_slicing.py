@@ -4,211 +4,123 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
+from conftest import EXAMPLE, Pipe, make_video, numbers
 
-from simple_video_utils.frames import read_frames_exact
-from simple_video_utils.slicing import slice_video, slice_video_stream
-
-
-def _encode_video(target, width=320, height=240, frames=30, fps=30, codec="h264", format=None):
-    with av.open(target, mode="w", format=format) as container:
-        stream = container.add_stream(codec, rate=fps)
-        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
-        for i in range(frames):
-            arr = np.full((height, width, 3), i * 8 % 256, dtype=np.uint8)
-            container.mux(stream.encode(av.VideoFrame.from_ndarray(arr, format="rgb24")))
-        container.mux(stream.encode())
-    return target
-
-
-def _write_video(path, **kwargs):
-    return str(_encode_video(str(path), **kwargs))
-
-
-def _streaming_video(frames=36, fps=24, codec="h264", format="mpegts") -> bytes:
-    buffer = _encode_video(io.BytesIO(), width=64, height=48, frames=frames, fps=fps,
-                           codec=codec, format=format)
-    return buffer.getvalue()
+from simple_video_utils import Slice, Video
 
 
 @pytest.fixture
-def video(tmp_path):
-    return _write_video(tmp_path / "src.mp4")
+def source(tmp_path):
+    return make_video(tmp_path / "source.mp4", frames=120)
 
 
-def _dims(clip: bytes) -> tuple[int, int]:
-    with av.open(io.BytesIO(clip), mode="r") as container:
-        frame = next(container.decode(video=0))
-        return frame.width, frame.height
+def read(clip: bytes, **arguments):
+    with Video(clip) as video:
+        return video.read(**arguments)
 
 
-def test_slice_returns_one_clip_per_range(video):
-    clips = list(slice_video(video, [(0.0, 0.3), (0.5, 0.8)]))
-    assert len(clips) == 2
-    assert all(clip for clip in clips)
-
-
-def test_slice_keeps_source_size_by_default(video):
-    # Default path stream-copies, so the source resolution is preserved.
-    [clip] = slice_video(video, [(0.0, 0.3)])
-    assert _dims(clip) == (320, 240)
-
-
-def test_slice_center_crops_and_resizes(video):
-    [clip] = slice_video(video, [(0.0, 0.3)], size=256)
-    assert _dims(clip) == (256, 256)
-
-
-def test_matching_size_is_copied(tmp_path):
-    # Source is already 128x128, so size=128 needs no re-encode.
-    square = _write_video(tmp_path / "square.mp4", width=128, height=128, frames=15)
-    [clip] = slice_video(square, [(0.0, 0.3)], size=128)
-    assert _dims(clip) == (128, 128)
-
-
-def test_copy_playback_starts_at_requested_start():
-    # The keyframe lead-in is muxed at negative pts, which the mp4 muxer turns
-    # into an edit list — decoders skip straight to `start` instead of showing
-    # everything from the keyframe.
-    src = str(Path(__file__).parent / "assets" / "example.mp4")
-    [clip] = slice_video(src, [(2.7, 3.03)])
+def test_slice_copies_the_frames_between_start_and_stop(source):
+    with Video(source) as video:
+        whole = video.read()
+        clip = b"".join(video.slice(1.0, 2.5))
+    assert np.array_equal(read(clip), whole[30:75])
     with av.open(io.BytesIO(clip)) as container:
-        frames = list(container.decode(video=0))
-        first_time = float(frames[0].pts * frames[0].time_base)
-        first_pixels = frames[0].to_ndarray(format="rgb24")
-    assert first_time == 0.0
-    assert len(frames) <= 13  # 10 frames cover [2.7, 3.03] at 30 fps, plus B-frame extras
-    [expected] = read_frames_exact(src, start_frame=81, end_frame=81)  # the frame at 2.7s
-    np.testing.assert_array_equal(first_pixels, expected)
+        packets = [packet for packet in container.demux(video=0) if packet.size]
+        # frame 30 is no keyframe: the clip starts at keyframe 24, and an edit list hides what precedes frame 30
+        assert len(packets) == 51
+        assert packets[0].is_keyframe
+        assert [p.pts for p in packets].index(0) == 6
+        assert container.streams.video[0].codec_context.name == "h264"
 
 
-def test_copy_keeps_trailing_frames():
-    # Packets arrive in decode order, so a B-frame with pts <= end can follow a
-    # packet with pts > end; cutting on pts used to drop such tail frames.
-    # The synthetic fixture encodes without that reordering — use a real asset.
-    src = str(Path(__file__).parent / "assets" / "example-short.mp4")
-    [clip] = slice_video(src, [(0.0, 0.68)])
-    with av.open(io.BytesIO(clip)) as container:
-        clip_count = sum(1 for _ in container.decode(video=0))
-    assert clip_count >= 21  # frames 0..20 cover [0, 0.68] at 30 fps
+def test_consecutive_slices_share_no_frame(source):
+    with Video(source) as video:
+        assert [numbers(read(b"".join(video.slice(a, b)))) for a, b in ((0, 1), (1, 2), (2, 9))] == [
+            list(range(30)), list(range(30, 60)), list(range(60, 120))]
 
 
-class _Pipe:
-    """A read-only, unseekable file object: what a demuxer sees on a pipe or socket."""
-
-    def __init__(self, data: bytes):
-        self._buffer = io.BytesIO(data)
-
-    def read(self, size=-1):
-        return self._buffer.read(size)
-
-
-@pytest.mark.parametrize("size", [None, 256])  # stream-copied, and re-encoded (the 320x240 source is not square)
-def test_clips_are_streamable(video, size):
-    # moov before mdat, so a reader that cannot seek demuxes the clip as the
-    # bytes arrive instead of failing once its probe buffer is full.
-    [clip] = slice_video(video, [(0.0, 1.0)], size=size)
-    assert clip.index(b"moov") < clip.index(b"mdat")
-    with av.open(_Pipe(clip)) as container:
-        assert sum(1 for _ in container.decode(video=0)) == 30
+def test_slice_streams_as_it_is_read(tmp_path):
+    source = make_video(tmp_path / "noise.mp4", frames=120, noise=True)
+    with Video(source) as video:
+        whole = video.read()
+    clip = Slice(source, 0.4, 3.9)
+    assert clip.duration == pytest.approx(3.5)
+    assert clip.size > 4 * 64 * 1024, "measured without keeping any media"
+    chunks = list(clip)
+    data = b"".join(chunks)
+    assert len(chunks) > 4
+    assert max(map(len, chunks)) < 2 * 64 * 1024
+    assert len(data) == clip.size
+    assert data == b"".join(clip), "replays byte for byte"
+    assert data.index(b"moov") < data.index(b"mdat")
+    with Video(Pipe(data)) as video:  # moov first: a reader needs no seeking
+        assert np.array_equal(video.read(), whole[12:117])
 
 
-@pytest.mark.parametrize("size", [None, 256])
-def test_slicing_is_reproducible(video, size):
-    # Both paths must be byte-stable: no wall-clock timestamp, encoder state, or
-    # container metadata may leak into the output across repeated runs.
-    outputs = {
-        tuple(slice_video(video, [(0.0, 0.3), (0.5, 0.8)], size=size))
-        for _ in range(3)
-    }
-    assert len(outputs) == 1
+def test_slice_of_bytes_and_of_b_frames(tmp_path):
+    data = Path(make_video(tmp_path / "b.mkv", frames=90, bframes=2)).read_bytes()
+    with Video(data) as video:
+        whole = video.read()
+        clip = read(b"".join(video.slice(1.2, 2.2)))
+    # Matroska drops decode timestamps after a seek; with B-frames, the frame at `stop` can remain
+    assert np.array_equal(clip[:30], whole[36:66])
+    assert len(clip) <= 31
 
 
-@pytest.mark.parametrize("bad", [(-0.1, 0.3), (0.5, 0.2), (0.5, 0.5)])
-@pytest.mark.parametrize("size", [None, 256])
-def test_out_of_range_slice_raises(video, bad, size):
-    with pytest.raises(ValueError, match="out of range"):
-        list(slice_video(video, [bad], size=size))
+def test_slice_keeps_gaps_and_carries_its_chapters(gapped):
+    with Video(gapped) as video:
+        frames, indices = video.read(size=(64, 64), indices=True)
+        held = dict(zip(indices.tolist(), frames, strict=True))
+        clip = video.slice(0.5, 3.5)
+        data = b"".join(clip)
+    assert clip.duration == pytest.approx(3.0, abs=0.01)
+    with Video(data) as video:
+        assert [(float(c.start), float(c.end), float(c.source)) for c in video.chapters] == [
+            pytest.approx(times, abs=0.001) for times in [(0, 5 / 30, 0.5), (1, 65 / 30, 1.5), (85 / 30, 3, 100 / 30)]]
+        assert video.meta.fps == 30
+        assert video.meta.nb_frames == 45
+        frames, indices = video.read(size=(64, 64), indices=True)
+        assert indices.tolist() == [*range(15, 20), *range(45, 80), *range(100, 105)], "source frame numbers"
+        assert all(np.array_equal(frame, held[index]) for frame, index in zip(frames, indices.tolist(), strict=True))
+        assert video.read(60, 70, size=(64, 64), indices=True)[1].tolist() == list(range(60, 70))
+        again = b"".join(video.slice(0.1, 1.2))
+    with Video(again) as video:  # a slice of a slice is still placed on the original source
+        assert video.read(size=(64, 64), indices=True)[1].tolist() == [18, 19, *range(45, 51)]
 
 
-@pytest.mark.parametrize("size", [None, 256])
-def test_slice_past_the_end_is_cut_at_the_end(video, size):
-    assert list(slice_video(video, [(0.5, 5.0)], size=size)) == list(slice_video(video, [(0.5, 1.0)], size=size))
+def test_slice_starting_in_a_gap_starts_on_its_first_frame(gapped):
+    with Video(gapped) as video:
+        data = b"".join(video.slice(3.0, 4.0))  # the third chapter starts at 3.333
+    with av.open(io.BytesIO(data)) as container:
+        packets = [packet for packet in container.demux(video=0) if packet.size]
+        assert packets[0].pts == 0, "nothing from the chapter before the gap"
+        assert len(packets) == 20
+    with Video(data) as video:
+        assert video.read(indices=True)[1].tolist() == list(range(100, 120))
+
+
+@pytest.mark.parametrize(("start", "stop", "error"), [
+    (9.0, 10.0, "no frames"), (2.0, 1.0, "out of range"), (-1.0, 1.0, "out of range"),
+    (0.0, float("inf"), "out of range"),
+])
+def test_bad_slices_raise(source, start, stop, error):
+    with pytest.raises(ValueError, match=error):
+        next(iter(Slice(source, start, stop)))
+
+
+def test_slice_in_a_gap_has_no_frames(gapped):
     with pytest.raises(ValueError, match="no frames"):
-        list(slice_video(video, [(5.0, 5.5)], size=size))
+        _ = Slice(gapped, 0.7, 1.4).size
 
 
-def _frames(video: bytes) -> list[np.ndarray]:
-    with av.open(io.BytesIO(video)) as container:
-        return [frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)]
+def test_slice_needs_a_source_it_can_reopen():
+    with open(EXAMPLE, "rb") as file, Video(file) as video, pytest.raises(TypeError, match="reopens"):
+        video.slice(0, 1)
 
 
-def test_stream_slices_are_split_into_duration_windows():
-    data = _streaming_video()
-    source_frames = _frames(data)
-    clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
-    decoded = [_frames(clip.data) for clip in clips]
-    assert len(decoded) == 3
-    assert [clip.start for clip in clips] == [0.0, 0.5, 1.0]
-    assert [frames[0].shape[:2] for frames in decoded] == [(48, 64)] * 3
-    for index, frames in enumerate(decoded):
-        assert len(frames) >= 12
-        np.testing.assert_array_equal(frames[0], source_frames[index * 12])
-
-
-def test_stream_slices_webm_reencodes_exact_windows():
-    # WebM has no edit list to hide the keyframe lead-in a copied clip would
-    # have to carry, so VP8/VP9 sources are decoded and re-encoded into exact
-    # MP4 windows: no lead-in, no trailing frames, window content only.
-    data = _streaming_video(codec="vp8", format="webm")
-    source_frames = _frames(data)
-    clips = list(slice_video_stream(io.BytesIO(data), duration=0.5))
-    assert len(clips) == 3
-    assert [clip.start for clip in clips] == [0.0, 0.5, 1.0]
-    for index, clip in enumerate(clips):
-        frames = _frames(clip.data)
-        assert len(frames) == 12
-        np.testing.assert_allclose(  # atol: H.264 is lossy
-            frames[0].astype(int), source_frames[index * 12].astype(int), atol=3)
-
-
-def test_webm_file_is_reencoded_at_source_resolution(tmp_path):
-    # The copy path is off for codecs MP4 can't carry, even without ``size``:
-    # slice_video re-encodes them at the source resolution.
-    src = _write_video(tmp_path / "src.webm", codec="vp8")
-    [clip] = slice_video(src, [(0.0, 0.3)])
-    assert _dims(clip) == (320, 240)
-
-
-class _CountingReader(io.RawIOBase):
-    """Non-seekable reader that tracks how far the source has been read."""
-
-    def __init__(self, data):
-        self.data, self.pos = data, 0
-
-    def readable(self):
-        return True
-
-    def readinto(self, buffer):
-        chunk = self.data[self.pos : self.pos + len(buffer)]
-        buffer[: len(chunk)] = chunk
-        self.pos += len(chunk)
-        return len(chunk)
-
-
-def test_stream_clips_arrive_before_eof():
-    # The point of streaming: each clip is yielded once its window's packets
-    # have arrived, not after the source is exhausted. PyAV reads the input in
-    # buffer_size chunks, so read-ahead — and with it clip latency — is capped
-    # by buffer_size, not by the stream length.
-    reader = _CountingReader(_streaming_video(frames=240))  # 10s at 24 fps
-    positions = [reader.pos for _ in slice_video_stream(reader, duration=0.5, buffer_size=4096)]
-    assert len(positions) == 20
-    assert positions[0] <= 3 * 4096
-    assert positions == sorted(positions)
-    assert len(set(positions)) > 2
-
-
-@pytest.mark.parametrize("duration", [0, -1, float("inf")])
-def test_stream_slice_duration_must_be_positive_and_finite(duration):
-    with pytest.raises(ValueError, match="duration"):
-        list(slice_video_stream(io.BytesIO(b"video"), duration=duration))
+def test_slice_notices_a_source_that_changed(tmp_path, source):
+    clip = Slice(source, 1.0, 3.0)
+    assert clip.size
+    make_video(source, frames=40)
+    with pytest.raises(OSError, match="changed"):
+        b"".join(clip)
