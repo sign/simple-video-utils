@@ -70,7 +70,8 @@ def refusing(message: str, errors: type[Exception] = av.FFmpegError) -> Iterator
     try:
         yield
     except errors as e:
-        raise (InvalidVideoError if isinstance(e, av.error.InvalidDataError) else VideoError)(message) from e
+        invalid = isinstance(e, (av.error.InvalidDataError, av.error.EOFError))  # EOF: the data stops too soon
+        raise (InvalidVideoError if invalid else VideoError)(message) from e
 
 
 def quiet() -> None:
