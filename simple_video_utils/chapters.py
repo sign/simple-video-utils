@@ -12,7 +12,7 @@ from tempfile import TemporaryDirectory
 import av
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.video import Video, rotation_filters
+from simple_video_utils.video import Video, refusing, rotation_filters
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -35,6 +35,7 @@ class ChapterClip:
         return self.resolution or (right - left, bottom - top)
 
 
+@refusing("Failed to write chapters")
 def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to the write they guard
     src: str | os.PathLike,
     out: str | os.PathLike,

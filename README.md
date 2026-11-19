@@ -1,6 +1,7 @@
 # simple-video-utils
 
-Read, slice and crop videos for sign language processing. One class over [PyAV](https://pyav.org), under 1,000 lines.
+Read, write, slice and crop videos for sign language processing. A thin layer over [PyAV](https://pyav.org), about
+1,100 lines, so that nothing using it has to import PyAV itself.
 
 ```bash
 pip install simple-video-utils  # Python 3.12+
@@ -32,8 +33,16 @@ the whole file. `fps` is measured from the frames when the header has none (brow
 the same rate as an exact `Fraction`. A stream that cannot seek gets the header's values only, and `fps=0.0` when there
 is no rate.
 
-`video_metadata(path)` caches its last 8 paths. A file that cannot be opened raises `RuntimeError`, and so does reading
-frames that cannot be decoded.
+`video_metadata(path)` caches its last 8 paths.
+
+`video.codec` (`"h264"`), `video.pix_fmt`, `video.sample_aspect_ratio`, `video.tags` (the container's metadata) and
+`video.timestamps()` (each frame's time in seconds, read from the packets) cover what the header and the packets say.
+
+## Errors
+
+Whatever PyAV refuses, opening, decoding or writing, raises `VideoError`, a `RuntimeError`. When the data itself is
+not a video (garbage, a cut-off upload, no video stream) it is an `InvalidVideoError`, a `VideoError`. Arguments that
+make no sense raise `ValueError` or `TypeError`.
 
 ## Frames
 
@@ -46,6 +55,7 @@ frames that cannot be decoded.
 | `fps` | Drop frames down to about this rate. Never repeats a frame; always keeps the first. |
 | `keep_last` | With `fps`, also keep the last frame of the range, which `fps` drops when it falls between steps. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
+| `format` | The arrays' pixel format: `"rgb24"` by default, `"gray"` for `(H, W)`, `"rgba"` for `(H, W, 4)`. |
 | `indices` | `frames()` and `chapter_frames()` only: yield `(array, index)` pairs. `read()` always returns the indices. |
 
 Reads three seconds or more into an MP4, MOV, Matroska or WebM file seek first, when its header says the frames keep
@@ -55,6 +65,7 @@ rotation in the header. A stream that cannot seek is read once: a second read ra
 read at a time: `keyframes()`, another read, `close()`, or a `meta` that has to read the file (Matroska, WebM) in the
 middle of a `frames()` loop makes that loop raise `RuntimeError`, so ask for `meta` before the loop.
 
+`Video(src, format="mpegts")` names the container when the data cannot, as for a stream joined midway.
 `Video(src, thread_type="NONE")` decodes without threads. Open each `Video` in the process that reads it (in a
 DataLoader worker, not before the fork): workers that inherit one share its file position and fail to decode.
 `Video(stream, buffer_size=4096)` yields frames sooner from a live stream. `video.container` and `video.stream` are the
@@ -93,9 +104,9 @@ Only chapters this library wrote count. Files written before 1.0 that play their
 ## Slices
 
 ```python
-from simple_video_utils import Slice
+from simple_video_utils import VideoSlice
 
-clip = Slice("cropped.mkv", 2.0, 8.0)                 # a path or bytes; nothing is read yet
+clip = VideoSlice("cropped.mkv", 2.0, 8.0)                 # a path or bytes; nothing is read yet
 
 clip.size, clip.duration                              # measured without keeping the clip
 for chunk in clip:                                    # MP4 bytes, about 64 KiB at a time; iterate again to replay
@@ -112,6 +123,33 @@ Times are matched at the precision of the file's clock. Codecs MP4 cannot carry 
 in size, the clip's header describes the chapter it starts in, so a slice within one chapter plays everywhere; one
 that runs into a chapter of another size plays only in FFmpeg-based players.
 
+## Writing
+
+```python
+from simple_video_utils import VideoWriter, write_video
+
+write_video("out.mp4", frames, fps=30)                # H.264, yuv420p; frames are (H, W, 3) RGB uint8
+data = write_video(None, frames, fps=30, options={"crf": "18"})   # the MP4's bytes
+
+with VideoWriter(stream, 30, format="mpegts", options={"tune": "zerolatency"}) as writer:
+    for frame in frames:                              # a writable stream gets bytes as frames arrive
+        writer.write(frame)
+```
+
+Frames are RGB, RGBA `(H, W, 4)` or gray `(H, W)`, all of one shape. Both take the same settings:
+
+| Setting | Meaning |
+|---|---|
+| `codec`, `pix_fmt` | The encoder and its pixel format: `"h264"` and `"yuv420p"` by default. |
+| `options` | The encoder's options, as strings: `{"crf": "18", "preset": "fast", "threads": "1"}`. |
+| `format`, `container_options` | The container, when the name does not say, and the muxer's options. |
+| `filters` | An FFmpeg filter chain every frame passes before the encoder: `"colorkey=0x00ff00:0.3:0.05"`. |
+| `tags` | The container's metadata, where it keeps custom keys (Matroska does, MP4 does not). |
+
+`writer.write(frame, index)` places a frame at `index / fps`, leaving a gap. Mattes round-trip exactly with
+`codec="ffv1", pix_fmt="gray"` and `read(format="gray")`; transparency is `codec="libvpx-vp9", pix_fmt="yuva420p"` in
+a `.webm`. Nothing is written before the first frame.
+
 ## From 0.x
 
 | 0.x | 1.0 |
@@ -127,7 +165,7 @@ that runs into a chapter of another size plays only in FFmpeg-based players.
 | `read_chapters(src, fps=, size=)` yielding `(dict, start, frames)` | `Video(src).chapter_frames(fps=, size=)` yielding `(Chapter, frames)` |
 | `list_chapters(p)` | `Video(p).chapters`, this library's only; every marker: `Video(p).container.chapters()` |
 | `keyframe_indices(v)`, `count_frames(v)` | `v.keyframes()`; `v.rewind()`, then `sum(1 for _ in v.container.decode(v.stream))` |
-| `slice_video(p, [(a, b)], chapters=True)`, `Video.from_slice(p, a, b)` | `Slice(p, a, b)` |
+| `slice_video(p, [(a, b)], chapters=True)`, `Video.from_slice(p, a, b)` | `VideoSlice(p, a, b)` |
 | `write_chapters(..., trim_to_source=True, thread_type=t)` | `write_chapters(...)`: it always trims; no `thread_type` |
 | `Timeline` | gone: a gapped file is on source time already |
 | `join_videos`, `slice_video_stream`, `slice_video(size=)` | gone |

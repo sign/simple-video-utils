@@ -1,12 +1,10 @@
 import io
-from fractions import Fraction
 from pathlib import Path
 
-import av
 import numpy as np
 import pytest
 
-from simple_video_utils import ChapterClip, write_chapters
+from simple_video_utils import ChapterClip, VideoWriter, write_chapters
 
 ASSETS = Path(__file__).parent / "assets"
 EXAMPLE = str(ASSETS / "example.mp4")  # 130 frames, 320x240, 30 fps, B-frames, one keyframe
@@ -29,19 +27,14 @@ def make_video(path, frames=60, fps=30, gop=12, bframes=0, noise=False, times=No
     `times` places each frame, in 1/fps ticks, for a video whose rate changes. `x264` adds encoder parameters.
     """
     random = np.random.default_rng(0)
-    with av.open(str(path), mode="w") as output:
-        fixed = f"keyint={gop}:min-keyint={gop}:scenecut=0{x264}"  # a keyframe exactly every `gop` frames
-        stream = output.add_stream("h264", rate=fps, options={"crf": "10", "x264-params": fixed})
-        stream.width, stream.height, stream.pix_fmt = 64, 48, pix_fmt
-        stream.codec_context.max_b_frames = bframes
+    fixed = f"keyint={gop}:min-keyint={gop}:scenecut=0{x264}"  # a keyframe exactly every `gop` frames
+    options = {"crf": "10", "bf": str(bframes), "x264-params": fixed}
+    with VideoWriter(path, fps, pix_fmt=pix_fmt, options=options) as writer:
         for i in range(frames):
             image = np.repeat([[i % 16 * 16, i // 16 * 16]], 32, axis=1).repeat(48, axis=0)[..., None].repeat(3, axis=2)
             if noise:
                 image = random.integers(0, 256, (48, 64, 3))
-            frame = av.VideoFrame.from_ndarray(image.astype(np.uint8), format="rgb24")
-            frame.pts, frame.time_base = times[i] if times else i, Fraction(1, fps)
-            output.mux(stream.encode(frame))
-        output.mux(stream.encode())
+            writer.write(image.astype(np.uint8), times[i] if times else None)
     return str(path)
 
 

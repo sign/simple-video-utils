@@ -16,7 +16,15 @@ import pytest
 from av.bitstream import BitStreamFilterContext
 from conftest import ASSETS, EXAMPLE, HELD, Pipe, make_video, numbers, windows
 
-from simple_video_utils import PackedChaptersError, Video, VideoMetadata, stack_frames, video_metadata
+from simple_video_utils import (
+    InvalidVideoError,
+    PackedChaptersError,
+    Video,
+    VideoError,
+    VideoMetadata,
+    stack_frames,
+    video_metadata,
+)
 from simple_video_utils.chapters import _replace_chapters
 
 
@@ -45,8 +53,21 @@ def test_metadata_from_bytes_and_streams(wrap):
 
 @pytest.mark.parametrize("src", [str(ASSETS / "missing.mp4"), b"not a video", str(ASSETS / "empty.mp4")])
 def test_unreadable_video_raises_runtime_error(src):
-    with pytest.raises(RuntimeError, match="Failed to open video"):
+    with pytest.raises(RuntimeError, match="Failed to open video") as error:
         Video(src)
+    # a file that is missing is no fault of its data, so only the other two are invalid
+    assert isinstance(error.value, VideoError)
+    assert isinstance(error.value, InvalidVideoError) == ("missing" not in str(src))
+    assert av.logging.get_level() is None, "every open switches PyAV's log callback off: it can deadlock a close"
+
+
+def test_gray_frames_and_a_named_container(tmp_path):
+    with Video(EXAMPLE) as video:
+        gray, colour = video.read(0, 3, format="gray").frames, video.read(0, 3).frames
+        assert gray.shape == colour.shape[:3]
+        assert np.abs(gray - colour.mean(axis=3)).max() < 16
+    with pytest.raises(VideoError):  # not what the file is
+        Video(EXAMPLE, format="mpegts")
 
 
 def test_frame_count_survives_a_header_that_overcounts():

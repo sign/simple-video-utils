@@ -8,7 +8,7 @@ import pytest
 from av.video.reformatter import ColorRange
 from conftest import ASSETS, EXAMPLE, Pipe, make_video, windows
 
-from simple_video_utils import ChapterClip, Slice, Video, chapters, write_chapters
+from simple_video_utils import ChapterClip, Video, VideoSlice, chapters, write_chapters
 
 
 def planes(path, frames: range) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -90,7 +90,7 @@ def test_chapters_that_touch_read_back(tmp_path):
     out, _ = write(tmp_path, EXAMPLE, [ChapterClip(0, 1, (0, 0, 160, 128)), ChapterClip(1, 10, (0, 0, 160, 128))])
     with Video(out) as video:
         assert [sum(1 for _ in frames) for _, frames in video.chapter_frames()] == [1, 9]
-    clip = b"".join(Slice(out, 0, 1))
+    clip = b"".join(VideoSlice(out, 0, 1))
     with Video(clip) as video:  # and the MP4 a slice writes, whose chapter ends are rebuilt from frame counts
         assert video.read().indices.tolist() == list(range(10))
 
@@ -104,7 +104,7 @@ def test_a_timed_read_finds_every_frame_of_a_chapter(tmp_path):
 
 def test_a_slice_carries_many_short_chapters(tmp_path):
     out, _ = write(tmp_path, EXAMPLE, [ChapterClip(n, n + 1, (0, 0, 16, 16)) for n in range(0, 128, 2)])
-    clip = Slice(out, 0, 5)  # every chapter mark needs room in the MP4 header, which is reserved before it is written
+    clip = VideoSlice(out, 0, 5)  # every chapter mark needs room in the MP4 header, reserved before it is written
     with Video(b"".join(clip)) as video:
         assert video.read().indices.tolist() == list(range(0, 128, 2))
 
@@ -122,7 +122,7 @@ def test_a_chapter_file_states_its_sources_rate(tmp_path):
 
 def test_a_chaptered_slice_is_cut_at_the_rate_its_chapters_state(tmp_path, gapped):
     clip = tmp_path / "clip.mp4"
-    clip.write_bytes(b"".join(Slice(gapped, 0.5, 3.5)))  # 45 frames over 3 seconds: its header says 120/7 fps
+    clip.write_bytes(b"".join(VideoSlice(gapped, 0.5, 3.5)))  # 45 frames over 3 seconds: its header says 120/7 fps
     out, _ = write(tmp_path, clip, [ChapterClip(0, 5, (0, 0, 160, 128))])
     with Video(out) as video, av.open(str(out)) as container:
         assert video.meta.fps == 30

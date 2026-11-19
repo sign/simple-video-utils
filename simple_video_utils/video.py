@@ -10,6 +10,7 @@ import struct
 import sys
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from fractions import Fraction
 from functools import cached_property, lru_cache
 from itertools import groupby, pairwise
@@ -55,19 +56,42 @@ class Chapter(NamedTuple):
     payload: dict
 
 
+class VideoError(RuntimeError):
+    """PyAV could not open, decode or write the video."""
+
+
+class InvalidVideoError(VideoError):
+    """The data is not a video that can be read: garbage, cut too short, or with no video stream."""
+
+
+@contextmanager
+def refusing(message: str, errors: type[Exception] = av.FFmpegError) -> Iterator[None]:
+    """PyAV's errors leave this library as VideoError, so nothing that uses it has to import PyAV to catch them."""
+    try:
+        yield
+    except errors as e:
+        raise (InvalidVideoError if isinstance(e, av.error.InvalidDataError) else VideoError)(message) from e
+
+
+def quiet() -> None:
+    # PyAV logs through a Python callback, which torchvision switches on. With it, closing a threaded decoder can
+    # deadlock: the close waits for the decoder's threads while holding the GIL the callback needs. Whoever imports
+    # last wins, so this runs at every open, not at import.
+    av.logging.set_level(None)
+
+
 class PackedChaptersError(ValueError):
     """The file plays its chapters back to back, as 0.x could write them. Only gapped files are read."""
 
 
 def _open(src, **options) -> av.container.InputContainer:
-    try:
+    quiet()
+    with refusing("Failed to open video", Exception):
         if sys.platform == "linux" and isinstance(src, str) and src.startswith("https://"):
             # PyAV's Linux wheels carry no trust store
             options["options"] = {"ca_file": ssl.get_default_verify_paths().cafile or certifi.where()}
         # PyAV takes the direction from a stream's own `.mode`, and an upload spooled in memory says "w+b"
         return av.open(io.BytesIO(src) if isinstance(src, bytes) else src, mode="r", **options)
-    except Exception as e:
-        raise RuntimeError("Failed to open video") from e
 
 
 def rotation_filters(graph: av.filter.Graph, rotation: int) -> list:
@@ -77,9 +101,9 @@ def rotation_filters(graph: av.filter.Graph, rotation: int) -> list:
     return [graph.add("transpose", "cclock" if rotation == 90 else "clock")] if rotation in (90, 270) else []
 
 
-def _rotation_graph(rotation: int, width: int, height: int) -> av.filter.Graph:
+def _rotation_graph(rotation: int, width: int, height: int, format: str) -> av.filter.Graph:
     graph = av.filter.Graph()
-    source = graph.add_buffer(width=width, height=height, format="rgb24", time_base=Fraction(1, 1000))
+    source = graph.add_buffer(width=width, height=height, format=format, time_base=Fraction(1, 1000))
     graph.link_nodes(source, *rotation_filters(graph, rotation), graph.add("buffersink"))
     graph.configure()
     return graph
@@ -109,8 +133,8 @@ def _pick(items: Iterable[tuple], fps: float, keep_last: bool) -> Iterator[tuple
         yield dropped
 
 
-def _rgb(items: Iterable[tuple], size: tuple[int, int] | None, rotation: int) -> Iterator[tuple]:
-    """Resize the native planes, convert to RGB, then turn upright: rotating first would change the chroma.
+def _rgb(items: Iterable[tuple], size: tuple[int, int] | None, rotation: int, format: str) -> Iterator[tuple]:
+    """Resize the native planes, convert to `format`, then turn upright: rotating first would change the chroma.
 
     `rotation` is the header's, as `meta` reports it: a frame's own can come from an H.264 SEI, on some frames only.
     """
@@ -121,9 +145,9 @@ def _rgb(items: Iterable[tuple], size: tuple[int, int] | None, rotation: int) ->
             width, height = size[::-1] if rotation in (90, 270) else size
             frame = scale.reformat(frame, width=width, height=height, interpolation=Interpolation.AREA, threads=1)
         threads = 1 if frame.width * frame.height < SINGLE_THREAD_MAX_PIXELS else 0
-        rgb = convert.reformat(frame, format="rgb24", threads=threads)
+        rgb = convert.reformat(frame, format=format, threads=threads)
         if rotation in (90, 180, 270):
-            turn = graph(rotation, rgb.width, rgb.height)
+            turn = graph(rotation, rgb.width, rgb.height, format)
             turn.push(rgb)
             rgb = turn.pull()
         # padded lines come out as strided views, which image libraries reject
@@ -167,18 +191,21 @@ class Video:
 
     `thread_type` is PyAV's ("AUTO", "FRAME", "SLICE", "NONE"). Open a Video in the process that reads it: one
     inherited across a fork can deadlock if its decoder is threaded, and shares its file position with the other
-    processes even with "NONE". A smaller `buffer_size` yields frames sooner on a live stream.
+    processes even with "NONE". A smaller `buffer_size` yields frames sooner on a live stream. `format` names the
+    container when the data cannot say ("mpegts" for a stream joined midway).
     """
 
-    def __init__(self, src: str | os.PathLike | bytes | BinaryIO, thread_type: str = "AUTO", buffer_size: int = 32768):
+    def __init__(self, src: str | os.PathLike | bytes | BinaryIO, thread_type: str = "AUTO", buffer_size: int = 32768,
+                 format: str | None = None):
         self._moves = 0  # times the container was repositioned or closed: a read still running then has lost its place
-        self.container = _open(os.fspath(src) if isinstance(src, os.PathLike) else src, buffer_size=buffer_size)
+        src = os.fspath(src) if isinstance(src, os.PathLike) else src
+        self.container = _open(src, buffer_size=buffer_size, format=format)
         # libav's word rather than a guess from the argument's type: it has no size for a pipe, named by path or not.
         # A format that opens its own files (an image sequence) has no size to ask for.
         self.seekable = bool(self.container.size) or self.container.format.no_file
         if not self.container.streams.video:
             self.container.close()
-            raise RuntimeError("Failed to open video: it has no video stream")
+            raise InvalidVideoError("Failed to open video: it has no video stream")
         self.stream = self.container.streams.video[0]
         self.stream.thread_type = thread_type
         # the header's: the decoder moves the stream's own size to each frame it decodes, and chapters differ in size
@@ -381,7 +408,7 @@ class Video:
         # a header rate can drift from the timestamps (#26): guessed_rate follows them
         locate = float(stream.guessed_rate or fps)
         index, chapter = (None if seeking else -1), None
-        try:
+        with refusing("Failed to decode video"):
             for frame in self.container.decode(stream):
                 if chapters:
                     time = frame.time + half  # half a frame of slack: Matroska keeps milliseconds
@@ -411,27 +438,27 @@ class Video:
                     if self._moves != moves:  # checked before PyAV is asked again: it crashes on a closed container
                         raise RuntimeError("another read, meta, keyframes() or close() moved the video before this "
                                            "read finished")
-        except av.FFmpegError as e:
-            raise RuntimeError("Failed to decode video") from e
 
-    def _frames(self, start, stop, seconds, fps, size, keep_last) -> Iterator[tuple]:
+    def _frames(self, start, stop, seconds, fps, size, keep_last, format) -> Iterator[tuple]:
         items = self._decode(start, stop, seconds)
-        return _rgb(_pick(items, fps, keep_last) if fps else items, size, self.rotation)
+        return _rgb(_pick(items, fps, keep_last) if fps else items, size, self.rotation, format)
 
-    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None,
+    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None, format="rgb24",
                indices=False) -> Iterator:
         """RGB (H, W, 3) uint8 arrays for frames [start, stop), decoded as they are asked for.
 
         `seconds=True` takes times instead of frame indices, and selects by each frame's own timestamp. `fps` drops
         frames down to about that rate; it always keeps the first frame, and with `keep_last=True` the last one too.
-        `size` is (width, height) as displayed. `indices=True` yields (array, frame index) pairs. In a file with
-        chapters, indices and times are the source's, so the frames between chapters are skipped, not renumbered, and
-        `fps` treats each chapter as its own range. A stream that cannot seek is read once.
+        `size` is (width, height) as displayed. `format` is the pixel format of the arrays: "gray" gives (H, W),
+        "rgba" (H, W, 4). `indices=True` yields (array, frame index) pairs. In a file with chapters, indices and
+        times are the source's, so the frames between chapters are skipped, not renumbered, and `fps` treats each
+        chapter as its own range. A stream that cannot seek is read once.
         """
         start, stop = self._range(start, stop, seconds, fps, size, keep_last)
-        return _items(self._frames(start, stop, seconds, fps, size, keep_last), indices)
+        return _items(self._frames(start, stop, seconds, fps, size, keep_last, format), indices)
 
-    def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None) -> Frames:
+    def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None,
+             format="rgb24") -> Frames:
         """`frames()` as one batch: (frames, indices). Raises ValueError when the range is empty."""
         start, stop = self._range(start, stop, seconds, fps, size, keep_last)
         # The header's count, else an estimate: it only sizes the batch. A read up to a `stop` decodes nothing to
@@ -448,27 +475,54 @@ class Video:
         if hint and fps and fps < rate:  # each chapter rounds up on its own
             hint = int(hint * fps / rate) + (1 + keep_last) * max(len(self.chapters), 1)
         numbers = []
-        frames = self._frames(start, stop, seconds, fps, size, keep_last)
+        frames = self._frames(start, stop, seconds, fps, size, keep_last, format)
         frames = stack_frames((numbers.append(i) or a for i, _, a in frames), hint)
         return Frames(frames, np.array(numbers, dtype=np.int64))
 
-    def chapter_frames(self, fps=None, size=None, keep_last=False,
+    def chapter_frames(self, fps=None, size=None, keep_last=False, format="rgb24",
                        indices=False) -> Iterator[tuple[Chapter | None, Iterator]]:
         """(chapter, its RGB frames) per chapter, from one decode, so it works on a stream that cannot seek.
 
         The frames are arrays, or (array, index) pairs with `indices=True`, as from `frames()`. A file without
         chapters yields (None, frames) once. Each iterator ends when the next chapter is asked for.
         """
-        frames = self._frames(*self._range(0, None, False, fps, size, keep_last), False, fps, size, keep_last)
+        frames = self._frames(*self._range(0, None, False, fps, size, keep_last), False, fps, size, keep_last, format)
         for number, group in groupby(frames, key=operator.itemgetter(1)):
             yield (None if number is None else self.chapters[number]), _items(group, indices)
 
-    def keyframes(self) -> list[int]:
-        """Frame indices of the keyframes, the same indices reads use. Packets are read, nothing is decoded."""
+    @property
+    def codec(self) -> str:
+        return self.stream.codec.canonical_name  # "av1", where the decoder's own name is "libdav1d"
+
+    @property
+    def pix_fmt(self) -> str:
+        return self.stream.pix_fmt
+
+    @property
+    def sample_aspect_ratio(self) -> Fraction:
+        """Width over height of one stored pixel; 1 when the file does not say."""
+        return Fraction(self.stream.sample_aspect_ratio or 1)
+
+    @property
+    def tags(self) -> dict[str, str]:
+        """The container's metadata."""
+        return dict(self.container.metadata)
+
+    @refusing("Failed to read video")
+    def _packets(self) -> list[tuple[int, bool]]:
+        """(pts, is keyframe) of every frame in presentation order. Packets are read, nothing is decoded."""
         self.rewind()
         # an edit list marks the packets it hides, like the ones a slice keeps only for decoding: they are no frames
-        packets = (p for p in self.container.demux(self.stream) if p.size and p.pts is not None and not p.is_discard)
-        packets = sorted((p.pts, p.is_keyframe) for p in packets)  # B-frames arrive out of presentation order
+        packets = (p for p in self.container.demux(self.stream) if p.size and p.pts is not None)
+        return sorted((p.pts, p.is_keyframe) for p in packets if not p.is_discard)  # B-frames arrive out of order
+
+    def timestamps(self) -> list[float]:
+        """Each frame's time in seconds, as stored."""
+        return [float(pts * self.stream.time_base) for pts, _ in self._packets()]
+
+    def keyframes(self) -> list[int]:
+        """Frame indices of the keyframes, the same indices reads use. Packets are read, nothing is decoded."""
+        packets = self._packets()
         if not self.chapters:
             return [index for index, (_, key) in enumerate(packets) if key]
         # in a chaptered file a frame's index is its place on the source, and only frames inside a chapter count

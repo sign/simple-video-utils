@@ -10,7 +10,7 @@ from itertools import islice
 
 import av
 
-from simple_video_utils.video import SLACK, Video
+from simple_video_utils.video import SLACK, Video, refusing
 
 
 class _Sink:
@@ -110,7 +110,7 @@ def _keyframe_header(stream: av.VideoStream, packet: av.Packet) -> tuple[bytes, 
     return header, frame.width, frame.height
 
 
-class Slice:
+class VideoSlice:
     """Seconds [start, stop) of a video as a streamable MP4 (moov first), produced as it is read.
 
     Iterate for its bytes; iterate again to replay it. Packets are copied, so nothing is re-encoded and codecs MP4
@@ -210,21 +210,22 @@ class Slice:
             raise OSError("Video source changed between slice reads")
 
     def __iter__(self) -> Iterator[bytes]:
-        with Video(self.src) as video:
-            stream = video.stream
-            base = 0 if video.chapters else stream.start_time or 0  # chapters sit on the source's clock
-            rate = stream.average_rate  # the header's will do: it only keeps the slack under half a frame
-            slack = min(SLACK, 0.5 / float(rate * stream.time_base)) if rate else SLACK
-            begin, end = (math.ceil(t / stream.time_base - slack) + base for t in (self.start, self.stop))
-            self._plan = self._plan or self._plan_packets(video, begin, end)
-            # the reserved moov, plus room for ftyp, the mdat header and its size, which the muxer patches on close
-            head = _Sink(self._plan[4] + 1024, queue=False)
-            for _ in self._mux(head, video, begin, end):
-                pass
-            self._size, header = head.size, bytes(head.head[:head.size])
-            with Video(header) as clip:
-                self._duration = clip.duration
-            yield header
-            del header
-            if head.size > len(head.head):
-                yield from self._mux(_Sink(len(head.head), queue=True), video, begin, end)
+        with refusing("Failed to slice video"):
+            with Video(self.src) as video:
+                stream = video.stream
+                base = 0 if video.chapters else stream.start_time or 0  # chapters sit on the source's clock
+                rate = stream.average_rate  # the header's will do: it only keeps the slack under half a frame
+                slack = min(SLACK, 0.5 / float(rate * stream.time_base)) if rate else SLACK
+                begin, end = (math.ceil(t / stream.time_base - slack) + base for t in (self.start, self.stop))
+                self._plan = self._plan or self._plan_packets(video, begin, end)
+                # the reserved moov, plus room for ftyp, the mdat header and its size, which the muxer patches on close
+                head = _Sink(self._plan[4] + 1024, queue=False)
+                for _ in self._mux(head, video, begin, end):
+                    pass
+                self._size, header = head.size, bytes(head.head[:head.size])
+                with Video(header) as clip:
+                    self._duration = clip.duration
+                yield header
+                del header
+                if head.size > len(head.head):
+                    yield from self._mux(_Sink(len(head.head), queue=True), video, begin, end)
