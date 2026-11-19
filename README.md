@@ -150,6 +150,44 @@ clips = slice_video("video.mp4", [(0.0, 1.5)], size=256)
 Clips are streamable MP4 (`moov` first), so a consumer can demux them from a
 pipe or socket without seeking.
 
+For long slices, `Video` keeps a replayable source rather than a complete clip:
+
+```python
+from simple_video_utils.video import Video
+
+clip = Video.from_slice("video.mp4", 600, 1200, chapters=True)
+with open("clip.mp4", "wb") as output:
+    for chunk in clip.iter_bytes():
+        output.write(chunk)
+```
+
+Slicing copies compressed packets; it never decodes or re-encodes frames.
+It counts packets and prepares final MP4 headers, then streams the media behind
+those headers. Memory holds sample tables and the current packet, not all clip
+bytes. This rereads source packets to preserve the same lossless MP4/edit-list
+behavior as `slice_video`, including keyframe lead-in and chapter gaps. A codec
+unsupported by the MP4 muxer raises instead of silently re-encoding.
+
+The same `Video` accepts complete bytes or caller-owned binary I/O:
+
+```python
+uploaded = Video(video_bytes)
+with open("video.mp4", "rb") as stream:
+    stored = Video(stream)
+    print(stored.fingerprint(), stored.size, stored.duration_seconds())
+```
+
+These APIs are synchronous. Async applications own their threadpool and
+cancellation policy. Seekable I/O replays the entire file from byte zero; borrowed
+I/O has one shared cursor and stays open. Non-seekable I/O supports one read and
+requires a supplied duration when needed. Fingerprinting requires a replayable
+source and retains only its MD5 and size. `duration_seconds()` and `size_bytes()` read the final MP4 header without
+hashing; `fingerprint()` computes an MD5 in a separate bounded pass. The first
+slice read needs three packet walks; subsequent reads need two. Only scalar
+metadata is cached between reads. A factory (`Video(lambda: byte_chunks(), duration=...)`)
+must reproduce identical bytes on every read; supply its duration explicitly. Close
+byte iterators when stopping early, and keep sources unchanged across replays.
+
 Split an incoming video stream into packet-copied clips as it arrives —
 each clip is yielded as soon as its window has been read, without re-encoding.
 Each carries its `start` on the source timeline, which counting the clips does
