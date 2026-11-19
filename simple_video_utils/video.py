@@ -130,6 +130,11 @@ def _rgb(items: Iterable[tuple], size: tuple[int, int] | None, rotation: int) ->
         yield index, chapter, np.ascontiguousarray(rgb.to_ndarray())
 
 
+def _items(frames: Iterable[tuple], indices: bool) -> Iterator:
+    """What a lazy read yields: the arrays, or (array, index) pairs when asked for indices."""
+    return ((array, index) for index, _, array in frames) if indices else (array for _, _, array in frames)
+
+
 def stack_frames(frames: Iterable[np.ndarray], size_hint: int = 0) -> np.ndarray:
     """`np.stack(list(frames))`, copying each array into the batch as it arrives, while it is still in cache.
 
@@ -413,17 +418,18 @@ class Video:
         items = self._decode(start, stop, seconds)
         return _rgb(_pick(items, fps, keep_last) if fps else items, size, self.rotation)
 
-    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None) -> Iterator[tuple]:
-        """(RGB (H, W, 3) uint8 array, frame index) for frames [start, stop), decoded as they are asked for.
+    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None,
+               indices=False) -> Iterator:
+        """RGB (H, W, 3) uint8 arrays for frames [start, stop), decoded as they are asked for.
 
         `seconds=True` takes times instead of frame indices, and selects by each frame's own timestamp. `fps` drops
         frames down to about that rate; it always keeps the first frame, and with `keep_last=True` the last one too.
-        `size` is (width, height) as displayed. In a file with chapters, indices and times are the source's, so the
-        frames between chapters are skipped, not renumbered, and `fps` treats each chapter as its own range. A stream
-        that cannot seek is read once.
+        `size` is (width, height) as displayed. `indices=True` yields (array, frame index) pairs. In a file with
+        chapters, indices and times are the source's, so the frames between chapters are skipped, not renumbered, and
+        `fps` treats each chapter as its own range. A stream that cannot seek is read once.
         """
         start, stop = self._range(start, stop, seconds, fps, size, keep_last)
-        return ((array, index) for index, _, array in self._frames(start, stop, seconds, fps, size, keep_last))
+        return _items(self._frames(start, stop, seconds, fps, size, keep_last), indices)
 
     def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None) -> Frames:
         """`frames()` as one batch: (frames, indices). Raises ValueError when the range is empty."""
@@ -446,15 +452,16 @@ class Video:
         frames = stack_frames((numbers.append(i) or a for i, _, a in frames), hint)
         return Frames(frames, np.array(numbers, dtype=np.int64))
 
-    def chapter_frames(self, fps=None, size=None, keep_last=False) -> Iterator[tuple[Chapter | None, Iterator]]:
-        """(chapter, its frames) per chapter, from one decode, so it works on a stream that cannot seek.
+    def chapter_frames(self, fps=None, size=None, keep_last=False,
+                       indices=False) -> Iterator[tuple[Chapter | None, Iterator]]:
+        """(chapter, its RGB frames) per chapter, from one decode, so it works on a stream that cannot seek.
 
-        The frames are (array, index) pairs, as from `frames()`. A file without chapters yields (None, frames) once.
-        Each iterator ends when the next chapter is asked for.
+        The frames are arrays, or (array, index) pairs with `indices=True`, as from `frames()`. A file without
+        chapters yields (None, frames) once. Each iterator ends when the next chapter is asked for.
         """
         frames = self._frames(*self._range(0, None, False, fps, size, keep_last), False, fps, size, keep_last)
         for number, group in groupby(frames, key=operator.itemgetter(1)):
-            yield (None if number is None else self.chapters[number]), ((array, index) for index, _, array in group)
+            yield (None if number is None else self.chapters[number]), _items(group, indices)
 
     def keyframes(self) -> list[int]:
         """Frame indices of the keyframes, the same indices reads use. Packets are read, nothing is decoded."""

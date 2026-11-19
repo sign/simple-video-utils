@@ -51,7 +51,10 @@ def numbers(frames) -> list[int]:
 
 def windows(video, indices, fps=30) -> list[list[int]]:
     """The indices a timed read of each frame's own window, [i / fps, (i + 1) / fps), returns."""
-    return [[index for _, index in video.frames(i / fps, (i + 1) / fps, seconds=True, size=(16, 16))] for i in indices]
+    def timed(i):
+        return video.frames(i / fps, (i + 1) / fps, seconds=True, size=(16, 16), indices=True)
+
+    return [[index for _, index in timed(i)] for i in indices]
 
 
 @pytest.fixture(scope="session")

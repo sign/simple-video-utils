@@ -18,7 +18,7 @@ with Video("sign.mp4") as video:                      # a path, a URL, bytes, or
     window = video.read(30, 60).frames                # frames 30..59
     second = video.read(1.0, 2.0, seconds=True)       # the frames timed in [1 s, 2 s)
     small = video.read(fps=15, keep_last=True, size=(256, 256))
-    for frame, index in video.frames(fps=15):         # the same arguments, decoded as you go
+    for frame in video.frames(fps=15):                # the same arguments, decoded as you go
         ...
 ```
 
@@ -37,7 +37,7 @@ frames that cannot be decoded.
 
 ## Frames
 
-`Video.frames()` yields `(array, index)` pairs lazily. `Video.read()` returns the same frames as one batch,
+`Video.frames()` yields RGB arrays lazily. `Video.read()` returns the same frames as one batch,
 `Frames(frames, indices)`: `torch.from_numpy(batch.frames)` wraps it without a copy. Both take the same arguments:
 
 | Argument | Meaning |
@@ -46,6 +46,7 @@ frames that cannot be decoded.
 | `fps` | Drop frames down to about this rate. Never repeats a frame; always keeps the first. |
 | `keep_last` | With `fps`, also keep the last frame of the range, which `fps` drops when it falls between steps. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
+| `indices` | `frames()` and `chapter_frames()` only: yield `(array, index)` pairs. `read()` always returns the indices. |
 
 Reads three seconds or more into an MP4, MOV, Matroska or WebM file seek first, when its header says the frames keep
 one rate; any other read is counted from the first frame. An MP4's header shows a skipped frame and Matroska's does
@@ -77,7 +78,7 @@ with Video("cropped.mkv") as video:
     video.chapters                                    # [Chapter(id, start, end, source, payload), ...]
     video.read(30, 90)                                # the first chapter, by source frame index
     for chapter, frames in video.chapter_frames(fps=15, size=(256, 256)):
-        ...                                           # (array, index) pairs; one decode, so it works on a stream
+        ...                                           # one decode, so it works on a stream
 ```
 
 `box` is `(left, top, right, bottom)` in displayed pixels and may reach past the frame, which pads with black. Sizes
@@ -121,8 +122,8 @@ that runs into a chapter of another size plays only in FFmpeg-based players.
 | `read_frames_exact(p, start_frame=a, end_frame=b)` | `Video(p).frames(a, b + 1)` |
 | `read_frames_batched(p, start_time=a, end_time=b)` | `Video(p).read(a, b, seconds=True).frames`: `b` is now excluded |
 | `frames, idx = read_frames_batched(p, return_indices=True)` | `frames, idx = Video(p).read()` |
-| `for frame in read_frames_exact(p)`, `size=FrameSize((w, h))` | `for frame, index in Video(p).frames()`, `size=(w, h)` |
-| `read_frames_from_stream(f, fps=15, buffer_size=n)` | `v = Video(f, buffer_size=n)`, then `v.meta`, `v.frames(fps=15)` (pairs) |
+| `read_frames_exact(p, return_indices=True)`, `size=FrameSize((w, h))` | `Video(p).frames(indices=True)`, `size=(w, h)` |
+| `read_frames_from_stream(f, fps=15, buffer_size=n)` | `v = Video(f, buffer_size=n)`, then `v.meta`, `v.frames(fps=15)` |
 | `read_chapters(src, fps=, size=)` yielding `(dict, start, frames)` | `Video(src).chapter_frames(fps=, size=)` yielding `(Chapter, frames)` |
 | `list_chapters(p)` | `Video(p).chapters`, this library's only; every marker: `Video(p).container.chapters()` |
 | `keyframe_indices(v)`, `count_frames(v)` | `v.keyframes()`; `v.rewind()`, then `sum(1 for _ in v.container.decode(v.stream))` |

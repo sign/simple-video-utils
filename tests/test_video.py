@@ -125,7 +125,7 @@ def test_read_is_the_stacked_frames(full):
     with Video(EXAMPLE) as video:
         assert full.shape == (130, 240, 320, 3)
         assert full.dtype == np.uint8
-        assert np.array_equal(np.stack([frame for frame, _ in video.frames()]), full)
+        assert np.array_equal(np.stack(list(video.frames())), full)
         assert np.array_equal(video.read(10, 20).frames, full[10:20])
         assert np.array_equal(video.read(np.int64(100)).frames, full[100:]), "past three seconds a read seeks"
         frames, indices = video.read(125, 500)
@@ -138,7 +138,7 @@ def test_read_by_seconds(full):
         assert np.array_equal(video.read(1.0, 2.0, seconds=True).frames, full[30:60])
         assert np.array_equal(video.read(-0.5, 0.7, seconds=True).frames, full[:21]), "0.7 s is frame 21"
         assert np.array_equal(video.read(3.5, 4.0, seconds=True).frames, full[105:120]), "this far in, after a seek"
-        frame, index = next(video.frames(video.meta.duration / 2, seconds=True))
+        frame, index = next(video.frames(video.meta.duration / 2, seconds=True, indices=True))
         assert index == 65
         assert np.array_equal(frame, full[65])
 
@@ -156,7 +156,7 @@ def test_bad_arguments_raise_at_the_call(arguments, error):
 def test_a_timed_read_goes_by_each_frames_own_time():
     # a browser recording: frames at 0, 57, 164, 213 ms. An average rate would put frame 3 inside [0.1, 0.2)
     with Video(ASSETS / "mediarecorder-no-average-rate.webm") as video:
-        assert [index for _, index in video.frames(0.1, 0.2, seconds=True)] == [2]
+        assert [index for _, index in video.frames(0.1, 0.2, seconds=True, indices=True)] == [2]
         assert video.read(0.164, 0.26, seconds=True).indices.tolist() == [2, 3]
     with av.open(str(ASSETS / "no_average_rate_5s.webm")) as container:
         times = [frame.time for frame in container.decode(video=0)]
@@ -170,13 +170,14 @@ def test_a_timed_read_allows_for_the_rounding_of_the_files_clock(tmp_path):
     with Video(make_video(tmp_path / "late.mkv", frames=60, times=range(2, 62))) as video:
         assert video.stream.start_time == 67
         assert windows(video, range(60)) == [[index] for index in range(60)]
-        assert next(video.frames(0.034, seconds=True))[1] == 2, "a millisecond after a stored time is after it"
+        _, index = next(video.frames(0.034, seconds=True, indices=True))
+        assert index == 2, "a millisecond after a stored time is after it"
 
 
 def test_a_stream_that_cannot_seek_is_read_once(tmp_path):
     data = Path(make_video(tmp_path / "v.mkv", frames=120)).read_bytes()
     with Video(Pipe(data)) as video:
-        frames = list(video.frames(100, 103))  # decoded from the start, with no seek
+        frames = list(video.frames(100, 103, indices=True))  # decoded from the start, with no seek
         assert [index for _, index in frames] == numbers(frame for frame, _ in frames) == [100, 101, 102]
         with pytest.raises(ValueError, match="read only once"):
             next(video.frames())
@@ -195,9 +196,9 @@ def test_reads_stay_exact_after_the_frame_rate_changes(tmp_path):
 def test_a_timed_read_needs_no_frame_rate():
     with Video(Pipe((ASSETS / "mediarecorder-no-average-rate.webm").read_bytes())) as video:
         assert video.meta.fps == 0.0
-        assert [index for _, index in video.frames(0.1, 0.2, seconds=True)] == [2]
+        assert [index for _, index in video.frames(0.1, 0.2, seconds=True, indices=True)] == [2]
     with Video(Pipe((ASSETS / "mediarecorder-no-average-rate.webm").read_bytes())) as video:
-        assert [index for _, index in video.frames(10, 14)] == [10, 11, 12, 13], "nor does a read by index"
+        assert [index for _, index in video.frames(10, 14, indices=True)] == [10, 11, 12, 13]  # nor by index
 
 
 def test_seeked_read_is_exact_when_the_header_rate_drifts():
@@ -256,7 +257,7 @@ def test_keep_last_adds_the_last_frame_when_fps_would_drop_it(full):
         assert batch.indices.tolist() == [*range(0, 30, 3), 29]
         assert np.array_equal(batch.frames, full[batch.indices])
         assert video.read(0, 28, fps=10, keep_last=True).indices.tolist() == list(range(0, 28, 3)), "27 was kept anyway"
-        assert [index for _, index in video.frames(120, fps=10, keep_last=True)] == [120, 123, 126, 129]
+        assert [index for _, index in video.frames(120, fps=10, keep_last=True, indices=True)] == [120, 123, 126, 129]
         with pytest.raises(ValueError, match="keep_last"):
             video.read(keep_last=True)
 
@@ -293,13 +294,13 @@ def test_one_video_serves_many_reads(full):
 ])
 def test_a_read_that_lost_its_place_raises(tmp_path, interrupt):
     with Video(make_video(tmp_path / "v.mkv", frames=120)) as video:
-        frames, later = video.frames(), video.frames(0, 3)
+        frames, later = video.frames(indices=True), video.frames(0, 3)
         assert next(frames)[1] == 0
         interrupt(video)
         with pytest.raises(RuntimeError, match="before this read finished"):
             next(frames)
         if interrupt is not Video.close:
-            assert numbers(frame for frame, _ in later) == [0, 1, 2], "a read started afterwards is whole"
+            assert numbers(later) == [0, 1, 2], "a read started afterwards is whole"
 
 
 def test_frames_are_decoded_as_they_are_asked_for(tmp_path):
@@ -310,7 +311,7 @@ def test_frames_are_decoded_as_they_are_asked_for(tmp_path):
     stream = Pipe(Path(path).read_bytes())
     with Video(stream, buffer_size=4096) as video:
         frames = video.frames()
-        assert np.array_equal([next(frames)[0], next(frames)[0]], whole[:2])
+        assert np.array_equal([next(frames), next(frames)], whole[:2])
         assert stream.tell() < len(stream.getbuffer()) / 2
 
 
@@ -368,7 +369,7 @@ def test_metadata_does_not_depend_on_what_was_read(gapped):
 def test_chapter_frames_reads_each_chapter_from_one_decode(gapped, wrap):
     with Video(wrap(gapped)) as video:
         chapters = [(chapter.id, [(frame.shape, index) for frame, index in frames])
-                    for chapter, frames in video.chapter_frames()]
+                    for chapter, frames in video.chapter_frames(indices=True)]
     assert chapters == [(1, [((128, 160, 3), index) for index in range(20)]),
                         (2, [((208, 256, 3), index) for index in range(45, 80)]),
                         (3, [((240, 320, 3), index) for index in range(100, 128)])]
