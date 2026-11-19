@@ -61,7 +61,7 @@ class VideoError(RuntimeError):
 
 
 class InvalidVideoError(VideoError):
-    """The data is not a video that can be read: garbage, cut too short, or with no video stream."""
+    """The data is not a video that can be read: garbage, cut off inside its header, or with no video to decode."""
 
 
 @contextmanager

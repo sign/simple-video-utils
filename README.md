@@ -41,7 +41,8 @@ is no rate.
 ## Errors
 
 Whatever PyAV refuses, opening, decoding or writing, raises `VideoError`, a `RuntimeError`. When the data itself is
-not a video (garbage, a cut-off upload, no video stream) it is an `InvalidVideoError`, a `VideoError`. Arguments that
+not a video (garbage, a file cut off inside its header, no video stream, a codec with no decoder) it is an
+`InvalidVideoError`, a `VideoError`. A file cut off between frames is a shorter video, and reads as one. Arguments that
 make no sense raise `ValueError` or `TypeError`.
 
 ## Frames
