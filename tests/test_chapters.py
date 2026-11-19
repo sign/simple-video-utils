@@ -1,10 +1,14 @@
+import errno
+import io
+from fractions import Fraction
+
 import av
 import numpy as np
 import pytest
 from av.video.reformatter import ColorRange
-from conftest import ASSETS, EXAMPLE
+from conftest import ASSETS, EXAMPLE, Pipe, make_video, windows
 
-from simple_video_utils import ChapterClip, Slice, Video, write_chapters
+from simple_video_utils import ChapterClip, Slice, Video, chapters, write_chapters
 
 
 def planes(path, frames: range) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -54,13 +58,7 @@ def test_a_box_past_the_frame_pads_with_black_even_off_the_chroma_grid(tmp_path)
 
 
 def test_a_full_range_source_stays_full_range(tmp_path):
-    source = tmp_path / "full.mp4"
-    with av.open(str(source), mode="w") as output:
-        stream = output.add_stream("h264", rate=30, options={"crf": "0"})
-        stream.width, stream.height, stream.pix_fmt = 64, 48, "yuvj420p"
-        image = np.linspace(0, 255, 64 * 48 * 3).reshape(48, 64, 3).astype(np.uint8)
-        output.mux(stream.encode(av.VideoFrame.from_ndarray(image, format="rgb24").reformat(format="yuvj420p")))
-        output.mux(stream.encode())
+    source = make_video(tmp_path / "full.mp4", frames=1, noise=True, pix_fmt="yuvj420p")
     out, _ = write(tmp_path, source, [ChapterClip(0, 1, (-8, -8, 56, 40))], crf=0)
     with av.open(str(out)) as container:
         assert next(container.decode(video=0)).color_range == ColorRange.JPEG
@@ -68,6 +66,13 @@ def test_a_full_range_source_stays_full_range(tmp_path):
     assert near(y[:8], 0), "black is 0 in full range, 16 in limited"
     assert near(y[:, :8], 0)
     assert near(y[8:, 8:], source_y[:40, :56])
+
+
+def test_a_reserved_colour_tag_is_read_after_the_first_frame(tmp_path):
+    # the header says colorspace 3, which the scale filter refuses; decoding a frame corrects it to 2
+    out, _ = write(tmp_path, ASSETS / "bad_colorspace.mp4", [ChapterClip(0, 2, (0, 0, 64, 64))])
+    with Video(out) as video:
+        assert len(video.read().frames) == 2
 
 
 def test_a_rotated_source_is_cut_as_it_is_displayed(tmp_path):
@@ -85,9 +90,43 @@ def test_chapters_that_touch_read_back(tmp_path):
     out, _ = write(tmp_path, EXAMPLE, [ChapterClip(0, 1, (0, 0, 160, 128)), ChapterClip(1, 10, (0, 0, 160, 128))])
     with Video(out) as video:
         assert [sum(1 for _ in frames) for _, frames in video.chapter_frames()] == [1, 9]
-    clip = b"".join(Slice(str(out), 0, 1))
+    clip = b"".join(Slice(out, 0, 1))
     with Video(clip) as video:  # and the MP4 a slice writes, whose chapter ends are rebuilt from frame counts
         assert video.read().indices.tolist() == list(range(10))
+
+
+def test_a_timed_read_finds_every_frame_of_a_chapter(tmp_path):
+    # frame 47 is at 1566.67 ms and its chapter starts at 1567; frame 49 is at 1633.33 and is stored at 1633
+    out, _ = write(tmp_path, EXAMPLE, [ChapterClip(47, 80, (0, 0, 160, 128))])
+    with Video(out) as video:
+        assert windows(video, range(47, 80)) == [[index] for index in range(47, 80)]
+
+
+def test_a_slice_carries_many_short_chapters(tmp_path):
+    out, _ = write(tmp_path, EXAMPLE, [ChapterClip(n, n + 1, (0, 0, 16, 16)) for n in range(0, 128, 2)])
+    clip = Slice(out, 0, 5)  # every chapter mark needs room in the MP4 header, which is reserved before it is written
+    with Video(b"".join(clip)) as video:
+        assert video.read().indices.tolist() == list(range(0, 128, 2))
+
+
+def test_a_chapter_file_states_its_sources_rate(tmp_path):
+    # Matroska keeps a rate as whole nanoseconds per frame, which libav hands back as 60/1 here
+    rate = Fraction(1600000, 26667)
+    source = make_video(tmp_path / "source.mp4", frames=12, fps=rate)
+    out, _ = write(tmp_path, source, [ChapterClip(2, 8, (0, 0, 64, 48))])
+    with Video(out) as video:
+        assert video.stream.average_rate == 60
+        assert video.rate == rate
+        assert ChapterClip(**video.chapters[0].payload).end_frame == 8, "the payload is still the clip, and only that"
+
+
+def test_a_chaptered_slice_is_cut_at_the_rate_its_chapters_state(tmp_path, gapped):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"".join(Slice(gapped, 0.5, 3.5)))  # 45 frames over 3 seconds: its header says 120/7 fps
+    out, _ = write(tmp_path, clip, [ChapterClip(0, 5, (0, 0, 160, 128))])
+    with Video(out) as video, av.open(str(out)) as container:
+        assert video.meta.fps == 30
+        assert [packet.pts for packet in container.demux(video=0) if packet.size] == [0, 33, 67, 100, 133]
 
 
 def test_resolution_resizes_a_chapter(tmp_path):
@@ -104,6 +143,17 @@ def test_clips_are_cut_at_the_last_frame_the_source_decodes(tmp_path):
     with Video(out) as video:
         assert [(c.payload["start_frame"], c.payload["end_frame"]) for c in video.chapters] == [(100, 130)]
         assert video.read().indices.tolist() == list(range(100, 130))
+
+
+@pytest.mark.parametrize(("fps", "clips"), [
+    (30, [ChapterClip(100, 104, (0, 0, 64, 48))]),  # libav sets no start time on a file of under 8 frames
+    (60, [ChapterClip(6 * i + 1, 6 * i + 5, (0, 0, 64, 48)) for i in range(14)]),  # 13 gaps, each rounded to a ms
+])
+def test_frame_count_is_what_the_chapters_hold(tmp_path, fps, clips):
+    out, _ = write(tmp_path, make_video(tmp_path / "source.mp4", frames=110, fps=fps), clips)
+    for source in (str(out), Pipe(out.read_bytes())):  # a pipe has the header alone, whose clock runs through the gaps
+        with Video(source) as video:
+            assert video.meta.nb_frames == sum(clip.end_frame - clip.start_frame for clip in clips)
 
 
 def test_a_source_without_a_header_rate(tmp_path):
@@ -132,3 +182,15 @@ def test_an_existing_output_is_left_alone(tmp_path):
     with pytest.raises(FileExistsError):
         write_chapters(EXAMPLE, out, [ChapterClip(0, 4, (0, 0, 16, 16))])
     assert out.read_bytes() == b"mine"
+
+
+def test_a_write_the_device_refuses_leaves_no_file(tmp_path, monkeypatch):
+    class Full(io.FileIO):
+        def write(self, data):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    # closing the file flushes it, so the close in the cleanup is refused as well
+    monkeypatch.setattr(chapters, "open", lambda path, mode: io.BufferedWriter(Full(path, "x")), raising=False)
+    with pytest.raises(OSError, match="No space left"):
+        write(tmp_path, EXAMPLE, [ChapterClip(0, 4, (0, 0, 16, 16))])
+    assert not list(tmp_path.iterdir())

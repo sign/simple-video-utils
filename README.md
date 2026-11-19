@@ -1,6 +1,6 @@
 # simple-video-utils
 
-Read, slice and crop videos for sign language processing. One class over [PyAV](https://pyav.org), under 800 lines.
+Read, slice and crop videos for sign language processing. One class over [PyAV](https://pyav.org), under 900 lines.
 
 ```bash
 pip install simple-video-utils  # Python 3.14+
@@ -10,7 +10,7 @@ pip install simple-video-utils  # Python 3.14+
 from simple_video_utils import Video, video_metadata
 
 video_metadata("sign.mp4")
-# VideoMetadata(width=320, height=240, fps=30.0, nb_frames=130, time_base='1/15360', duration=4.33, rotation=0)
+# VideoMetadata(width=320, height=240, fps=30.0, nb_frames=130, time_base='1/15360', duration=4.333333333333333, rotation=0)
 
 with Video("sign.mp4") as video:                      # a path, a URL, bytes, or a binary stream
     video.meta                                        # the same metadata, for any source
@@ -24,12 +24,16 @@ with Video("sign.mp4") as video:                      # a path, a URL, bytes, or
 
 ## Metadata
 
-`width` and `height` are as displayed, rotation applied. `nb_frames` is checked rather than trusted: the header's count
-is compared with duration x fps and the frames are decoded when they disagree; files with no count (Matroska, WebM)
-read their last packet instead. `fps` is measured from the frames when the header has none (browser recordings). A
-stream that cannot seek gets the header's values only, and `fps=0.0` when there is no rate.
+`width` and `height` are as displayed, rotation applied. `nb_frames` is checked rather than trusted: a file with
+chapters counts what its chapters hold. Otherwise the header's count, less the samples an edit list hides (a slice's
+lead-in, a recording trimmed in place), is compared with duration x fps and the frames are decoded when they disagree;
+files with no count (Matroska, WebM) read their last packet instead, which takes the header's frame rate to hold for
+the whole file. `fps` is measured from the frames when the header has none (browser recordings), and `video.rate` is
+the same rate as an exact `Fraction`. A stream that cannot seek gets the header's values only, and `fps=0.0` when there
+is no rate.
 
-`video_metadata(path)` caches its last 8 paths. A file that cannot be opened or decoded raises `RuntimeError`.
+`video_metadata(path)` caches its last 8 paths. A file that cannot be opened raises `RuntimeError`, and so does reading
+frames that cannot be decoded.
 
 ## Frames
 
@@ -43,17 +47,23 @@ stream that cannot seek gets the header's values only, and `fps=0.0` when there 
 | `keep_last` | With `fps`, also keep the last frame of the range, which `fps` drops when it falls between steps. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
 
-Reads three seconds or more into a file seek first. Frames always come out upright. A stream that cannot seek is read
-once: a second read raises `ValueError`.
+Reads three seconds or more into an MP4, MOV, Matroska or WebM file seek first, when its header says the frames keep
+one rate; any other read is counted from the first frame. An MP4's header shows a skipped frame and Matroska's does
+not, so a Matroska file with uneven timing is numbered by its header rate after a seek. Frames come out upright, by the
+rotation in the header. A stream that cannot seek is read once: a second read raises `ValueError`. A `Video` does one
+read at a time: `keyframes()`, another read, `close()`, or a `meta` that has to read the file (Matroska, WebM) in the
+middle of a `frames()` loop makes that loop raise `RuntimeError`, so ask for `meta` before the loop.
 
-`Video(src, thread_type="NONE")` decodes without threads: use it in processes that fork (DataLoader workers).
+`Video(src, thread_type="NONE")` decodes without threads. Open each `Video` in the process that reads it (in a
+DataLoader worker, not before the fork): workers that inherit one share its file position and fail to decode.
 `Video(stream, buffer_size=4096)` yields frames sooner from a live stream. `video.container` and `video.stream` are the
-PyAV objects, for anything not covered here; call `video.rewind()` before decoding from them yourself.
+PyAV objects, for anything not covered here; call `video.rewind()` before decoding from them yourself. They close with
+the `Video`, when it is closed or dropped.
 
 ## Chapters
 
-A chaptered file holds crops and trims of a source video. Each frame keeps its source time, so the seconds between
-chapters hold no frames, and frame indices are the source's.
+A chaptered file holds crops and trims of a source video. Frame `i` sits at `i / rate`, its source time when the source
+keeps one rate, so the seconds between chapters hold no frames, and frame indices are the source's.
 
 ```python
 from simple_video_utils import ChapterClip, write_chapters
@@ -76,7 +86,7 @@ wrote. Chapters of different sizes need `size=` to be read as one batch. `fps` t
 every read: it starts over on each chapter's first frame, and `keep_last` keeps each chapter's last. A video without
 chapters yields `(None, frames)` once from `chapter_frames`.
 
-Only chapters this library wrote count. Files written before 0.10, which played their chapters back to back, raise
+Only chapters this library wrote count. Files written before 1.0 that play their chapters back to back raise
 `PackedChaptersError` (a `ValueError`) on any read: write them again.
 
 ## Slices
@@ -84,7 +94,7 @@ Only chapters this library wrote count. Files written before 0.10, which played 
 ```python
 from simple_video_utils import Slice
 
-clip = Slice("cropped.mkv", 12.0, 15.5)              # a path or bytes; nothing is read yet
+clip = Slice("cropped.mkv", 2.0, 8.0)                 # a path or bytes; nothing is read yet
 
 clip.size, clip.duration                              # measured without keeping the clip
 for chunk in clip:                                    # MP4 bytes, about 64 KiB at a time; iterate again to replay
@@ -107,13 +117,13 @@ Times are matched at the precision of the file's clock. Codecs MP4 cannot carry 
 | `video_metadata_from_bytes(data)` | `Video(data).meta` |
 | `open_video(p, thread_type=t)` + `video_metadata_from_container(v)` | `Video(p, thread_type=t)`, `v.meta` |
 | `read_frames_exact(p, start_frame=a, end_frame=b)` | `Video(p).frames(a, b + 1)` |
-| `read_frames_batched(p, start_time=a, end_time=b)` | `Video(p).read(a, b, seconds=True).frames` |
+| `read_frames_batched(p, start_time=a, end_time=b)` | `Video(p).read(a, b, seconds=True).frames`: `b` is now excluded |
 | `frames, idx = read_frames_batched(p, return_indices=True)` | `frames, idx = Video(p).read()` |
 | `for frame in read_frames_exact(p)`, `size=FrameSize((w, h))` | `for frame, index in Video(p).frames()`, `size=(w, h)` |
 | `read_frames_from_stream(f, fps=15, buffer_size=n)` | `v = Video(f, buffer_size=n)`, then `v.meta`, `v.frames(fps=15)` (pairs) |
 | `read_chapters(src, fps=, size=)` yielding `(dict, start, frames)` | `Video(src).chapter_frames(fps=, size=)` yielding `(Chapter, frames)` |
-| `list_chapters(p)` | `Video(p).chapters` |
-| `keyframe_indices(v)`, `count_frames(v)` | `v.keyframes()`, `sum(1 for _ in v.container.decode(v.stream))` |
+| `list_chapters(p)` | `Video(p).chapters`, this library's only; every marker: `Video(p).container.chapters()` |
+| `keyframe_indices(v)`, `count_frames(v)` | `v.keyframes()`; `v.rewind()`, then `sum(1 for _ in v.container.decode(v.stream))` |
 | `slice_video(p, [(a, b)], chapters=True)`, `Video.from_slice(p, a, b)` | `Slice(p, a, b)` |
 | `write_chapters(..., trim_to_source=True, thread_type=t)` | `write_chapters(...)`: it always trims; no `thread_type` |
 | `Timeline` | gone: a gapped file is on source time already |

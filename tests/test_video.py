@@ -1,14 +1,23 @@
 import io
 import json
+import math
+import os
+import shutil
+import struct
+import sys
+import tempfile
+import threading
 from fractions import Fraction
 from pathlib import Path
 
 import av
 import numpy as np
 import pytest
-from conftest import ASSETS, EXAMPLE, HELD, Pipe, make_video, numbers
+from av.bitstream import BitStreamFilterContext
+from conftest import ASSETS, EXAMPLE, HELD, Pipe, make_video, numbers, windows
 
 from simple_video_utils import PackedChaptersError, Video, VideoMetadata, stack_frames, video_metadata
+from simple_video_utils.chapters import _replace_chapters
 
 
 @pytest.fixture(scope="module")
@@ -23,6 +32,7 @@ def test_metadata():
     assert list(meta._asdict()) == ["width", "height", "fps", "nb_frames", "time_base", "duration", "rotation"]
     assert video_metadata(EXAMPLE) is meta, "cached per path"
     assert video_metadata(Path(EXAMPLE)) == meta
+    assert video_metadata(next(entry for entry in os.scandir(ASSETS) if entry.name == "example.mp4")) == meta
 
 
 @pytest.mark.parametrize("wrap", [bytes, io.BytesIO, Pipe])
@@ -44,6 +54,17 @@ def test_frame_count_survives_a_header_that_overcounts():
         assert container.streams.video[0].frames == 11
     with Video(ASSETS / "buggy_mov_header.mov") as video:
         assert video.meta.nb_frames == len(video.read(size=(64, 36)).frames) == 3
+    with Video(Pipe((ASSETS / "buggy_mov_header.mov").read_bytes())) as video:
+        assert video.meta.nb_frames == 3, "its edit list hides 8 samples: the index says so, nothing is decoded"
+
+
+def test_frame_count_is_decoded_when_the_header_and_the_clock_disagree(tmp_path):
+    data = bytearray(Path(make_video(tmp_path / "v.mp4", frames=60)).read_bytes())
+    duration = data.index(b"mdhd") + 20  # the track's length: make it say half of what its samples add up to
+    data[duration:duration + 4] = struct.pack(">I", struct.unpack_from(">I", data, duration)[0] // 2)
+    with Video(bytes(data)) as video:
+        assert (video.stream.frames, video.duration) == (60, 1.0)
+        assert video.meta.nb_frames == len(video.read().frames) == 60
 
 
 @pytest.mark.parametrize(("name", "count"), [("no_nb_frames.mkv", 37), ("no_nb_frames.webm", 107)])
@@ -74,6 +95,25 @@ def test_rotation_comes_from_the_header_and_frames_come_out_upright():
         assert video.read(0, 2, size=(90, 160)).frames.shape == (2, 160, 90, 3)
 
 
+@pytest.mark.parametrize("degrees", [90, 180])
+def test_an_orientation_only_in_the_h264_stream_turns_no_frame(tmp_path, degrees):
+    # no display matrix in the header, and libav hands the SEI's rotation to the frames that carry it: here the first
+    path = tmp_path / "sei.mp4"
+    with av.open(EXAMPLE) as source, av.open(str(path), mode="w") as output:
+        stream = source.streams.video[0]
+        track = output.add_stream_from_template(stream)
+        tag = BitStreamFilterContext(f"h264_metadata=display_orientation=insert:rotate={degrees}", stream, track)
+        for packet in source.demux(stream):
+            for tagged in tag.filter(packet if packet.size else None):
+                tagged.stream = track
+                output.mux(tagged)
+    with av.open(str(path)) as container:
+        assert [frame.rotation % 360 for frame in container.decode(video=0)][:3] == [degrees, 0, 0]
+    with Video(path) as video, Video(EXAMPLE) as plain:
+        assert (video.meta.width, video.meta.height, video.meta.rotation) == (320, 240, 0)
+        assert np.array_equal(video.read().frames, plain.read().frames)
+
+
 def test_reserved_colour_tags_do_not_break_the_conversion():
     with av.open(str(ASSETS / "bad_colorspace.mp4")) as container:
         assert container.streams.video[0].codec_context.colorspace == 3  # a value the H.264 spec reserves
@@ -97,6 +137,7 @@ def test_read_by_seconds(full):
     with Video(EXAMPLE) as video:
         assert np.array_equal(video.read(1.0, 2.0, seconds=True).frames, full[30:60])
         assert np.array_equal(video.read(-0.5, 0.7, seconds=True).frames, full[:21]), "0.7 s is frame 21"
+        assert np.array_equal(video.read(3.5, 4.0, seconds=True).frames, full[105:120]), "this far in, after a seek"
         frame, index = next(video.frames(video.meta.duration / 2, seconds=True))
         assert index == 65
         assert np.array_equal(frame, full[65])
@@ -119,9 +160,17 @@ def test_a_timed_read_goes_by_each_frames_own_time():
         assert video.read(0.164, 0.26, seconds=True).indices.tolist() == [2, 3]
     with av.open(str(ASSETS / "no_average_rate_5s.webm")) as container:
         times = [frame.time for frame in container.decode(video=0)]
-    with Video(ASSETS / "no_average_rate_5s.webm") as video:  # far enough in to seek; 20 fps would say 80-89
+    with Video(ASSETS / "no_average_rate_5s.webm") as video:  # counted, as it has no rate; 20 fps would say 80-89
         timed = video.read(4.0, 4.5, seconds=True).indices.tolist()
         assert timed == [index for index, time in enumerate(times) if 4.0 <= time < 4.5] == list(range(79, 89))
+
+
+def test_a_timed_read_allows_for_the_rounding_of_the_files_clock(tmp_path):
+    # Matroska keeps milliseconds, and this file's first frame is stored at 67 ms: every time is read against it
+    with Video(make_video(tmp_path / "late.mkv", frames=60, times=range(2, 62))) as video:
+        assert video.stream.start_time == 67
+        assert windows(video, range(60)) == [[index] for index in range(60)]
+        assert next(video.frames(0.034, seconds=True))[1] == 2, "a millisecond after a stored time is after it"
 
 
 def test_a_stream_that_cannot_seek_is_read_once(tmp_path):
@@ -156,13 +205,39 @@ def test_seeked_read_is_exact_when_the_header_rate_drifts():
     with Video(ASSETS / "vfr_dup_index.mp4") as video:
         whole = video.read().frames
         assert np.array_equal(video.read(400, 430).frames, whole[400:430])
+        # frames 499 and 500 are two frame times apart: the rates agree within 1%, the places after them do not
+        assert np.array_equal(video.read(540, 549).frames, whole[540:549])
 
 
-def test_seeked_read_without_a_header_rate():
+@pytest.mark.parametrize("extension", ["ts", "avi"])
+def test_a_container_that_does_not_seek_to_a_frame_is_counted(tmp_path, extension):
+    # MPEG-TS resumes at the keyframe after a seek's target, and H.264 in AVI starts a frame late
+    with Video(make_video(tmp_path / f"v.{extension}", frames=240, gop=60)) as video:
+        batch = video.read(97, 100)
+        assert batch.indices.tolist() == numbers(batch.frames) == [97, 98, 99]
+
+
+def test_a_read_far_into_a_file_without_a_header_rate_is_counted():
     with Video(ASSETS / "no_average_rate_5s.webm") as video:
         whole = video.read().frames
         assert len(whole) == video.meta.nb_frames == 100
         assert np.array_equal(video.read(80, 90).frames, whole[80:90])
+
+
+def test_a_read_up_to_a_stop_measures_no_rate(monkeypatch):
+    monkeypatch.setattr(Video, "_decoded", property(lambda video: pytest.fail("decoded the file to measure a rate")))
+    with Video(ASSETS / "mediarecorder-no-average-rate.webm") as video:
+        assert video.read(10, 14).indices.tolist() == [10, 11, 12, 13]
+        assert video.read(0.1, 0.2, seconds=True).indices.tolist() == [2]
+
+
+def test_stop_may_be_far_past_the_end():
+    data = (ASSETS / "mediarecorder-no-average-rate.webm").read_bytes()  # nothing in it says how many frames it holds
+    for source in (data, Pipe(data)):
+        with Video(source) as video:
+            assert len(video.read(0, sys.maxsize).frames) == 45, "`stop` must not size the batch"
+    with Video(EXAMPLE) as video:
+        assert len(video.read(1.0, math.inf, seconds=True).frames) == 100
 
 
 def test_fps_drops_frames_and_never_repeats_them(full):
@@ -212,23 +287,31 @@ def test_one_video_serves_many_reads(full):
         assert sum(1 for _ in video.container.decode(video.stream)) == 130
 
 
+@pytest.mark.parametrize("interrupt", [
+    lambda video: video.meta,  # Matroska has no frame count in its header, so this reads the end of the file
+    lambda video: video.read(100, 102), Video.keyframes, lambda video: next(video.frames(60)), Video.close,
+])
+def test_a_read_that_lost_its_place_raises(tmp_path, interrupt):
+    with Video(make_video(tmp_path / "v.mkv", frames=120)) as video:
+        frames, later = video.frames(), video.frames(0, 3)
+        assert next(frames)[1] == 0
+        interrupt(video)
+        with pytest.raises(RuntimeError, match="before this read finished"):
+            next(frames)
+        if interrupt is not Video.close:
+            assert numbers(frame for frame, _ in later) == [0, 1, 2], "a read started afterwards is whole"
+
+
 def test_frames_are_decoded_as_they_are_asked_for(tmp_path):
     path = make_video(tmp_path / "v.mkv", frames=120, noise=True)
     with Video(path) as video:
         whole = video.read().frames
 
-    class Counting(Pipe):
-        count = 0
-
-        def readinto(self, buffer):
-            self.count += len(buffer)
-            return super().readinto(buffer)
-
-    stream = Counting(Path(path).read_bytes())
+    stream = Pipe(Path(path).read_bytes())
     with Video(stream, buffer_size=4096) as video:
         frames = video.frames()
         assert np.array_equal([next(frames)[0], next(frames)[0]], whole[:2])
-        assert stream.count < len(stream.data.getbuffer()) / 2
+        assert stream.tell() < len(stream.getbuffer()) / 2
 
 
 def test_keyframes_are_in_presentation_order(tmp_path):
@@ -248,8 +331,9 @@ def test_stack_frames():
         assert (batch[:, 0, 0, 0] == np.arange(100)).all()
     with pytest.raises(ValueError, match="no frames"):
         stack_frames(iter(()))
-    with pytest.raises(ValueError, match="different shapes"):
-        stack_frames([frames[0], np.zeros((3, 3, 3), np.uint8)])
+    for count in (1, 64):  # 64 fills the first chunk: the next one must not take the new shape
+        with pytest.raises(ValueError, match="different shapes"):
+            stack_frames([*frames[:count], np.zeros((3, 3, 3), np.uint8)])
 
 
 def test_chapters_place_frames_on_the_source(gapped, full):
@@ -264,12 +348,20 @@ def test_chapters_place_frames_on_the_source(gapped, full):
         assert indices.tolist() == HELD
         # the first chapter is the source's top-left corner
         assert np.abs(frames[:20].astype(int) - full[:20, :128, :160]).mean() < 4
+        early, own, late = (np.abs(frames[1:20].astype(int) - full[i:i + 19, :128, :160]).mean() for i in (0, 1, 2))
+        assert own < min(early, late), "frame for frame: the source one frame earlier or later matches worse"
         assert video.read(15, 50, size=(16, 16)).indices.tolist() == [*range(15, 20), *range(45, 50)]
         assert video.read(105, 110).indices.tolist() == list(range(105, 110)), "a seek lands in a chapter"
         assert video.read(0.6, 1.6, seconds=True, size=(16, 16)).indices.tolist() == [18, 19, 45, 46, 47]
         with pytest.raises(ValueError, match="different shapes"):
             video.read()
         assert video.keyframes() == [0, 45, 100], "the same indices as reads, not positions in the file"
+
+
+def test_metadata_does_not_depend_on_what_was_read(gapped):
+    with Video(gapped) as video:
+        video.read(50, 60)  # the decoder now reports the second chapter's size, 256x208
+        assert (video.meta.width, video.meta.height) == (160, 128)
 
 
 @pytest.mark.parametrize("wrap", [str, lambda path: Pipe(Path(path).read_bytes())])
@@ -289,16 +381,11 @@ def test_fps_starts_over_in_each_chapter(gapped):
 
 def test_packed_chapters_are_refused(tmp_path):
     # before 0.10 chapters played back to back: here source frames 30-59 and 90-119 sit at 0-1 s and 1-2 s
-    path = tmp_path / "packed.mkv"
-    with av.open(EXAMPLE) as source, av.open(str(path), mode="w") as output:
-        output.set_chapters([{"id": i, "start": i * 1000, "end": (i + 1) * 1000, "time_base": Fraction(1, 1000),
-                              "metadata": {"payload": json.dumps({"start_frame": start, "end_frame": start + 30})}}
-                             for i, start in enumerate((30, 90))])
-        track = output.add_stream_from_template(source.streams.video[0])
-        for packet in source.demux(video=0):
-            if packet.size:
-                packet.stream = track
-                output.mux(packet)
+    path = Path(shutil.copy(EXAMPLE, tmp_path / "packed.mkv"))
+    _replace_chapters(path, [
+        {"id": i, "start": i * 1000, "end": (i + 1) * 1000, "time_base": Fraction(1, 1000),
+         "metadata": {"payload": json.dumps({"start_frame": start, "end_frame": start + 30})}}
+        for i, start in enumerate((30, 90))])
     with Video(path) as video, pytest.raises(PackedChaptersError, match="packed"):
         video.read()
     with pytest.raises(PackedChaptersError):
@@ -306,17 +393,56 @@ def test_packed_chapters_are_refused(tmp_path):
     assert issubclass(PackedChaptersError, ValueError)
 
 
+# ordinary markers, and titles that only look like ours: a title is anyone's text
+TITLES = ("Intro", "1", "[2]", '{"start_frame": Infinity}', '{"start_frame": 0, "rate": "-30"}', "[" * 100_000)
+
+
 def test_a_video_without_our_chapters_has_none(tmp_path):
-    path = tmp_path / "marked.mkv"
-    with av.open(EXAMPLE) as source, av.open(str(path), mode="w") as output:
-        output.set_chapters([{"id": i, "start": i * 2000, "end": i * 2000 + 2000, "time_base": Fraction(1, 1000),
-                              "metadata": {"title": title}} for i, title in enumerate(("Intro", "1", "[2]"))])
-        track = output.add_stream_from_template(source.streams.video[0])
-        for packet in source.demux(video=0):
-            if packet.size:
-                packet.stream = track
-                output.mux(packet)
+    path = Path(shutil.copy(EXAMPLE, tmp_path / "marked.mkv"))
+    _replace_chapters(path, [{"id": i, "start": i * 2000, "end": i * 2000 + 2000, "time_base": Fraction(1, 1000),
+                              "metadata": {"title": title}} for i, title in enumerate(TITLES)])
     with Video(path) as video:
-        assert len(video.container.chapters()) == 3
+        assert len(video.container.chapters()) == len(TITLES)
         assert video.chapters == []
         assert [(chapter, sum(1 for _ in frames)) for chapter, frames in video.chapter_frames()] == [(None, 130)]
+
+
+def test_a_stream_is_opened_for_reading_whatever_mode_it_reports():
+    # an upload spooled in memory (Starlette's UploadFile.file) says "w+b", which PyAV alone takes as "open to write"
+    with tempfile.SpooledTemporaryFile() as upload:
+        upload.write(Path(EXAMPLE).read_bytes())
+        upload.seek(0)
+        with Video(upload) as video:
+            assert video.meta.nb_frames == 130
+
+
+def test_a_dropped_video_closes_its_container(monkeypatch):
+    container = Video(EXAMPLE).container  # nothing closes it, as in the one-liner `Video(path).read()`
+    assert not container.input_was_opened, "PyAV alone keeps the file and decoder until the cyclic collector runs"
+    unraisable = []
+    monkeypatch.setattr(sys, "unraisablehook", unraisable.append)
+    with pytest.raises(RuntimeError, match="Failed to open video"):
+        Video(b"not a video")
+    assert not unraisable, "a Video that never opened has nothing to close"
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no named pipes on this platform")
+def test_a_named_pipe_cannot_seek_even_when_it_is_given_by_path(tmp_path):
+    pipe = tmp_path / "video.mkv"
+    os.mkfifo(pipe)
+    threading.Thread(target=pipe.write_bytes, args=((ASSETS / "no_nb_frames.mkv").read_bytes(),), daemon=True).start()
+    with Video(pipe) as video:
+        assert video.meta.nb_frames == 38, "the header's estimate: counting would use the pipe up"
+        assert sum(1 for _ in video.frames()) == 37
+        with pytest.raises(ValueError, match="read only once"):
+            next(video.frames())
+
+
+def test_reads_by_time_refuse_a_stream_without_timestamps(tmp_path):
+    path = make_video(tmp_path / "raw.h264", frames=30)  # an elementary stream: frames, but no times
+    with Video(path) as video:
+        assert numbers(video.read(10, 13).frames) == [10, 11, 12]
+    with Video(path) as video, pytest.raises(ValueError, match="frame times"):
+        video.read(0.2, 0.4, seconds=True)
+    with Video(path) as video, pytest.raises(ValueError, match="frame times"):
+        next(video.frames(fps=10))

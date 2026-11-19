@@ -1,4 +1,4 @@
-"""Write crops and trims of a video as the chapters of one Matroska file, each frame at its source time."""
+"""Write crops and trims of a video as the chapters of one Matroska file, each frame at its place on the source."""
 
 import json
 import os
@@ -45,10 +45,11 @@ def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to
 ) -> list[ChapterClip]:
     """Write `clips` as H.264 chapters of the Matroska file `out`, and return the clips written.
 
-    Frames keep their source times, so the stretches between clips hold no frames. Boxes are in displayed pixels
+    Frame i is written at i / rate, its source time when the source keeps one rate, so the stretches between clips
+    hold no frames. Boxes are in displayed pixels
     (rotation applied) and may reach past the frame, which pads with black. Each chapter stores its clip as a JSON
-    `payload` tag. A clip running past the last frame the source decodes is cut there, and later ones are dropped.
-    `out` must not exist; a failed write removes it.
+    `payload` tag, and the frame rate beside it. A clip running past the last frame the source decodes is cut there, and
+    later ones are dropped. `out` must not exist; a failed write removes it.
     """
     if not clips:
         raise ValueError("write_chapters needs at least one clip")
@@ -61,7 +62,7 @@ def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to
         if clip.size[0] % 16 or clip.size[1] % 16:
             raise ValueError("H.264 chapter width and height must be multiples of 16")
     with Video(src) as video:
-        rate = video.stream.average_rate or Fraction(video.fps).limit_denominator(1001)
+        rate = video.rate
         if not rate:
             raise ValueError("Video has no frame rate information")
         with open(out, "xb") as file:
@@ -91,16 +92,19 @@ def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to
                     _replace_chapters(Path(out), _table(written, rate))
             except BaseException:
                 # anything, an interrupt included, leaves a truncated file that "xb" would refuse to overwrite on retry
-                file.close()
-                Path(out).unlink()
+                try:
+                    file.close()  # flushes, so it raises again when the device refused the bytes
+                finally:
+                    Path(out).unlink()
                 raise
     return written
 
 
 def _table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
+    # each chapter states the rate: the header's comes back from Matroska rounded, and frame numbers drift with it
     return [{"id": number, "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
              "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)), "time_base": Fraction(1, 1000),
-             "metadata": {"payload": json.dumps(asdict(clip))}} for number, clip in enumerate(clips)]
+             "metadata": {"payload": json.dumps(asdict(clip)), "rate": str(rate)}} for number, clip in enumerate(clips)]
 
 
 def _replace_chapters(path: Path, chapters: list[dict]) -> None:
@@ -126,6 +130,7 @@ def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
 
 def _write_clip(video: Video, track: av.VideoStream, clip: ChapterClip, frames: Iterator[av.VideoFrame],
                 rate: Fraction, crf: int, preset: str) -> int:
+    # decoded before the graph is built: the first frame corrects header colour tags the scale filter would refuse
     first = next(frames, None)
     if first is None:
         return 0
@@ -181,9 +186,7 @@ def _write_clip(video: Video, track: av.VideoStream, clip: ChapterClip, frames: 
     encoder.time_base, encoder.framerate = 1 / rate, rate
     encoder.max_b_frames = 0  # separate encoders must not reorder packets across a chapter boundary
     encoder.options = {"crf": str(crf), "preset": preset}
-    count = 0
     for index, frame in enumerate(chain((first,), frames), start=clip.start_frame):
-        count += 1
         graph.push(frame)
         cropped = graph.pull()
         cropped.pts, cropped.time_base, cropped.pict_type = index, 1 / rate, 0
@@ -193,4 +196,4 @@ def _write_clip(video: Video, track: av.VideoStream, clip: ChapterClip, frames: 
     for packet in encoder.encode():
         packet.stream = track
         track.container.mux(packet)
-    return count
+    return index + 1 - clip.start_frame
