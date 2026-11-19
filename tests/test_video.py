@@ -65,7 +65,7 @@ def test_rate_is_measured_when_the_header_has_none():
 
 
 def test_rotation_comes_from_the_header_and_frames_come_out_upright():
-    rotated = str(ASSETS / "rotated90.mp4")
+    rotated = str(ASSETS / "fsboard_rotated90.mp4")
     with av.open(rotated) as container:
         stored = np.stack([frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)])
     with Video(rotated) as video:

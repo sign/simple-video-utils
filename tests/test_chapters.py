@@ -71,7 +71,7 @@ def test_a_full_range_source_stays_full_range(tmp_path):
 
 
 def test_a_rotated_source_is_cut_as_it_is_displayed(tmp_path):
-    rotated = ASSETS / "rotated90.mp4"
+    rotated = ASSETS / "fsboard_rotated90.mp4"
     out, _ = write(tmp_path, rotated, [ChapterClip(2, 6, (40, 160, 200, 480))], crf=0)
     with Video(rotated) as source, Video(out) as video:
         assert video.meta.rotation == 0
