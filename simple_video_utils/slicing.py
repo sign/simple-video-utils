@@ -18,7 +18,6 @@ import math
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
-from itertools import takewhile
 from typing import BinaryIO, NamedTuple
 
 import av
@@ -27,6 +26,7 @@ import numpy as np
 from simple_video_utils.frames import read_frames_exact
 from simple_video_utils.metadata import _open_video, video_metadata, video_metadata_from_container
 from simple_video_utils.timeline import Timeline
+from simple_video_utils.video import Video
 
 # MP4 output hides each clip's keyframe lead-in behind an edit list, keeping
 # packet copy frame-accurate for players — but only for codecs MP4 can carry.
@@ -175,38 +175,6 @@ def _iter_packets(container: av.container.InputContainer, stream: av.VideoStream
         raise ValueError(message)
 
 
-def _copy_clip(
-    src: str, start: float, end: float, timeline: Timeline, source_end: float, marks: Sequence[dict] = (),
-) -> bytes:
-    """
-    Remux [start, end] seconds without re-encoding.
-
-    The copied packets start on the keyframe at/before ``start`` (the lead-in
-    is needed to decode) and may run a few frames past ``end``: packets arrive
-    in decode order, so a B-frame with pts <= end can follow a packet with
-    pts > end — cutting on pts would drop it. Cutting on dts (monotonic,
-    dts <= pts) keeps every frame in range at the cost of a few trailing ones.
-
-    Timestamps are rebased so ``start`` is t=0, putting the lead-in at
-    negative pts — the mp4 muxer records that as an edit list, so players
-    begin playback at ``start`` and the reported duration excludes the
-    lead-in. Consumers that enumerate raw decoded frames still see the
-    lead-in (with pts < 0); only presentation skips it.
-    """
-    with _open_video(src) as source:
-        in_stream = source.streams.video[0]
-        start_pts = _stream_pts(start, in_stream)
-        end_pts = _stream_pts(end, in_stream)
-        source.seek(start_pts, stream=in_stream, backward=True)
-        # on the source clock: a packed chapter's end is the next chapter's first frame
-        packets = list(takewhile(lambda p: p.dts <= end_pts and (not timeline.chapters.size or timeline.to_source(
-            p.dts * p.time_base) <= source_end + p.time_base / 2), _iter_packets(source, in_stream)))
-        clip = _window(packets, start_pts)
-        # gaps between chapters stay gaps, unless chapters say where each stretch came from
-        clock = (timeline.squeeze if marks else timeline.to_source) if timeline.chapters.size else None
-        return _mux_packets(in_stream, clip, start_pts, clock, marks) if clip else b""
-
-
 def slice_video(
     src: str,
     slices: Sequence[tuple[float, float]],
@@ -236,29 +204,30 @@ def slice_video(
     Sources whose codec MP4 can't carry (e.g. VP8/VP9 WebM) are always
     re-encoded, at the source resolution when ``size`` is None.
     """
-    meta = video_metadata(src)
     with _open_video(src) as container:
-        stream = container.streams.video[0]
-        codec = stream.codec_context.name
-        timeline = Timeline.read(container)
-        origin = float((stream.start_time or 0) * stream.time_base)
+        codec = container.streams.video[0].codec_context.name
+        meta = video_metadata(src) if size is not None else None
+        copy = codec in _MP4_COPY_CODECS and (
+            meta is None or (meta.width == meta.height == size and meta.rotation == 0)
+        )
+        if not copy:
+            timeline = Timeline.read(container)
+    if copy:
+        for start, end in slices:
+            yield b"".join(Video.from_slice(src, start, end, chapters=chapters).iter_bytes())
+        return
+
+    meta = meta or video_metadata(src)
     held = timeline.chapters
     duration = held[-1, 2] + held[-1, 1] - held[-1, 0] if held.size else meta.duration
-    should_copy = codec in _MP4_COPY_CODECS and (
-        size is None or (meta.width == meta.height == size and meta.rotation == 0)
-    )
-
     for start, end in slices:
         if start < 0 or end <= start or (duration is not None and end > duration):
             msg = f"slice ({start}, {end}) out of range [0, {duration}]"
             raise ValueError(msg)
         window = timeline.window(start, end)
-        marks = _clip_chapters(timeline, window, end, meta.fps, should_copy) if chapters and window else ()
+        marks = _clip_chapters(timeline, window, end, meta.fps, copied=False) if chapters and window else ()
         if window is None:
             clip = b""
-        elif should_copy:
-            # chapter seconds are on the file's clock; _stream_pts counts from its first frame
-            clip = _copy_clip(src, *(t - origin if held.size else t for t in window), timeline, end, marks)
         else:
             clip = _encode_clip(src, start, end, meta.fps, size, marks)
         if not clip:
@@ -472,7 +441,7 @@ class _Slice:
 
     def __post_init__(self):
         if not math.isfinite(self.start) or not math.isfinite(self.end) or self.start < 0 or self.end <= self.start:
-            message = "slice times must be finite and satisfy 0 <= start < end"
+            message = "slice times out of range: must be finite and satisfy 0 <= start < end"
             raise ValueError(message)
 
     def _plan(self, source):
