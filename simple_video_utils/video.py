@@ -141,18 +141,19 @@ def _rgb(items: Iterable[tuple], size: tuple[int, int] | None, rotation: int, fo
     """
     scale, convert = VideoReformatter(), VideoReformatter()  # each keeps its swscale context for the whole read
     graph = lru_cache(maxsize=1)(_rotation_graph)  # stateful, so one per read
-    for index, chapter, frame in items:
-        if size:
-            width, height = size[::-1] if rotation in (90, 270) else size
-            frame = scale.reformat(frame, width=width, height=height, interpolation=Interpolation.AREA, threads=1)
-        threads = 1 if frame.width * frame.height < SINGLE_THREAD_MAX_PIXELS else 0
-        rgb = convert.reformat(frame, format=format, threads=threads)
-        if rotation in (90, 180, 270):
-            turn = graph(rotation, rgb.width, rgb.height, format)
-            turn.push(rgb)
-            rgb = turn.pull()
-        # padded lines come out as strided views, which image libraries reject
-        yield index, chapter, np.ascontiguousarray(rgb.to_ndarray())
+    with refusing("Failed to convert video"):
+        for index, chapter, frame in items:
+            if size:
+                width, height = size[::-1] if rotation in (90, 270) else size
+                frame = scale.reformat(frame, width=width, height=height, interpolation=Interpolation.AREA, threads=1)
+            threads = 1 if frame.width * frame.height < SINGLE_THREAD_MAX_PIXELS else 0
+            rgb = convert.reformat(frame, format=format, threads=threads)
+            if rotation in (90, 180, 270):
+                turn = graph(rotation, rgb.width, rgb.height, format)
+                turn.push(rgb)
+                rgb = turn.pull()
+            # padded lines come out as strided views, which image libraries reject
+            yield index, chapter, np.ascontiguousarray(rgb.to_ndarray())
 
 
 def _items(frames: Iterable[tuple], indices: bool) -> Iterator:
@@ -204,10 +205,11 @@ class Video:
         # libav's word rather than a guess from the argument's type: it has no size for a pipe, named by path or not.
         # A format that opens its own files (an image sequence) has no size to ask for.
         self.seekable = bool(self.container.size) or self.container.format.no_file
-        if not self.container.streams.video:
+        streams = self.container.streams.video
+        if not streams or streams[0].codec_context is None:
             self.container.close()
-            raise InvalidVideoError("Failed to open video: it has no video stream")
-        self.stream = self.container.streams.video[0]
+            raise InvalidVideoError(f"Failed to open video: it has no {'decoder for its ' * bool(streams)}video stream")
+        self.stream = streams[0]
         self.stream.thread_type = thread_type
         # the header's: the decoder moves the stream's own size to each frame it decodes, and chapters differ in size
         self._stored = self.stream.width, self.stream.height
@@ -228,6 +230,7 @@ class Video:
         if hasattr(self, "container"):  # __init__ can fail before it opens one
             self.close()
 
+    @refusing("Failed to decode video")
     def rewind(self) -> None:
         """Back to the first frame, for reading `container` directly after a read has moved it."""
         if self._moves:
@@ -349,8 +352,11 @@ class Video:
         else:
             unsure = not stream.average_rate or (header and expected is not None and abs(header - expected) > 1)
             frames = self._decoded[1] if unsure else None
+            if frames is None and not header and self.seekable:
+                # no last packet where the header's duration puts it: the file is cut short, so only decoding knows
+                frames = self._tail_count() or self._decoded[1]
             if frames is None:
-                frames = header or (self._tail_count() if self.seekable else None) or expected
+                frames = header or expected
         width, height = self._stored[::-1] if self.rotation % 180 == 90 else self._stored
         return VideoMetadata(width, height, fps, frames, str(stream.time_base), duration, self.rotation)
 
@@ -401,7 +407,8 @@ class Video:
         steady = steady and self.container.format.name.startswith(("mov", "matroska"))
         at = (start if seconds else start / fps if fps else 0) + shift[0]
         if seeking := bool(steady) and self.seekable and at - first >= 3:  # nearer, decoding from the start is as fast
-            self.container.seek(int((at - 1) / stream.time_base), stream=stream)
+            with refusing("Failed to decode video"):
+                self.container.seek(int((at - 1) / stream.time_base), stream=stream)
             self._moves += 1
         else:
             self.rewind()

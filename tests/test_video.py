@@ -24,6 +24,7 @@ from simple_video_utils import (
     VideoMetadata,
     stack_frames,
     video_metadata,
+    write_video,
 )
 from simple_video_utils.chapters import _replace_chapters
 
@@ -471,3 +472,14 @@ def test_reads_by_time_refuse_a_stream_without_timestamps(tmp_path):
         video.read(0.2, 0.4, seconds=True)
     with Video(path) as video, pytest.raises(ValueError, match="frame times"):
         next(video.frames(fps=10))
+
+
+def test_what_pyav_cannot_decode_is_an_invalid_video(tmp_path):
+    unknown = write_video(None, [np.zeros((48, 64, 3), np.uint8)] * 3, 30, codec="mpeg4", format="avi")
+    with pytest.raises(InvalidVideoError, match="no decoder"):
+        Video(unknown.replace(b"FMP4", b"ZZZZ"))  # a codec no decoder knows
+    whole = (ASSETS / "no_nb_frames.webm").read_bytes()
+    with Video(whole[:len(whole) // 50]) as video, pytest.raises(VideoError):  # the header, and nothing to seek to
+        _ = video.meta
+    with Video(whole[:len(whole) // 2]) as video:  # the header still promises 107 frames
+        assert video.meta.nb_frames == len(video.read().frames) == 33
