@@ -4,7 +4,7 @@ import pytest
 from av.video.reformatter import ColorRange
 from conftest import ASSETS, EXAMPLE
 
-from simple_video_utils import ChapterClip, Video, write_chapters
+from simple_video_utils import ChapterClip, Slice, Video, write_chapters
 
 
 def planes(path, frames: range) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -85,7 +85,7 @@ def test_chapters_that_touch_read_back(tmp_path):
     out, _ = write(tmp_path, EXAMPLE, [ChapterClip(0, 1, (0, 0, 160, 128)), ChapterClip(1, 10, (0, 0, 160, 128))])
     with Video(out) as video:
         assert [sum(1 for _ in frames) for _, frames in video.chapter_frames()] == [1, 9]
-        clip = b"".join(video.slice(0, 1))
+    clip = b"".join(Slice(str(out), 0, 1))
     with Video(clip) as video:  # and the MP4 a slice writes, whose chapter ends are rebuilt from frame counts
         assert video.read().indices.tolist() == list(range(10))
 
@@ -111,17 +111,6 @@ def test_a_source_without_a_header_rate(tmp_path):
     with Video(out) as video:
         assert video.meta.fps == pytest.approx(19.8)
         assert len(video.read().frames) == 26
-
-
-def test_decoding_threads_do_not_change_the_output(tmp_path):
-    clips = [ChapterClip(0, 12, (0, 0, 160, 128))]
-    write_chapters(EXAMPLE, tmp_path / "auto.mkv", clips, preset="ultrafast")
-    write_chapters(EXAMPLE, tmp_path / "none.mkv", clips, preset="ultrafast", thread_type="NONE")
-    packets = []
-    for name in ("auto.mkv", "none.mkv"):
-        with av.open(str(tmp_path / name)) as container:
-            packets.append([bytes(packet) for packet in container.demux(video=0)])
-    assert packets[0] == packets[1]
 
 
 @pytest.mark.parametrize(("clips", "error"), [

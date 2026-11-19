@@ -18,7 +18,7 @@ with Video("sign.mp4") as video:                      # a path, a URL, bytes, or
     window = video.read(30, 60).frames                # frames 30..59
     second = video.read(1.0, 2.0, seconds=True)       # the frames timed in [1 s, 2 s)
     small = video.read(fps=15, keep_last=True, size=(256, 256))
-    for frame in video.frames(fps=15):                # the same arguments, decoded as you go
+    for frame, index in video.frames(fps=15):         # the same arguments, decoded as you go
         ...
 ```
 
@@ -33,9 +33,8 @@ stream that cannot seek gets the header's values only, and `fps=0.0` when there 
 
 ## Frames
 
-`Video.frames()` yields RGB arrays lazily. `Video.read()` returns them as one batch, `Frames(frames, indices)`:
-`torch.from_numpy(batch.frames)` wraps it without a copy, and `batch.indices` says which frame each one is. Both take
-the same arguments:
+`Video.frames()` yields `(array, index)` pairs lazily. `Video.read()` returns the same frames as one batch,
+`Frames(frames, indices)`: `torch.from_numpy(batch.frames)` wraps it without a copy. Both take the same arguments:
 
 | Argument | Meaning |
 |---|---|
@@ -43,7 +42,6 @@ the same arguments:
 | `fps` | Drop frames down to about this rate. Never repeats a frame; always keeps the first. |
 | `keep_last` | With `fps`, also keep the last frame of the range, which `fps` drops when it falls between steps. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
-| `indices` | `frames()` only: yield `(array, index)` pairs. `read()` always returns the indices. |
 
 Reads three seconds or more into a file seek first. Frames always come out upright. A stream that cannot seek is read
 once: a second read raises `ValueError`.
@@ -84,8 +82,9 @@ Only chapters this library wrote count. Files written before 0.10, which played 
 ## Slices
 
 ```python
-with Video("cropped.mkv") as video:
-    clip = video.slice(12.0, 15.5)                    # nothing is read yet
+from simple_video_utils import Slice
+
+clip = Slice("cropped.mkv", 12.0, 15.5)              # a path or bytes; nothing is read yet
 
 clip.size, clip.duration                              # measured without keeping the clip
 for chunk in clip:                                    # MP4 bytes, about 64 KiB at a time; iterate again to replay
@@ -110,12 +109,12 @@ Times are matched at the precision of the file's clock. Codecs MP4 cannot carry 
 | `read_frames_exact(p, start_frame=a, end_frame=b)` | `Video(p).frames(a, b + 1)` |
 | `read_frames_batched(p, start_time=a, end_time=b)` | `Video(p).read(a, b, seconds=True).frames` |
 | `frames, idx = read_frames_batched(p, return_indices=True)` | `frames, idx = Video(p).read()` |
-| `read_frames_exact(p, return_indices=True)`, `size=FrameSize((w, h))` | `Video(p).frames(indices=True)`, `size=(w, h)` |
-| `read_frames_from_stream(f, fps=15, buffer_size=n)` | `v = Video(f, buffer_size=n)`, then `v.meta`, `v.frames(fps=15)` |
+| `for frame in read_frames_exact(p)`, `size=FrameSize((w, h))` | `for frame, index in Video(p).frames()`, `size=(w, h)` |
+| `read_frames_from_stream(f, fps=15, buffer_size=n)` | `v = Video(f, buffer_size=n)`, then `v.meta`, `v.frames(fps=15)` (pairs) |
 | `read_chapters(src, fps=, size=)` yielding `(dict, start, frames)` | `Video(src).chapter_frames(fps=, size=)` yielding `(Chapter, frames)` |
 | `list_chapters(p)` | `Video(p).chapters` |
 | `keyframe_indices(v)`, `count_frames(v)` | `v.keyframes()`, `sum(1 for _ in v.container.decode(v.stream))` |
-| `slice_video(p, [(a, b)], chapters=True)`, `Video.from_slice(p, a, b)` | `Video(p).slice(a, b)` or `Slice(p, a, b)` |
-| `write_chapters(..., trim_to_source=True)` | `write_chapters(...)`: it always trims |
+| `slice_video(p, [(a, b)], chapters=True)`, `Video.from_slice(p, a, b)` | `Slice(p, a, b)` |
+| `write_chapters(..., trim_to_source=True, thread_type=t)` | `write_chapters(...)`: it always trims; no `thread_type` |
 | `Timeline` | gone: a gapped file is on source time already |
 | `join_videos`, `slice_video_stream`, `slice_video(size=)` | gone |

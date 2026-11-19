@@ -22,7 +22,7 @@ def read(clip: bytes, **arguments):
 def test_slice_copies_the_frames_between_start_and_stop(source):
     with Video(source) as video:
         whole = video.read().frames
-        clip = b"".join(video.slice(1.0, 2.5))
+    clip = b"".join(Slice(source, 1.0, 2.5))
     assert np.array_equal(read(clip), whole[30:75])
     with av.open(io.BytesIO(clip)) as container:
         packets = [packet for packet in container.demux(video=0) if packet.size]
@@ -34,9 +34,8 @@ def test_slice_copies_the_frames_between_start_and_stop(source):
 
 
 def test_consecutive_slices_share_no_frame(source):
-    with Video(source) as video:
-        assert [numbers(read(b"".join(video.slice(a, b)))) for a, b in ((0, 1), (1, 2), (2, 9))] == [
-            list(range(30)), list(range(30, 60)), list(range(60, 120))]
+    assert [numbers(read(b"".join(Slice(source, a, b)))) for a, b in ((0, 1), (1, 2), (2, 9))] == [
+        list(range(30)), list(range(30, 60)), list(range(60, 120))]
 
 
 def test_slice_streams_as_it_is_read(tmp_path):
@@ -61,7 +60,7 @@ def test_slice_of_bytes_and_of_b_frames(tmp_path):
     data = Path(make_video(tmp_path / "b.mkv", frames=90, bframes=2)).read_bytes()
     with Video(data) as video:
         whole = video.read().frames
-        clip = read(b"".join(video.slice(1.2, 2.2)))
+    clip = read(b"".join(Slice(data, 1.2, 2.2)))
     # Matroska drops decode timestamps after a seek; with B-frames, the frame at `stop` can remain
     assert np.array_equal(clip[:30], whole[36:66])
     assert len(clip) <= 31
@@ -85,8 +84,8 @@ def test_slice_keeps_gaps_and_carries_its_chapters(gapped):
     with Video(gapped) as video:
         frames, indices = video.read(size=(64, 64))
         held = dict(zip(indices.tolist(), frames, strict=True))
-        clip = video.slice(0.5, 3.5)
-        data = b"".join(clip)
+    clip = Slice(gapped, 0.5, 3.5)
+    data = b"".join(clip)
     assert clip.duration == pytest.approx(3.0, abs=0.01)
     with Video(data) as video:
         assert [(float(c.start), float(c.end), float(c.source)) for c in video.chapters] == [
@@ -97,14 +96,13 @@ def test_slice_keeps_gaps_and_carries_its_chapters(gapped):
         assert indices.tolist() == [*range(15, 20), *range(45, 80), *range(100, 105)], "source frame numbers"
         assert all(np.array_equal(frame, held[index]) for frame, index in zip(frames, indices.tolist(), strict=True))
         assert video.read(60, 70, size=(64, 64)).indices.tolist() == list(range(60, 70))
-        again = b"".join(video.slice(0.1, 1.2))
+    again = b"".join(Slice(data, 0.1, 1.2))
     with Video(again) as video:  # a slice of a slice is still placed on the original source
         assert video.read(size=(64, 64)).indices.tolist() == [18, 19, *range(45, 51)]
 
 
 def test_slice_starting_in_a_gap_starts_on_its_first_frame(gapped):
-    with Video(gapped) as video:
-        data = b"".join(video.slice(3.0, 4.0))  # the third chapter starts at 3.333
+    data = b"".join(Slice(gapped, 3.0, 4.0))  # the third chapter starts at 3.333
     with av.open(io.BytesIO(data)) as container:
         packets = [packet for packet in container.demux(video=0) if packet.size]
         assert packets[0].pts == 0, "nothing from the chapter before the gap"
@@ -128,8 +126,8 @@ def test_slice_in_a_gap_has_no_frames(gapped):
 
 
 def test_slice_needs_a_source_it_can_reopen():
-    with open(EXAMPLE, "rb") as file, Video(file) as video, pytest.raises(TypeError, match="reopens"):
-        video.slice(0, 1)
+    with open(EXAMPLE, "rb") as file, pytest.raises(TypeError, match="reopens"):
+        Slice(file, 0, 1)
 
 
 def test_slice_notices_a_source_that_changed(tmp_path, source):

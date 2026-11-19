@@ -204,7 +204,7 @@ class Video:
     @cached_property
     def chapters(self) -> list[Chapter]:
         """The chapters this library wrote, in order. Other chapter markers are not chapters here."""
-        found, ahead = [], []
+        found = []
         for chapter in sorted(self.container.chapters(), key=lambda c: c["start"] * c["time_base"]):
             tags = {key.lower(): value for key, value in chapter["metadata"].items()}
             start, end = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
@@ -221,9 +221,8 @@ class Video:
             # how far the file's clock runs from the source's, in frames: nothing in a whole file (a Matroska payload
             # tag), one amount throughout a slice (an MP4 title). A packed file closes its gaps, so it drifts.
             base = 0 if "payload" in tags else found[0].source - found[0].start
-            ahead.append((source - start - base) * rate)
-        if any(abs(frames) > Fraction(1, 2) for frames in ahead):
-            raise PackedChaptersError("chapters are packed back to back; rewrite the file with version 0.10 or later")
+            if abs(source - start - base) * rate > Fraction(1, 2):
+                raise PackedChaptersError("chapters are packed back to back; rewrite with version 0.10 or later")
         if any(c.end <= c.start for c in found) or any(a.end > b.start for a, b in pairwise(found)):
             raise ValueError("chapters must not overlap and must have positive duration")
         return found
@@ -358,19 +357,17 @@ class Video:
         items = self._decode(start, stop, seconds)
         return _rgb(_pick(items, fps, keep_last) if fps else items, size)
 
-    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None,
-               indices=False) -> Iterator:
-        """RGB (H, W, 3) uint8 arrays for frames [start, stop), decoded as they are asked for.
+    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None) -> Iterator[tuple]:
+        """(RGB (H, W, 3) uint8 array, frame index) for frames [start, stop), decoded as they are asked for.
 
         `seconds=True` takes times instead of frame indices, and selects by each frame's own timestamp. `fps` drops
         frames down to about that rate; it always keeps the first frame, and with `keep_last=True` the last one too.
-        `size` is (width, height) as displayed. `indices=True` yields (array, frame index) pairs. In a file with
-        chapters, indices and times are the source's, so the frames between chapters are skipped, not renumbered, and
-        `fps` treats each chapter as its own range. A stream that cannot seek is read once.
+        `size` is (width, height) as displayed. In a file with chapters, indices and times are the source's, so the
+        frames between chapters are skipped, not renumbered, and `fps` treats each chapter as its own range. A stream
+        that cannot seek is read once.
         """
         start, stop = self._range(start, stop, seconds, fps, size, keep_last)
-        frames = self._frames(start, stop, seconds, fps, size, keep_last)
-        return ((array, index) for index, _, array in frames) if indices else (array for _, _, array in frames)
+        return ((array, index) for index, _, array in self._frames(start, stop, seconds, fps, size, keep_last))
 
     def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None) -> Frames:
         """`frames()` as one batch: (frames, indices). Raises ValueError when the range is empty."""
@@ -401,18 +398,9 @@ class Video:
     def keyframes(self) -> list[int]:
         """Frame indices of the keyframes, in presentation order. Packets are read, nothing is decoded."""
         self.rewind()
-        packets = [(p.pts if p.pts is not None else p.dts, p.is_keyframe)
-                   for p in self.container.demux(self.stream) if p.size]
-        order = range(len(packets))
-        if all(time is not None for time, _ in packets):  # B-frames arrive out of presentation order
-            order = sorted(order, key=lambda i: packets[i][0])
-        return [index for index, i in enumerate(order) if packets[i][1]]
-
-    def slice(self, start: float, stop: float):
-        """Seconds [start, stop) as a lossless MP4 that is read lazily: see `Slice`."""
-        from simple_video_utils.slicing import Slice
-
-        return Slice(self.src, start, stop)
+        packets = (p for p in self.container.demux(self.stream) if p.size and p.pts is not None)
+        # sorted by time: B-frames arrive out of presentation order
+        return [index for index, (_, key) in enumerate(sorted((p.pts, p.is_keyframe) for p in packets)) if key]
 
 
 @lru_cache(maxsize=8)

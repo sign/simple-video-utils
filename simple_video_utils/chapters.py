@@ -42,7 +42,6 @@ def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to
     *,
     crf: int = 23,
     preset: str = "medium",
-    thread_type: str = "AUTO",
 ) -> list[ChapterClip]:
     """Write `clips` as H.264 chapters of the Matroska file `out`, and return the clips written.
 
@@ -61,7 +60,7 @@ def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to
             raise ValueError(f"clip needs 0 <= start_frame < end_frame and a non-empty box: {clip}")
         if clip.size[0] % 16 or clip.size[1] % 16:
             raise ValueError("H.264 chapter width and height must be multiples of 16")
-    with Video(src, thread_type=thread_type) as video:
+    with Video(src) as video:
         rate = video.stream.average_rate or Fraction(video.fps).limit_denominator(1001)
         if not rate:
             raise ValueError("Video has no frame rate information")

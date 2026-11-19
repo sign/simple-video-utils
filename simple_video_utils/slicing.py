@@ -12,8 +12,6 @@ import av
 
 from simple_video_utils.video import Video
 
-CHUNK = 64 * 1024
-
 
 class _Sink(io.RawIOBase):
     """The file libav's MP4 muxer writes to: keeps the first `head` bytes, which the muxer returns to on close to
@@ -165,7 +163,7 @@ class Slice:
                 samples -= 1
                 packet.pts, packet.dts, packet.stream = packet.pts - first, packet.dts - first, track
                 output.mux(packet)
-                yield from sink.drain(CHUNK)
+                yield from sink.drain(64 * 1024)
         yield from sink.drain()
         if samples or sink.size != (self._size or sink.size):
             raise OSError("Video source changed between slice reads")

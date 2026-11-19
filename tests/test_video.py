@@ -85,7 +85,7 @@ def test_read_is_the_stacked_frames(full):
     with Video(EXAMPLE) as video:
         assert full.shape == (130, 240, 320, 3)
         assert full.dtype == np.uint8
-        assert np.array_equal(np.stack(list(video.frames())), full)
+        assert np.array_equal(np.stack([frame for frame, _ in video.frames()]), full)
         assert np.array_equal(video.read(10, 20).frames, full[10:20])
         assert np.array_equal(video.read(np.int64(100)).frames, full[100:]), "past three seconds a read seeks"
         frames, indices = video.read(125, 500)
@@ -97,7 +97,9 @@ def test_read_by_seconds(full):
     with Video(EXAMPLE) as video:
         assert np.array_equal(video.read(1.0, 2.0, seconds=True).frames, full[30:60])
         assert np.array_equal(video.read(-0.5, 0.7, seconds=True).frames, full[:21]), "0.7 s is frame 21"
-        assert np.array_equal(next(video.frames(video.meta.duration / 2, seconds=True)), full[65])
+        frame, index = next(video.frames(video.meta.duration / 2, seconds=True))
+        assert index == 65
+        assert np.array_equal(frame, full[65])
 
 
 @pytest.mark.parametrize(("arguments", "error"), [
@@ -113,7 +115,7 @@ def test_bad_arguments_raise_at_the_call(arguments, error):
 def test_a_timed_read_goes_by_each_frames_own_time():
     # a browser recording: frames at 0, 57, 164, 213 ms. An average rate would put frame 3 inside [0.1, 0.2)
     with Video(ASSETS / "mediarecorder-no-average-rate.webm") as video:
-        assert [index for _, index in video.frames(0.1, 0.2, seconds=True, indices=True)] == [2]
+        assert [index for _, index in video.frames(0.1, 0.2, seconds=True)] == [2]
         assert video.read(0.164, 0.26, seconds=True).indices.tolist() == [2, 3]
     with av.open(str(ASSETS / "no_average_rate_5s.webm")) as container:
         times = [frame.time for frame in container.decode(video=0)]
@@ -125,7 +127,8 @@ def test_a_timed_read_goes_by_each_frames_own_time():
 def test_a_stream_that_cannot_seek_is_read_once(tmp_path):
     data = Path(make_video(tmp_path / "v.mkv", frames=120)).read_bytes()
     with Video(Pipe(data)) as video:
-        assert numbers(video.frames(100, 103)) == [100, 101, 102], "decoded from the start, with no seek"
+        frames = list(video.frames(100, 103))  # decoded from the start, with no seek
+        assert [index for _, index in frames] == numbers(frame for frame, _ in frames) == [100, 101, 102]
         with pytest.raises(ValueError, match="read only once"):
             next(video.frames())
 
@@ -160,7 +163,7 @@ def test_keep_last_adds_the_last_frame_when_fps_would_drop_it(full):
         assert batch.indices.tolist() == [*range(0, 30, 3), 29]
         assert np.array_equal(batch.frames, full[batch.indices])
         assert video.read(0, 28, fps=10, keep_last=True).indices.tolist() == list(range(0, 28, 3)), "27 was kept anyway"
-        assert [index for _, index in video.frames(120, fps=10, keep_last=True, indices=True)] == [120, 123, 126, 129]
+        assert [index for _, index in video.frames(120, fps=10, keep_last=True)] == [120, 123, 126, 129]
         with pytest.raises(ValueError, match="keep_last"):
             video.read(keep_last=True)
 
@@ -206,7 +209,7 @@ def test_frames_are_decoded_as_they_are_asked_for(tmp_path):
     stream = Counting(Path(path).read_bytes())
     with Video(stream, buffer_size=4096) as video:
         frames = video.frames()
-        assert np.array_equal([next(frames), next(frames)], whole[:2])
+        assert np.array_equal([next(frames)[0], next(frames)[0]], whole[:2])
         assert stream.count < len(stream.data.getbuffer()) / 2
 
 
