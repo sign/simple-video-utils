@@ -123,11 +123,18 @@ def test_slicing_is_reproducible(video, size):
     assert len(outputs) == 1
 
 
-@pytest.mark.parametrize("bad", [(5.0, 5.5), (-0.1, 0.3), (0.5, 0.2), (0.5, 0.5)])
+@pytest.mark.parametrize("bad", [(-0.1, 0.3), (0.5, 0.2), (0.5, 0.5)])
 @pytest.mark.parametrize("size", [None, 256])
 def test_out_of_range_slice_raises(video, bad, size):
     with pytest.raises(ValueError, match="out of range"):
         list(slice_video(video, [bad], size=size))
+
+
+@pytest.mark.parametrize("size", [None, 256])
+def test_slice_past_the_end_is_cut_at_the_end(video, size):
+    assert list(slice_video(video, [(0.5, 5.0)], size=size)) == list(slice_video(video, [(0.5, 1.0)], size=size))
+    with pytest.raises(ValueError, match="no frames"):
+        list(slice_video(video, [(5.0, 5.5)], size=size))
 
 
 def _frames(video: bytes) -> list[np.ndarray]:
