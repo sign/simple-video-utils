@@ -29,8 +29,11 @@ class Pipe(io.RawIOBase):
         return self.data.readinto(buffer)
 
 
-def make_video(path, frames=60, fps=30, gop=12, bframes=0, noise=False) -> str:
-    """Frame i shows i as two grey levels, which `numbers` reads back; `noise` makes the packets large instead."""
+def make_video(path, frames=60, fps=30, gop=12, bframes=0, noise=False, times=None) -> str:
+    """Frame i shows i as two grey levels, which `numbers` reads back; `noise` makes the packets large instead.
+
+    `times` places each frame, in 1/fps ticks, for a video whose rate changes.
+    """
     random = np.random.default_rng(0)
     with av.open(str(path), mode="w") as output:
         fixed = f"keyint={gop}:min-keyint={gop}:scenecut=0"  # a keyframe exactly every `gop` frames
@@ -42,7 +45,7 @@ def make_video(path, frames=60, fps=30, gop=12, bframes=0, noise=False) -> str:
             if noise:
                 image = random.integers(0, 256, (48, 64, 3))
             frame = av.VideoFrame.from_ndarray(image.astype(np.uint8), format="rgb24")
-            frame.pts, frame.time_base = i, Fraction(1, fps)
+            frame.pts, frame.time_base = times[i] if times else i, Fraction(1, fps)
             output.mux(stream.encode(frame))
         output.mux(stream.encode())
     return str(path)

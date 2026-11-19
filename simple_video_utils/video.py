@@ -228,6 +228,13 @@ class Video:
         return found
 
     @cached_property
+    def _spans(self) -> tuple[list, list, list]:
+        """Per chapter: its start and end in file seconds, and how far the file's clock runs ahead of the source's."""
+        chapters = self.chapters
+        return ([float(c.start) for c in chapters], [float(c.end) for c in chapters],
+                [float(c.start - c.source) for c in chapters])
+
+    @cached_property
     def _decoded(self) -> tuple[float | None, int | None]:
         """(fps, frame count) from decoding every frame: the truth when the header has no rate or miscounts."""
         if not self.seekable:
@@ -306,18 +313,22 @@ class Video:
         Frames are counted. After a seek the first one is placed by its timestamp; so is the first of each chapter,
         which makes the frames missing between chapters count too.
         """
-        stream, fps, chapters = self.stream, self.fps, self.chapters
+        stream, chapters = self.stream, self.chapters
         if stop is not None and stop <= start:
             return
-        if (start > 0 or chapters) and not fps:
+        fps = self.fps if chapters else float(stream.average_rate or 0)
+        if chapters and not fps:
             raise ValueError("Video has no FPS information")
         first = float((stream.start_time or 0) * stream.time_base)
-        # seconds from a frame's index time to its place in this file: a slice starts mid-source
-        shift = [float(c.start - c.source) for c in chapters] or [first]
-        starts, ends, half = [float(c.start) for c in chapters], [float(c.end) for c in chapters], 0.5 / (fps or 1)
+        starts, ends, shift = self._spans
+        shift, half = shift or [first], 0.5 / (fps or 1)  # a plain file's clock starts on its first frame
         tick = float(stream.time_base) / 2  # files round times to their clock, so a frame can sit half a tick early
+        # After a seek one rate says which frame this is, so the timestamps must follow one rate. They do not after a
+        # change of cadence, where the base rate (the fastest stretch) leaves the average behind, nor in a browser
+        # recording, which has no rate. Those are counted from the start instead.
+        steady = chapters or (fps and stream.base_rate and abs(fps / float(stream.base_rate) - 1) < 0.01)
         at = (start if seconds else start / fps if fps else 0) + shift[0]
-        if seeking := self.seekable and at - first >= 3:  # nearer than that, decoding from the start is as fast
+        if seeking := bool(steady) and self.seekable and at - first >= 3:  # nearer, decoding from the start is as fast
             self.container.seek(int((at - 1) / stream.time_base), stream=stream)
             self._moved = True
         else:
@@ -396,11 +407,21 @@ class Video:
             yield (None if number is None else self.chapters[number]), (array for _, _, array in group)
 
     def keyframes(self) -> list[int]:
-        """Frame indices of the keyframes, in presentation order. Packets are read, nothing is decoded."""
+        """Frame indices of the keyframes, the same indices reads use. Packets are read, nothing is decoded."""
         self.rewind()
-        packets = (p for p in self.container.demux(self.stream) if p.size and p.pts is not None)
-        # sorted by time: B-frames arrive out of presentation order
-        return [index for index, (_, key) in enumerate(sorted((p.pts, p.is_keyframe) for p in packets)) if key]
+        # an edit list marks the packets it hides, like the ones a slice keeps only for decoding: they are no frames
+        packets = (p for p in self.container.demux(self.stream) if p.size and p.pts is not None and not p.is_discard)
+        packets = sorted((p.pts, p.is_keyframe) for p in packets)  # B-frames arrive out of presentation order
+        if not self.chapters:
+            return [index for index, (_, key) in enumerate(packets) if key]
+        # in a chaptered file a frame's index is its place on the source, and only frames inside a chapter count
+        (starts, ends, shift), half, keys = self._spans, 0.5 / self.fps, []
+        for pts, key in packets:
+            time = float(pts * self.stream.time_base) + half
+            number = bisect_right(starts, time) - 1
+            if key and number >= 0 and time < ends[number]:
+                keys.append(round((time - half - shift[number]) * self.fps))
+        return keys
 
 
 @lru_cache(maxsize=8)

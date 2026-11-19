@@ -31,6 +31,8 @@ def test_slice_copies_the_frames_between_start_and_stop(source):
         assert packets[0].is_keyframe
         assert [p.pts for p in packets].index(0) == 6
         assert container.streams.video[0].codec_context.name == "h264"
+    with Video(clip) as video:
+        assert video.keyframes() == [6, 18, 30, 42], "counted in the frames a read returns, not the hidden ones"
 
 
 def test_consecutive_slices_share_no_frame(source):

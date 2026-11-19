@@ -133,6 +133,24 @@ def test_a_stream_that_cannot_seek_is_read_once(tmp_path):
             next(video.frames())
 
 
+def test_reads_stay_exact_after_the_frame_rate_changes(tmp_path):
+    # 160 frames at 60 fps, then 40 at 10 fps: no single rate says which frame sits at a given time
+    times = [10 * i for i in range(160)] + [1600 + 60 * i for i in range(40)]
+    with Video(make_video(tmp_path / "vfr.mp4", frames=200, fps=600, times=times)) as video:
+        whole = video.read()
+        for late in (video.read(5.0, 5.5, seconds=True), video.read(184, 189)):
+            assert late.indices.tolist() == [184, 185, 186, 187, 188]
+            assert np.array_equal(late.frames, whole.frames[184:189])
+
+
+def test_a_timed_read_needs_no_frame_rate():
+    with Video(Pipe((ASSETS / "mediarecorder-no-average-rate.webm").read_bytes())) as video:
+        assert video.meta.fps == 0.0
+        assert [index for _, index in video.frames(0.1, 0.2, seconds=True)] == [2]
+    with Video(Pipe((ASSETS / "mediarecorder-no-average-rate.webm").read_bytes())) as video:
+        assert [index for _, index in video.frames(10, 14)] == [10, 11, 12, 13], "nor does a read by index"
+
+
 def test_seeked_read_is_exact_when_the_header_rate_drifts():
     # the header says 59.89 fps, the frames run at 60: placing frames by the header rate lands one off (#26)
     with Video(ASSETS / "vfr_dup_index.mp4") as video:
@@ -251,6 +269,7 @@ def test_chapters_place_frames_on_the_source(gapped, full):
         assert video.read(0.6, 1.6, seconds=True, size=(16, 16)).indices.tolist() == [18, 19, 45, 46, 47]
         with pytest.raises(ValueError, match="different shapes"):
             video.read()
+        assert video.keyframes() == [0, 45, 100], "the same indices as reads, not positions in the file"
 
 
 @pytest.mark.parametrize("wrap", [str, lambda path: Pipe(Path(path).read_bytes())])
