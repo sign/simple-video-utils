@@ -14,7 +14,7 @@ from simple_video_utils import PackedChaptersError, Video, VideoMetadata, stack_
 @pytest.fixture(scope="module")
 def full():
     with Video(EXAMPLE) as video:
-        return video.read()
+        return video.read().frames
 
 
 def test_metadata():
@@ -43,7 +43,7 @@ def test_frame_count_survives_a_header_that_overcounts():
     with av.open(str(ASSETS / "buggy_mov_header.mov")) as container:
         assert container.streams.video[0].frames == 11
     with Video(ASSETS / "buggy_mov_header.mov") as video:
-        assert video.meta.nb_frames == len(video.read(size=(64, 36))) == 3
+        assert video.meta.nb_frames == len(video.read(size=(64, 36)).frames) == 3
 
 
 @pytest.mark.parametrize(("name", "count"), [("no_nb_frames.mkv", 37), ("no_nb_frames.webm", 107)])
@@ -58,7 +58,7 @@ def test_rate_is_measured_when_the_header_has_none():
     with Video(data) as video:
         assert not video.stream.average_rate
         assert video.meta.fps == pytest.approx(19.36, abs=0.01)
-        assert video.meta.nb_frames == len(video.read()) == 45
+        assert video.meta.nb_frames == len(video.read().frames) == 45
     with Video(Pipe(data)) as video:  # measuring needs a rewind
         assert video.meta.fps == 0.0
         assert sum(1 for _ in video.frames()) == 45
@@ -70,15 +70,15 @@ def test_rotation_comes_from_the_header_and_frames_come_out_upright():
         stored = np.stack([frame.to_ndarray(format="rgb24") for frame in container.decode(video=0)])
     with Video(rotated) as video:
         assert (video.meta.width, video.meta.height, video.meta.rotation) == (360, 640, 90)
-        assert np.array_equal(video.read(), np.rot90(stored, axes=(1, 2)))
-        assert video.read(0, 2, size=(90, 160)).shape == (2, 160, 90, 3)
+        assert np.array_equal(video.read().frames, np.rot90(stored, axes=(1, 2)))
+        assert video.read(0, 2, size=(90, 160)).frames.shape == (2, 160, 90, 3)
 
 
 def test_reserved_colour_tags_do_not_break_the_conversion():
     with av.open(str(ASSETS / "bad_colorspace.mp4")) as container:
         assert container.streams.video[0].codec_context.colorspace == 3  # a value the H.264 spec reserves
     with Video(ASSETS / "bad_colorspace.mp4") as video:
-        assert video.read(size=(64, 36)).shape == (182, 36, 64, 3)
+        assert video.read(size=(64, 36)).frames.shape == (182, 36, 64, 3)
 
 
 def test_read_is_the_stacked_frames(full):
@@ -86,17 +86,17 @@ def test_read_is_the_stacked_frames(full):
         assert full.shape == (130, 240, 320, 3)
         assert full.dtype == np.uint8
         assert np.array_equal(np.stack(list(video.frames())), full)
-        assert np.array_equal(video.read(10, 20), full[10:20])
-        assert np.array_equal(video.read(np.int64(100)), full[100:]), "past three seconds a read seeks"
-        frames, indices = video.read(125, 500, indices=True)
+        assert np.array_equal(video.read(10, 20).frames, full[10:20])
+        assert np.array_equal(video.read(np.int64(100)).frames, full[100:]), "past three seconds a read seeks"
+        frames, indices = video.read(125, 500)
         assert indices.tolist() == [125, 126, 127, 128, 129]
         assert np.array_equal(frames, full[125:])
 
 
 def test_read_by_seconds(full):
     with Video(EXAMPLE) as video:
-        assert np.array_equal(video.read(1.0, 2.0, seconds=True), full[30:60])
-        assert np.array_equal(video.read(-0.5, 0.7, seconds=True), full[:21]), "0.7 s is frame 21, despite floats"
+        assert np.array_equal(video.read(1.0, 2.0, seconds=True).frames, full[30:60])
+        assert np.array_equal(video.read(-0.5, 0.7, seconds=True).frames, full[:21]), "0.7 s is frame 21"
         assert np.array_equal(next(video.frames(video.meta.duration / 2, seconds=True)), full[65])
 
 
@@ -114,11 +114,11 @@ def test_a_timed_read_goes_by_each_frames_own_time():
     # a browser recording: frames at 0, 57, 164, 213 ms. An average rate would put frame 3 inside [0.1, 0.2)
     with Video(ASSETS / "mediarecorder-no-average-rate.webm") as video:
         assert [index for _, index in video.frames(0.1, 0.2, seconds=True, indices=True)] == [2]
-        assert video.read(0.164, 0.26, seconds=True, indices=True)[1].tolist() == [2, 3]
+        assert video.read(0.164, 0.26, seconds=True).indices.tolist() == [2, 3]
     with av.open(str(ASSETS / "no_average_rate_5s.webm")) as container:
         times = [frame.time for frame in container.decode(video=0)]
     with Video(ASSETS / "no_average_rate_5s.webm") as video:  # far enough in to seek; 20 fps would say 80-89
-        timed = video.read(4.0, 4.5, seconds=True, indices=True)[1].tolist()
+        timed = video.read(4.0, 4.5, seconds=True).indices.tolist()
         assert timed == [index for index, time in enumerate(times) if 4.0 <= time < 4.5] == list(range(79, 89))
 
 
@@ -133,24 +133,44 @@ def test_a_stream_that_cannot_seek_is_read_once(tmp_path):
 def test_seeked_read_is_exact_when_the_header_rate_drifts():
     # the header says 59.89 fps, the frames run at 60: placing frames by the header rate lands one off (#26)
     with Video(ASSETS / "vfr_dup_index.mp4") as video:
-        whole = video.read()
-        assert np.array_equal(video.read(400, 430), whole[400:430])
+        whole = video.read().frames
+        assert np.array_equal(video.read(400, 430).frames, whole[400:430])
 
 
 def test_seeked_read_without_a_header_rate():
     with Video(ASSETS / "no_average_rate_5s.webm") as video:
-        whole = video.read()
+        whole = video.read().frames
         assert len(whole) == video.meta.nb_frames == 100
-        assert np.array_equal(video.read(80, 90), whole[80:90])
+        assert np.array_equal(video.read(80, 90).frames, whole[80:90])
 
 
 def test_fps_drops_frames_and_never_repeats_them(full):
     with Video(EXAMPLE) as video:
-        frames, indices = video.read(fps=10, indices=True)
+        frames, indices = video.read(fps=10)
         assert indices.tolist() == list(range(0, 130, 3))
         assert np.array_equal(frames, full[::3])
-        assert len(video.read(fps=120)) == 130
-        assert video.read(40, 60, fps=15, indices=True)[1].tolist() == list(range(40, 60, 2))
+        assert len(video.read(fps=120).frames) == 130
+        assert video.read(40, 60, fps=15).indices.tolist() == list(range(40, 60, 2))
+
+
+def test_keep_last_adds_the_last_frame_when_fps_would_drop_it(full):
+    with Video(EXAMPLE) as video:
+        assert video.read(0, 30, fps=10).indices.tolist() == list(range(0, 30, 3))
+        batch = video.read(0, 30, fps=10, keep_last=True)
+        assert batch.indices.tolist() == [*range(0, 30, 3), 29]
+        assert np.array_equal(batch.frames, full[batch.indices])
+        assert video.read(0, 28, fps=10, keep_last=True).indices.tolist() == list(range(0, 28, 3)), "27 was kept anyway"
+        assert [index for _, index in video.frames(120, fps=10, keep_last=True, indices=True)] == [120, 123, 126, 129]
+        with pytest.raises(ValueError, match="keep_last"):
+            video.read(keep_last=True)
+
+
+def test_keep_last_keeps_the_last_frame_of_each_chapter(gapped):
+    with Video(gapped) as video:
+        kept = video.read(fps=15, keep_last=True, size=(32, 32)).indices.tolist()
+        assert kept == [*range(0, 20, 2), 19, *range(45, 80, 2), *range(100, 128, 2), 127]
+        counts = [sum(1 for _ in frames) for _, frames in video.chapter_frames(fps=15, size=(32, 32), keep_last=True)]
+        assert counts == [11, 18, 15]
 
 
 def test_size_resizes_before_the_rgb_conversion():
@@ -158,15 +178,15 @@ def test_size_resizes_before_the_rgb_conversion():
         frame = next(container.decode(video=0))
         expected = frame.reformat(width=64, height=48, interpolation="AREA").to_ndarray(format="rgb24")
     with Video(EXAMPLE) as video:
-        assert np.array_equal(video.read(0, 1, size=(64, 48))[0], expected)
+        assert np.array_equal(video.read(0, 1, size=(64, 48)).frames[0], expected)
 
 
 def test_one_video_serves_many_reads(full):
     with Video(EXAMPLE, thread_type="NONE") as video:
         assert video.meta.nb_frames == 130
-        assert np.array_equal(video.read(5, 15), full[5:15])
+        assert np.array_equal(video.read(5, 15).frames, full[5:15])
         assert video.keyframes() == [0]
-        assert np.array_equal(video.read(0, 5), full[:5])
+        assert np.array_equal(video.read(0, 5).frames, full[:5])
         video.rewind()
         assert sum(1 for _ in video.container.decode(video.stream)) == 130
 
@@ -174,7 +194,7 @@ def test_one_video_serves_many_reads(full):
 def test_frames_are_decoded_as_they_are_asked_for(tmp_path):
     path = make_video(tmp_path / "v.mkv", frames=120, noise=True)
     with Video(path) as video:
-        whole = video.read()
+        whole = video.read().frames
 
     class Counting(Pipe):
         count = 0
@@ -219,13 +239,13 @@ def test_chapters_place_frames_on_the_source(gapped, full):
         assert [float(c.start) for c in video.chapters] == pytest.approx([0, 1.5, 3.333])
         assert video.chapters[1].payload["payload"] == {"who": "signer"}
         assert video.meta.nb_frames == len(HELD), "the frames it holds, not the source's"
-        frames, indices = video.read(size=(160, 128), indices=True)
+        frames, indices = video.read(size=(160, 128))
         assert indices.tolist() == HELD
         # the first chapter is the source's top-left corner
         assert np.abs(frames[:20].astype(int) - full[:20, :128, :160]).mean() < 4
-        assert video.read(15, 50, size=(16, 16), indices=True)[1].tolist() == [*range(15, 20), *range(45, 50)]
-        assert video.read(105, 110, indices=True)[1].tolist() == list(range(105, 110)), "a seek lands in a chapter"
-        assert video.read(0.6, 1.6, seconds=True, size=(16, 16), indices=True)[1].tolist() == [18, 19, 45, 46, 47]
+        assert video.read(15, 50, size=(16, 16)).indices.tolist() == [*range(15, 20), *range(45, 50)]
+        assert video.read(105, 110).indices.tolist() == list(range(105, 110)), "a seek lands in a chapter"
+        assert video.read(0.6, 1.6, seconds=True, size=(16, 16)).indices.tolist() == [18, 19, 45, 46, 47]
         with pytest.raises(ValueError, match="different shapes"):
             video.read()
 
@@ -241,7 +261,7 @@ def test_fps_starts_over_in_each_chapter(gapped):
     with Video(gapped) as video:
         counts = [sum(1 for _ in frames) for _, frames in video.chapter_frames(fps=15, size=(32, 32))]
         assert counts == [10, 18, 14]
-        kept = video.read(fps=15, size=(32, 32), indices=True)[1].tolist()
+        kept = video.read(fps=15, size=(32, 32)).indices.tolist()
         assert kept == [*range(0, 20, 2), *range(45, 80, 2), *range(100, 128, 2)]
 
 

@@ -16,12 +16,12 @@ def source(tmp_path):
 
 def read(clip: bytes, **arguments):
     with Video(clip) as video:
-        return video.read(**arguments)
+        return video.read(**arguments).frames
 
 
 def test_slice_copies_the_frames_between_start_and_stop(source):
     with Video(source) as video:
-        whole = video.read()
+        whole = video.read().frames
         clip = b"".join(video.slice(1.0, 2.5))
     assert np.array_equal(read(clip), whole[30:75])
     with av.open(io.BytesIO(clip)) as container:
@@ -42,7 +42,7 @@ def test_consecutive_slices_share_no_frame(source):
 def test_slice_streams_as_it_is_read(tmp_path):
     source = make_video(tmp_path / "noise.mp4", frames=120, noise=True)
     with Video(source) as video:
-        whole = video.read()
+        whole = video.read().frames
     clip = Slice(source, 0.4, 3.9)
     assert clip.duration == pytest.approx(3.5)
     assert clip.size > 4 * 64 * 1024, "measured without keeping any media"
@@ -54,13 +54,13 @@ def test_slice_streams_as_it_is_read(tmp_path):
     assert data == b"".join(clip), "replays byte for byte"
     assert data.index(b"moov") < data.index(b"mdat")
     with Video(Pipe(data)) as video:  # moov first: a reader needs no seeking
-        assert np.array_equal(video.read(), whole[12:117])
+        assert np.array_equal(video.read().frames, whole[12:117])
 
 
 def test_slice_of_bytes_and_of_b_frames(tmp_path):
     data = Path(make_video(tmp_path / "b.mkv", frames=90, bframes=2)).read_bytes()
     with Video(data) as video:
-        whole = video.read()
+        whole = video.read().frames
         clip = read(b"".join(video.slice(1.2, 2.2)))
     # Matroska drops decode timestamps after a seek; with B-frames, the frame at `stop` can remain
     assert np.array_equal(clip[:30], whole[36:66])
@@ -78,12 +78,12 @@ def test_b_frames_leave_later_frames_visible_in_a_plain_slice(tmp_path):
 def test_slice_times_are_matched_on_the_files_clock(gapped):
     # frame 100 of 30 fps is at 3.3333 s, stored as 3333 ms: a slice from 100 / 30 must still start on it
     with Video(b"".join(Slice(gapped, 100 / 30, 110 / 30))) as video:
-        assert video.read(indices=True)[1].tolist() == list(range(100, 110))
+        assert video.read().indices.tolist() == list(range(100, 110))
 
 
 def test_slice_keeps_gaps_and_carries_its_chapters(gapped):
     with Video(gapped) as video:
-        frames, indices = video.read(size=(64, 64), indices=True)
+        frames, indices = video.read(size=(64, 64))
         held = dict(zip(indices.tolist(), frames, strict=True))
         clip = video.slice(0.5, 3.5)
         data = b"".join(clip)
@@ -93,13 +93,13 @@ def test_slice_keeps_gaps_and_carries_its_chapters(gapped):
             pytest.approx(times, abs=0.001) for times in [(0, 5 / 30, 0.5), (1, 65 / 30, 1.5), (85 / 30, 3, 100 / 30)]]
         assert video.meta.fps == 30
         assert video.meta.nb_frames == 45
-        frames, indices = video.read(size=(64, 64), indices=True)
+        frames, indices = video.read(size=(64, 64))
         assert indices.tolist() == [*range(15, 20), *range(45, 80), *range(100, 105)], "source frame numbers"
         assert all(np.array_equal(frame, held[index]) for frame, index in zip(frames, indices.tolist(), strict=True))
-        assert video.read(60, 70, size=(64, 64), indices=True)[1].tolist() == list(range(60, 70))
+        assert video.read(60, 70, size=(64, 64)).indices.tolist() == list(range(60, 70))
         again = b"".join(video.slice(0.1, 1.2))
     with Video(again) as video:  # a slice of a slice is still placed on the original source
-        assert video.read(size=(64, 64), indices=True)[1].tolist() == [18, 19, *range(45, 51)]
+        assert video.read(size=(64, 64)).indices.tolist() == [18, 19, *range(45, 51)]
 
 
 def test_slice_starting_in_a_gap_starts_on_its_first_frame(gapped):
@@ -110,7 +110,7 @@ def test_slice_starting_in_a_gap_starts_on_its_first_frame(gapped):
         assert packets[0].pts == 0, "nothing from the chapter before the gap"
         assert len(packets) == 20
     with Video(data) as video:
-        assert video.read(indices=True)[1].tolist() == list(range(100, 120))
+        assert video.read().indices.tolist() == list(range(100, 120))
 
 
 @pytest.mark.parametrize(("start", "stop", "error"), [

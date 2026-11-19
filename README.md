@@ -14,10 +14,10 @@ video_metadata("sign.mp4")
 
 with Video("sign.mp4") as video:                      # a path, a URL, bytes, or a binary stream
     video.meta                                        # the same metadata, for any source
-    frames = video.read()                             # (N, H, W, 3) uint8 RGB
-    window = video.read(30, 60)                       # frames 30..59
+    frames, indices = video.read()                    # (N, H, W, 3) uint8 RGB, and each frame's index
+    window = video.read(30, 60).frames                # frames 30..59
     second = video.read(1.0, 2.0, seconds=True)       # the frames timed in [1 s, 2 s)
-    small, index = video.read(fps=15, size=(256, 256), indices=True)
+    small = video.read(fps=15, keep_last=True, size=(256, 256))
     for frame in video.frames(fps=15):                # the same arguments, decoded as you go
         ...
 ```
@@ -33,15 +33,17 @@ stream that cannot seek gets the header's values only, and `fps=0.0` when there 
 
 ## Frames
 
-`Video.frames()` yields RGB arrays lazily; `Video.read()` returns them as one batch (`torch.from_numpy` wraps it
-without a copy). Both take the same arguments:
+`Video.frames()` yields RGB arrays lazily. `Video.read()` returns them as one batch, `Frames(frames, indices)`:
+`torch.from_numpy(batch.frames)` wraps it without a copy, and `batch.indices` says which frame each one is. Both take
+the same arguments:
 
 | Argument | Meaning |
 |---|---|
 | `start`, `stop` | Frame indices, `stop` excluded. With `seconds=True`, times: the frames timestamped in `[start, stop)`. |
-| `fps` | Drop frames down to about this rate. Never repeats a frame. |
+| `fps` | Drop frames down to about this rate. Never repeats a frame; always keeps the first. |
+| `keep_last` | With `fps`, also keep the last frame of the range, which `fps` drops when it falls between steps. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
-| `indices` | Also return each frame's index. |
+| `indices` | `frames()` only: yield `(array, index)` pairs. `read()` always returns the indices. |
 
 Reads three seconds or more into a file seek first. Frames always come out upright. A stream that cannot seek is read
 once: a second read raises `ValueError`.
@@ -67,13 +69,14 @@ with Video("cropped.mkv") as video:
     video.chapters                                    # [Chapter(id, start, end, source, payload), ...]
     video.read(30, 90)                                # the first chapter, by source frame index
     for chapter, frames in video.chapter_frames(fps=15, size=(256, 256)):
-        ...                                           # one decode, so it works on a stream; fps restarts per chapter
+        ...                                           # one decode, so it works on a stream
 ```
 
 `box` is `(left, top, right, bottom)` in displayed pixels and may reach past the frame, which pads with black. Sizes
 must be multiples of 16. A clip running past the source's last frame is cut there; `write_chapters` returns what it
-wrote. Chapters of different sizes need `size=` to be read as one batch. A video without chapters yields
-`(None, frames)` once from `chapter_frames`.
+wrote. Chapters of different sizes need `size=` to be read as one batch. `fps` treats each chapter as its own range in
+every read: it starts over on each chapter's first frame, and `keep_last` keeps each chapter's last. A video without
+chapters yields `(None, frames)` once from `chapter_frames`.
 
 Only chapters this library wrote count. Files written before 0.10, which played their chapters back to back, raise
 `PackedChaptersError` (a `ValueError`) on any read: write them again.
@@ -105,8 +108,9 @@ Times are matched at the precision of the file's clock. Codecs MP4 cannot carry 
 | `video_metadata_from_bytes(data)` | `Video(data).meta` |
 | `open_video(p, thread_type=t)` + `video_metadata_from_container(v)` | `Video(p, thread_type=t)`, `v.meta` |
 | `read_frames_exact(p, start_frame=a, end_frame=b)` | `Video(p).frames(a, b + 1)` |
-| `read_frames_batched(p, start_time=a, end_time=b)` | `Video(p).read(a, b, seconds=True)` |
-| `return_indices=True`, `size=FrameSize((w, h))` | `indices=True`, `size=(w, h)` |
+| `read_frames_batched(p, start_time=a, end_time=b)` | `Video(p).read(a, b, seconds=True).frames` |
+| `frames, idx = read_frames_batched(p, return_indices=True)` | `frames, idx = Video(p).read()` |
+| `read_frames_exact(p, return_indices=True)`, `size=FrameSize((w, h))` | `Video(p).frames(indices=True)`, `size=(w, h)` |
 | `read_frames_from_stream(f, fps=15, buffer_size=n)` | `v = Video(f, buffer_size=n)`, then `v.meta`, `v.frames(fps=15)` |
 | `read_chapters(src, fps=, size=)` yielding `(dict, start, frames)` | `Video(src).chapter_frames(fps=, size=)` yielding `(Chapter, frames)` |
 | `list_chapters(p)` | `Video(p).chapters` |

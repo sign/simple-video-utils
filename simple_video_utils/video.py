@@ -35,6 +35,11 @@ class VideoMetadata(NamedTuple):
     rotation: int = 0  # degrees, from the container's display matrix
 
 
+class Frames(NamedTuple):
+    frames: np.ndarray  # (N, H, W, 3) uint8 RGB
+    indices: np.ndarray  # each frame's index in the video
+
+
 class Chapter(NamedTuple):
     """A stretch of frames with their source timing; the seconds between chapters hold no frames."""
 
@@ -74,23 +79,30 @@ def _rotation_graph(rotation: int, width: int, height: int) -> av.filter.Graph:
     return graph
 
 
-def _pick(items: Iterable[tuple], fps: float) -> Iterator[tuple]:
+def _pick(items: Iterable[tuple], fps: float, keep_last: bool) -> Iterator[tuple]:
     """Thin frames out to about `fps`: the first of each 1/fps bucket, counted from each chapter's first frame.
 
-    Frames are dropped, never repeated, so a target at or above the source rate keeps them all.
+    Frames are dropped, never repeated, so a target at or above the source rate keeps them all. `keep_last` also
+    keeps the last frame of each chapter, which would otherwise be dropped when it shares a bucket.
     """
-    anchor = bucket = None
+    anchor = bucket = dropped = None
     current = -1
     for item in items:
         _, chapter, frame = item
         if (time := frame.time) is None:
             continue
         if anchor is None or chapter != current:
+            if dropped:
+                yield dropped
             anchor, bucket, current = time, None, chapter
         # one tick of slack: containers round times to their clock (a 15 fps mkv stores 0, 67, 133 ms)
         if (now := int((time - anchor + float(frame.time_base)) * fps)) != bucket:
-            bucket = now
+            bucket, dropped = now, None
             yield item
+        elif keep_last:
+            dropped = item
+    if dropped:
+        yield dropped
 
 
 def _rgb(items: Iterable[tuple], size: tuple[int, int] | None) -> Iterator[tuple]:
@@ -273,9 +285,11 @@ class Video:
         time_base = str(stream.time_base) if stream.time_base else None
         return VideoMetadata(width, height, fps, frames, time_base, duration, self.rotation)
 
-    def _range(self, start, stop, seconds, fps, size) -> tuple:
+    def _range(self, start, stop, seconds, fps, size, keep_last=False) -> tuple:
         if fps is not None and fps <= 0:
             raise ValueError("fps must be positive")
+        if keep_last and fps is None:
+            raise ValueError("keep_last only applies with fps")
         if size is not None and (len(size) != 2 or min(map(operator.index, size)) <= 0):
             raise ValueError("size must be two positive integers, (width, height)")
         if seconds:  # a negative start reads from the beginning: padded windows are common
@@ -340,24 +354,27 @@ class Video:
         except av.FFmpegError as e:
             raise RuntimeError("Failed to decode video") from e
 
-    def _frames(self, start, stop, seconds, fps, size) -> Iterator[tuple]:
+    def _frames(self, start, stop, seconds, fps, size, keep_last) -> Iterator[tuple]:
         items = self._decode(start, stop, seconds)
-        return _rgb(_pick(items, fps) if fps else items, size)
+        return _rgb(_pick(items, fps, keep_last) if fps else items, size)
 
-    def frames(self, start=0, stop=None, *, seconds=False, fps=None, size=None, indices=False) -> Iterator:
+    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None,
+               indices=False) -> Iterator:
         """RGB (H, W, 3) uint8 arrays for frames [start, stop), decoded as they are asked for.
 
         `seconds=True` takes times instead of frame indices, and selects by each frame's own timestamp. `fps` drops
-        frames down to about that rate. `size` is (width, height) as displayed. `indices=True` yields (array, frame
-        index) pairs. In a file with chapters, indices and times are the source's, so the frames between chapters are
-        skipped, not renumbered. A stream that cannot seek is read once.
+        frames down to about that rate; it always keeps the first frame, and with `keep_last=True` the last one too.
+        `size` is (width, height) as displayed. `indices=True` yields (array, frame index) pairs. In a file with
+        chapters, indices and times are the source's, so the frames between chapters are skipped, not renumbered, and
+        `fps` treats each chapter as its own range. A stream that cannot seek is read once.
         """
-        frames = self._frames(*self._range(start, stop, seconds, fps, size), seconds, fps, size)
+        start, stop = self._range(start, stop, seconds, fps, size, keep_last)
+        frames = self._frames(start, stop, seconds, fps, size, keep_last)
         return ((array, index) for index, _, array in frames) if indices else (array for _, _, array in frames)
 
-    def read(self, start=0, stop=None, *, seconds=False, fps=None, size=None, indices=False):
-        """`frames()` as one (N, H, W, 3) array, or (array, indices). Raises ValueError when the range is empty."""
-        start, stop = self._range(start, stop, seconds, fps, size)
+    def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None) -> Frames:
+        """`frames()` as one batch: (frames, indices). Raises ValueError when the range is empty."""
+        start, stop = self._range(start, stop, seconds, fps, size, keep_last)
         # the header's count, else an estimate: it only sizes the batch
         held = sum(float(c.end - c.start) for c in self.chapters) or self.duration or 0
         total = self.stream.frames or math.ceil(held * self.fps)
@@ -366,18 +383,18 @@ class Video:
         wanted = (total if high is None else high) - low  # a chaptered read asks in source frames, more than it holds
         hint = max(min(wanted, total or wanted), 0)
         if hint and fps and fps < self.fps:
-            hint = int(hint * fps / self.fps) + 1
+            hint = int(hint * fps / self.fps) + 1 + keep_last * max(len(self.chapters), 1)
         numbers = []
-        frames = self._frames(start, stop, seconds, fps, size)
+        frames = self._frames(start, stop, seconds, fps, size, keep_last)
         frames = stack_frames((numbers.append(i) or a for i, _, a in frames), hint)
-        return (frames, np.array(numbers, dtype=np.int64)) if indices else frames
+        return Frames(frames, np.array(numbers, dtype=np.int64))
 
-    def chapter_frames(self, fps=None, size=None) -> Iterator[tuple[Chapter | None, Iterator[np.ndarray]]]:
+    def chapter_frames(self, fps=None, size=None, keep_last=False) -> Iterator[tuple[Chapter | None, Iterator]]:
         """(chapter, its RGB frames) per chapter, from one decode, so it works on a stream that cannot seek.
 
         A file without chapters yields (None, frames) once. Each iterator ends when the next chapter is asked for.
         """
-        frames = self._frames(*self._range(0, None, False, fps, size), False, fps, size)
+        frames = self._frames(*self._range(0, None, False, fps, size, keep_last), False, fps, size, keep_last)
         for number, group in groupby(frames, key=operator.itemgetter(1)):
             yield (None if number is None else self.chapters[number]), (array for _, _, array in group)
 

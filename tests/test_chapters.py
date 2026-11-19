@@ -75,9 +75,9 @@ def test_a_rotated_source_is_cut_as_it_is_displayed(tmp_path):
     out, _ = write(tmp_path, rotated, [ChapterClip(2, 6, (40, 160, 200, 480))], crf=0)
     with Video(rotated) as source, Video(out) as video:
         assert video.meta.rotation == 0
-        frames = video.read()
+        frames = video.read().frames
         assert frames.shape == (4, 320, 160, 3)
-        assert np.abs(frames.astype(int) - source.read(2, 6)[:, 160:480, 40:200]).mean() < 1
+        assert np.abs(frames.astype(int) - source.read(2, 6).frames[:, 160:480, 40:200]).mean() < 1
 
 
 def test_chapters_that_touch_read_back(tmp_path):
@@ -87,13 +87,13 @@ def test_chapters_that_touch_read_back(tmp_path):
         assert [sum(1 for _ in frames) for _, frames in video.chapter_frames()] == [1, 9]
         clip = b"".join(video.slice(0, 1))
     with Video(clip) as video:  # and the MP4 a slice writes, whose chapter ends are rebuilt from frame counts
-        assert video.read(indices=True)[1].tolist() == list(range(10))
+        assert video.read().indices.tolist() == list(range(10))
 
 
 def test_resolution_resizes_a_chapter(tmp_path):
     out, _ = write(tmp_path, EXAMPLE, [ChapterClip(0, 3, (0, 0, 320, 240), resolution=(160, 112))])
     with Video(out) as video:
-        assert video.read().shape == (3, 112, 160, 3)
+        assert video.read().frames.shape == (3, 112, 160, 3)
         assert video.chapters[0].payload["resolution"] == [160, 112]
 
 
@@ -103,14 +103,14 @@ def test_clips_are_cut_at_the_last_frame_the_source_decodes(tmp_path):
     assert written == [ChapterClip(100, 130, (0, 0, 160, 128))]
     with Video(out) as video:
         assert [(c.payload["start_frame"], c.payload["end_frame"]) for c in video.chapters] == [(100, 130)]
-        assert video.read(indices=True)[1].tolist() == list(range(100, 130))
+        assert video.read().indices.tolist() == list(range(100, 130))
 
 
 def test_a_source_without_a_header_rate(tmp_path):
     out, _ = write(tmp_path, ASSETS / "no_average_rate_5s.webm", [ChapterClip(4, 30, (0, 0, 96, 96))])
     with Video(out) as video:
         assert video.meta.fps == pytest.approx(19.8)
-        assert len(video.read()) == 26
+        assert len(video.read().frames) == 26
 
 
 def test_decoding_threads_do_not_change_the_output(tmp_path):
