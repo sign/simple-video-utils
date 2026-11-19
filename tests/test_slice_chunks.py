@@ -97,7 +97,7 @@ def test_packed_and_gapped_source_offsets(tmp_path, packed, chapters):
 
 
 @pytest.mark.parametrize(("start", "end"), [(-1, 1), (1, 1), (2, 1), (0, float("inf")), (float("nan"), 1),
-                                            (0, 11), (0.001, 0.002)])
+                                            (10, 11), (0.001, 0.002)])
 def test_invalid_or_empty_ranges_fail(source, start, end):
     with pytest.raises(ValueError, match="finite|range|frames"):
         list(slice_video_chunks(source, start, end))
@@ -240,3 +240,14 @@ def test_matroska_seek_keeps_bframe_keyframe_lead_in(bframes):
         assert decoded[0].time == 0
         frames.append(len(decoded))
     assert frames == [87, 87]
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_streamed_chapter_tail_clamps_to_last_source_frame(tmp_path, packed):
+    path = tmp_path / "tail.mkv"
+    _write_video(path, frames=15, starts=(0, 15) if packed else (30, 90), sources=(30, 90))
+    exact = Video.from_slice(str(path), 3.2, 3.5, chapters=True)
+    overshoot = Video.from_slice(str(path), 3.2, 4, chapters=True)
+    assert overshoot.duration_seconds() == exact.duration_seconds()
+    assert b"".join(overshoot.iter_bytes()) == b"".join(exact.iter_bytes())
+    with pytest.raises(ValueError, match="no frames"):
+        list(Video.from_slice(str(path), 3.5, 4, chapters=True).iter_bytes())

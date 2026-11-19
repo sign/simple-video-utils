@@ -187,8 +187,8 @@ def slice_video(
     Yields lazily so a long slice list never holds every clip in memory. ``size``
     center-crops each frame to a square and resizes to ``size`` x ``size``; a
     source that is already that size (and unrotated) is stream-copied instead.
-    Every slice must be within the video (``0 <= start <= end <= duration``);
-    an out-of-range or empty slice raises ``ValueError``.
+    A slice needs ``0 <= start < end``, else ``ValueError``. One running past the end of the video
+    is cut at the end; one with no frames (e.g. starting at or past the end) raises ``ValueError``.
 
     A chaptered video takes source seconds: a slice holds the frames its chapters
     keep, starts at t=0 on the first of them, and keeps gaps between chapters.
@@ -220,10 +220,11 @@ def slice_video(
     meta = meta or video_metadata(src)
     held = timeline.chapters
     duration = held[-1, 2] + held[-1, 1] - held[-1, 0] if held.size else meta.duration
-    for start, end in slices:
-        if start < 0 or end <= start or (duration is not None and end > duration):
-            msg = f"slice ({start}, {end}) out of range [0, {duration}]"
+    for start, asked in slices:
+        if start < 0 or asked <= start:
+            msg = f"slice ({start}, {asked}) out of range"
             raise ValueError(msg)
+        end = asked if duration is None else min(asked, duration)  # callers don't know the file's exact length
         window = timeline.window(start, end)
         marks = _clip_chapters(timeline, window, end, meta.fps, copied=False) if chapters and window else ()
         if window is None:
@@ -231,7 +232,7 @@ def slice_video(
         else:
             clip = _encode_clip(src, start, end, meta.fps, size, marks)
         if not clip:
-            msg = f"slice ({start}, {end}) has no frames"
+            msg = f"slice ({start}, {asked}) has no frames"
             raise ValueError(msg)
         yield clip
 
@@ -451,10 +452,8 @@ class _Slice:
         duration = (float(held[-1, 2] + held[-1, 1] - held[-1, 0]) if held.size else
                     float(stream.duration * stream.time_base) if stream.duration is not None else
                     source.duration / av.time_base if source.duration is not None else None)
-        if duration is not None and self.end > duration:
-            message = f"slice ({self.start}, {self.end}) out of range [0, {duration}]"
-            raise ValueError(message)
-        window = timeline.window(self.start, self.end)
+        end = self.end if duration is None else min(self.end, duration)
+        window = timeline.window(self.start, end)
         if window is None:
             message = f"slice ({self.start}, {self.end}) has no frames"
             raise ValueError(message)
@@ -462,7 +461,7 @@ class _Slice:
         if self.chapters and held.size and not rate:
             message = "Chapter mapping requires a source frame rate"
             raise ValueError(message)
-        marks = (_clip_chapters(timeline, window, self.end, float(rate), copied=True)
+        marks = (_clip_chapters(timeline, window, end, float(rate), copied=True)
                  if self.chapters and held.size else [])
         origin = float((stream.start_time or 0) * stream.time_base)
         low, high = (time - origin if held.size else time for time in window)
@@ -470,8 +469,8 @@ class _Slice:
         clock = (timeline.squeeze if marks else timeline.to_source) if held.size else None
         if self._stats is None:
             self._stats = _slice_stats(
-                _slice_packets(source, stream, begin, stop, timeline, self.end), begin, stop)
-        return stream, timeline, begin, stop, clock, marks
+                _slice_packets(source, stream, begin, stop, timeline, end), begin, stop)
+        return stream, timeline, begin, stop, clock, marks, end
 
     def duration_seconds(self):
         if self._duration is None:
@@ -483,12 +482,12 @@ class _Slice:
         self.duration_seconds()
         return self._length
 
-    def _header(self, source, stream, timeline, begin, stop, clock, marks):
+    def _header(self, source, stream, timeline, begin, stop, clock, marks, end):
         samples, keyframe = self._stats
         # _mp4 reserves 4096 + 32 bytes/sample; the extra covers ftyp, mdat and its size patch.
         header_size = 4096 + 32 * samples + 1024
         recorded = _SliceOutput(header_size, record=True)
-        packets = _slice_packets(source, stream, begin, stop, timeline, self.end, keyframe)
+        packets = _slice_packets(source, stream, begin, stop, timeline, end, keyframe)
         for _ in _write_slice(recorded, stream, packets, samples, begin, clock, marks):
             pass
         assert recorded.header is not None
@@ -509,7 +508,7 @@ class _Slice:
     def __call__(self):
         with _open_video(self.src) as source:
             plan = self._plan(source)
-            stream, timeline, begin, stop, clock, marks = plan
+            stream, timeline, begin, stop, clock, marks, end = plan
             header = self._header(source, *plan)
             length, header_size = self._length, len(header)
             samples, keyframe = self._stats
@@ -518,7 +517,7 @@ class _Slice:
             if header_size < length:
                 output = _SliceOutput(header_size, record=False)
                 yield from _write_slice(output, stream,
-                                        _slice_packets(source, stream, begin, stop, timeline, self.end, keyframe),
+                                        _slice_packets(source, stream, begin, stop, timeline, end, keyframe),
                                         samples, begin, clock, marks)
                 if output.length != length:
                     message = "Video source changed while replaying the slice"
