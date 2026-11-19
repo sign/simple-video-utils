@@ -5,7 +5,7 @@ from fractions import Fraction
 
 import numpy as np
 import pytest
-from av.video.reformatter import ColorRange, Colorspace
+from av.video.reformatter import ColorPrimaries, ColorRange, Colorspace, ColorTrc
 from conftest import make_video, numbers
 
 from simple_video_utils import Video, VideoError, VideoWriter, write_video
@@ -32,9 +32,10 @@ def test_default_is_h264_mp4_at_the_exact_rate():
     with Video(write_video(None, (shows(i) for i in range(20)), 30000 / 1001)) as video:
         assert (video.codec, video.pix_fmt, video.rate) == ("h264", "yuv420p", Fraction(30000, 1001))
         assert numbers(video.frames()) == list(range(20))
-        # the matrix the RGB was converted with: untagged, Apple's decoder shows skin (224, 172, 105) as (226, 181, 117)
+        # sRGB pixels, converted by BT.601: untagged, Apple's decoder shows skin (224, 172, 105) as (226, 181, 117)
         colour = video.stream.codec_context
         assert (colour.colorspace, colour.color_range) == (Colorspace.ITU601, ColorRange.MPEG)
+        assert (colour.color_primaries, colour.color_trc) == (ColorPrimaries.BT709, ColorTrc.IEC61966_2_1)
 
 
 def test_index_places_a_frame_and_timestamps_reports_it(tmp_path):

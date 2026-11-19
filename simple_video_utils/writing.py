@@ -8,7 +8,7 @@ from typing import BinaryIO
 
 import av
 import numpy as np
-from av.video.reformatter import ColorRange, Colorspace
+from av.video.reformatter import ColorPrimaries, ColorRange, Colorspace, ColorTrc
 
 from simple_video_utils.video import quiet, refusing
 
@@ -70,9 +70,11 @@ class VideoWriter:
             stream = self.container.add_stream(codec, rate=self._rate, options=options)
             stream.width, stream.height, stream.pix_fmt = image.width, image.height, pix_fmt
             if pix_fmt.startswith("yuv"):
-                # RGB becomes YUV by BT.601 in limited range, here and in a filter chain alike. Untagged, players take
-                # a picture 720 lines or taller for BT.709, and its colours shift.
-                stream.codec_context.colorspace, stream.codec_context.color_range = Colorspace.ITU601, ColorRange.MPEG
+                # The arrays are sRGB, and become YUV by BT.601 in limited range, here and in a filter chain alike.
+                # Untagged, each player guesses a matrix and a transfer curve, and the colours shift.
+                colour = stream.codec_context
+                colour.colorspace, colour.color_range = Colorspace.ITU601, ColorRange.MPEG
+                colour.color_primaries, colour.color_trc = ColorPrimaries.BT709, ColorTrc.IEC61966_2_1
         self.container.mux(stream.encode(image))
         self._stream = stream  # kept once it has encoded: PyAV crashes flushing an encoder that failed to open
 
