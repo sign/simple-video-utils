@@ -66,7 +66,8 @@ rotation in the header. A stream that cannot seek is read once: a second read ra
 read at a time: `keyframes()`, another read, `close()`, or a `meta` that has to read the file (Matroska, WebM) in the
 middle of a `frames()` loop makes that loop raise `RuntimeError`, so ask for `meta` before the loop.
 
-`Video(src, format="mpegts")` names the container when the data cannot, as for a stream joined midway.
+`Video(src, format="mpegts")` names the container when the data cannot, as for a stream joined midway, and
+`container_options={"probesize": "32"}` passes the demuxer its options.
 `Video(src, thread_type="NONE")` decodes without threads. Open each `Video` in the process that reads it (in a
 DataLoader worker, not before the fork): workers that inherit one share its file position and fail to decode.
 `Video(stream, buffer_size=4096)` yields frames sooner from a live stream. `video.container` and `video.stream` are the

@@ -90,7 +90,8 @@ def _open(src, **options) -> av.container.InputContainer:
     with refusing("Failed to open video", Exception):
         if sys.platform == "linux" and isinstance(src, str) and src.startswith("https://"):
             # PyAV's Linux wheels carry no trust store
-            options["options"] = {"ca_file": ssl.get_default_verify_paths().cafile or certifi.where()}
+            trusted = ssl.get_default_verify_paths().cafile or certifi.where()
+            options["options"] = {"ca_file": trusted, **options.get("options", {})}
         # PyAV takes the direction from a stream's own `.mode`, and an upload spooled in memory says "w+b"
         return av.open(io.BytesIO(src) if isinstance(src, bytes) else src, mode="r", **options)
 
@@ -194,14 +195,15 @@ class Video:
     `thread_type` is PyAV's ("AUTO", "FRAME", "SLICE", "NONE"). Open a Video in the process that reads it: one
     inherited across a fork can deadlock if its decoder is threaded, and shares its file position with the other
     processes even with "NONE". A smaller `buffer_size` yields frames sooner on a live stream. `format` names the
-    container when the data cannot say ("mpegts" for a stream joined midway).
+    container when the data cannot say ("mpegts" for a stream joined midway), and `container_options` are the
+    demuxer's (`{"probesize": "32"}` to stop it reading ahead on a live one).
     """
 
     def __init__(self, src: str | os.PathLike | bytes | BinaryIO, thread_type: str = "AUTO", buffer_size: int = 32768,
-                 format: str | None = None):
+                 format: str | None = None, container_options: dict[str, str] | None = None):
         self._moves = 0  # times the container was repositioned or closed: a read still running then has lost its place
         src = os.fspath(src) if isinstance(src, os.PathLike) else src
-        self.container = _open(src, buffer_size=buffer_size, format=format)
+        self.container = _open(src, buffer_size=buffer_size, format=format, options=dict(container_options or {}))
         # libav's word rather than a guess from the argument's type: it has no size for a pipe, named by path or not.
         # A format that opens its own files (an image sequence) has no size to ask for.
         self.seekable = bool(self.container.size) or self.container.format.no_file

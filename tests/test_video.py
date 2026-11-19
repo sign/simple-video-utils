@@ -67,6 +67,8 @@ def test_gray_frames_and_a_named_container(tmp_path):
         gray, colour = video.read(0, 3, format="gray").frames, video.read(0, 3).frames
         assert gray.shape == colour.shape[:3]
         assert np.abs(gray - colour.mean(axis=3)).max() < 16
+    with Video(EXAMPLE, container_options={"probesize": "4096"}) as video:
+        assert video.container.options == {"probesize": "4096"}
     with pytest.raises(InvalidVideoError):  # not what the file is, so it ends before a stream is found
         Video(EXAMPLE, format="mpegts")
 
