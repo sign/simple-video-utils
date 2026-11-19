@@ -148,7 +148,8 @@ Frames are RGB, RGBA `(H, W, 4)` or gray `(H, W)`, all of one shape. Both take t
 
 `writer.write(frame, index)` places a frame at `index / fps`, leaving a gap. Mattes round-trip exactly with
 `codec="ffv1", pix_fmt="gray"` and `read(format="gray")`; transparency is `codec="libvpx-vp9", pix_fmt="yuva420p"` in
-a `.webm`. Nothing is written before the first frame.
+a `.webm`. YUV output is tagged with the matrix it was converted with (BT.601, limited range), so players show the
+colours that went in. Nothing is written before the first frame.
 
 ## From 0.x
 
