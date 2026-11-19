@@ -65,11 +65,18 @@ class InvalidVideoError(VideoError):
 
 
 @contextmanager
-def refusing(message: str, errors: type[Exception] = av.FFmpegError) -> Iterator[None]:
-    """PyAV's errors leave this library as VideoError, so nothing that uses it has to import PyAV to catch them."""
+def refusing(message: str, errors: type[Exception] = av.FFmpegError,
+             keep: type[Exception] | tuple = ()) -> Iterator[None]:
+    """PyAV's errors leave this library as VideoError, so nothing that uses it has to import PyAV to catch them.
+
+    A writer passes `keep=OSError`: no directory or no space left is the destination's fault, not the video's, and
+    PyAV's error for it is already the builtin one.
+    """
     try:
         yield
     except errors as e:
+        if isinstance(e, keep):
+            raise
         invalid = isinstance(e, (av.error.InvalidDataError, av.error.EOFError))  # EOF: the data stops too soon
         raise (InvalidVideoError if invalid else VideoError)(message) from e
 

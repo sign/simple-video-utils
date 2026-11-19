@@ -43,12 +43,12 @@ class VideoWriter:
         self._encoder, self._filters = (codec, pix_fmt, options), filters
         self._shape = self._stream = self._graph = None
         self._next = 0
-        with refusing("Failed to open video for writing"):
+        with refusing("Failed to write video", keep=OSError):
             dst = os.fspath(dst) if isinstance(dst, os.PathLike) else dst
             self.container = av.open(dst, mode="w", format=format, options=container_options)
         self.container.metadata.update(tags or {})
 
-    @refusing("Failed to write video")
+    @refusing("Failed to write video", keep=OSError)
     def write(self, frame: np.ndarray, index: int | None = None) -> None:
         """Add a frame, shown at `index / fps`: right after the one before it unless `index` leaves a gap."""
         if frame.shape != (self._shape or frame.shape):
@@ -78,7 +78,7 @@ class VideoWriter:
         self.container.mux(stream.encode(image))
         self._stream = stream  # kept once it has encoded: PyAV crashes flushing an encoder that failed to open
 
-    @refusing("Failed to write video")
+    @refusing("Failed to write video", keep=OSError)
     def close(self) -> None:
         """Flush the encoder and finish the file."""
         stream, self._stream = self._stream, None

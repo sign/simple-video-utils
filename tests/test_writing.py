@@ -59,7 +59,9 @@ def test_a_stream_receives_bytes_while_frames_are_written():
         assert numbers(video.frames()) == list(range(5))
 
 
-def test_what_cannot_be_written_raises():
+def test_what_cannot_be_written_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):  # the destination's fault, so the builtin error and not a VideoError
+        write_video(tmp_path / "missing" / "out.mp4", [shows(0)], 30)
     with pytest.raises(ValueError, match="different shapes"):
         write_video(None, [shows(0), shows(0)[:32]], 30)
     with pytest.raises(ValueError, match="nope"):

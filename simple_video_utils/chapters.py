@@ -35,7 +35,7 @@ class ChapterClip:
         return self.resolution or (right - left, bottom - top)
 
 
-@refusing("Failed to write chapters")
+@refusing("Failed to write chapters", keep=OSError)
 def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to the write they guard
     src: str | os.PathLike,
     out: str | os.PathLike,
