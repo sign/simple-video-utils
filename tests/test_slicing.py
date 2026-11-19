@@ -67,6 +67,20 @@ def test_slice_of_bytes_and_of_b_frames(tmp_path):
     assert len(clip) <= 31
 
 
+def test_b_frames_leave_later_frames_visible_in_a_plain_slice(tmp_path):
+    source = make_video(tmp_path / "b.mp4", frames=120, gop=30, bframes=3)
+    shown = numbers(read(b"".join(Slice(source, 0, 4 / 30))))
+    # frames 0-3 are predicted from frames 4 and 6, which are copied with them and cannot be hidden
+    assert shown[:4] == [0, 1, 2, 3]
+    assert shown[4:] == [4, 6]
+
+
+def test_slice_times_are_matched_on_the_files_clock(gapped):
+    # frame 100 of 30 fps is at 3.3333 s, stored as 3333 ms: a slice from 100 / 30 must still start on it
+    with Video(b"".join(Slice(gapped, 100 / 30, 110 / 30))) as video:
+        assert video.read(indices=True)[1].tolist() == list(range(100, 110))
+
+
 def test_slice_keeps_gaps_and_carries_its_chapters(gapped):
     with Video(gapped) as video:
         frames, indices = video.read(size=(64, 64), indices=True)

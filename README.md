@@ -38,12 +38,13 @@ without a copy). Both take the same arguments:
 
 | Argument | Meaning |
 |---|---|
-| `start`, `stop` | Frame indices, `stop` excluded. With `seconds=True`, times: frames in `[start, stop)`. |
+| `start`, `stop` | Frame indices, `stop` excluded. With `seconds=True`, times: the frames timestamped in `[start, stop)`. |
 | `fps` | Drop frames down to about this rate. Never repeats a frame. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
 | `indices` | Also return each frame's index. |
 
-Reads three seconds or more into a file seek first. Frames always come out upright.
+Reads three seconds or more into a file seek first. Frames always come out upright. A stream that cannot seek is read
+once: a second read raises `ValueError`.
 
 `Video(src, thread_type="NONE")` decodes without threads: use it in processes that fork (DataLoader workers).
 `Video(stream, buffer_size=4096)` yields frames sooner from a live stream. `video.container` and `video.stream` are the
@@ -91,8 +92,10 @@ data = b"".join(clip)
 
 A slice copies packets, so it is lossless and fast, and never holds the clip in memory. The MP4 puts `moov` first, so
 it can be read from a pipe. It starts on its first frame and keeps the frames from the keyframe before it, hidden
-behind an edit list; with B-frames, the frame at `stop` can remain. Gaps between chapters stay gaps, and the chapters
-it spans come along, so reading the clip gives the source's frame indices. Codecs MP4 cannot carry raise.
+behind an edit list. With B-frames it also keeps the later frames its last ones are predicted from, and those stay
+visible: a few frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it
+spans come along, so reading a chaptered clip gives exactly the frames in range, with the source's frame indices.
+Times are matched at the precision of the file's clock. Codecs MP4 cannot carry raise.
 
 ## From 0.x
 

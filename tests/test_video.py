@@ -6,7 +6,7 @@ from pathlib import Path
 import av
 import numpy as np
 import pytest
-from conftest import ASSETS, EXAMPLE, HELD, Pipe, make_video
+from conftest import ASSETS, EXAMPLE, HELD, Pipe, make_video, numbers
 
 from simple_video_utils import PackedChaptersError, Video, VideoMetadata, stack_frames, video_metadata
 
@@ -108,6 +108,26 @@ def test_read_by_seconds(full):
 def test_bad_arguments_raise_at_the_call(arguments, error):
     with Video(EXAMPLE) as video, pytest.raises(error):
         video.frames(**arguments) if arguments.get("stop") != 5 else video.read(**arguments)
+
+
+def test_a_timed_read_goes_by_each_frames_own_time():
+    # a browser recording: frames at 0, 57, 164, 213 ms. An average rate would put frame 3 inside [0.1, 0.2)
+    with Video(ASSETS / "mediarecorder-no-average-rate.webm") as video:
+        assert [index for _, index in video.frames(0.1, 0.2, seconds=True, indices=True)] == [2]
+        assert video.read(0.164, 0.26, seconds=True, indices=True)[1].tolist() == [2, 3]
+    with av.open(str(ASSETS / "no_average_rate_5s.webm")) as container:
+        times = [frame.time for frame in container.decode(video=0)]
+    with Video(ASSETS / "no_average_rate_5s.webm") as video:  # far enough in to seek; 20 fps would say 80-89
+        timed = video.read(4.0, 4.5, seconds=True, indices=True)[1].tolist()
+        assert timed == [index for index, time in enumerate(times) if 4.0 <= time < 4.5] == list(range(79, 89))
+
+
+def test_a_stream_that_cannot_seek_is_read_once(tmp_path):
+    data = Path(make_video(tmp_path / "v.mkv", frames=120)).read_bytes()
+    with Video(Pipe(data)) as video:
+        assert numbers(video.frames(100, 103)) == [100, 101, 102], "decoded from the start, with no seek"
+        with pytest.raises(ValueError, match="read only once"):
+            next(video.frames())
 
 
 def test_seeked_read_is_exact_when_the_header_rate_drifts():
@@ -247,14 +267,14 @@ def test_packed_chapters_are_refused(tmp_path):
 def test_a_video_without_our_chapters_has_none(tmp_path):
     path = tmp_path / "marked.mkv"
     with av.open(EXAMPLE) as source, av.open(str(path), mode="w") as output:
-        output.set_chapters([{"id": 1, "start": 0, "end": 2000, "time_base": Fraction(1, 1000),
-                              "metadata": {"title": "Intro"}}])
+        output.set_chapters([{"id": i, "start": i * 2000, "end": i * 2000 + 2000, "time_base": Fraction(1, 1000),
+                              "metadata": {"title": title}} for i, title in enumerate(("Intro", "1", "[2]"))])
         track = output.add_stream_from_template(source.streams.video[0])
         for packet in source.demux(video=0):
             if packet.size:
                 packet.stream = track
                 output.mux(packet)
     with Video(path) as video:
-        assert len(video.container.chapters()) == 1
+        assert len(video.container.chapters()) == 3
         assert video.chapters == []
         assert [(chapter, sum(1 for _ in frames)) for chapter, frames in video.chapter_frames()] == [(None, 130)]

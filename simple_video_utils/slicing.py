@@ -93,9 +93,12 @@ class Slice:
     """Seconds [start, stop) of a video as a streamable MP4 (moov first), produced as it is read.
 
     Iterate for its bytes; iterate again to replay it. Packets are copied, so nothing is re-encoded and codecs MP4
-    cannot carry raise. The clip starts on its first frame. It also holds the frames from the keyframe before that
-    one, hidden behind an edit list, and with B-frames the frame at `stop` can remain. Gaps between chapters stay
-    gaps, and the chapters it spans come along. The source must not change between reads.
+    cannot carry raise. Times are matched at the precision of the file's clock (a millisecond in Matroska). The clip
+    starts on its first frame and holds the frames from the keyframe before that one, hidden behind an edit list.
+    With B-frames it also holds the later frames its last ones are predicted from, and those stay visible: a few
+    frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it spans
+    come along, so `Video` reads exactly the frames in range from a chaptered slice. The source must not change
+    between reads.
     """
 
     def __init__(self, src: str | bytes, start: float, stop: float):

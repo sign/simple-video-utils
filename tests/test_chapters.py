@@ -80,6 +80,16 @@ def test_a_rotated_source_is_cut_as_it_is_displayed(tmp_path):
         assert np.abs(frames.astype(int) - source.read(2, 6)[:, 160:480, 40:200]).mean() < 1
 
 
+def test_chapters_that_touch_read_back(tmp_path):
+    # at 30 fps the boundary is 33.3 ms, which Matroska stores as 33
+    out, _ = write(tmp_path, EXAMPLE, [ChapterClip(0, 1, (0, 0, 160, 128)), ChapterClip(1, 10, (0, 0, 160, 128))])
+    with Video(out) as video:
+        assert [sum(1 for _ in frames) for _, frames in video.chapter_frames()] == [1, 9]
+        clip = b"".join(video.slice(0, 1))
+    with Video(clip) as video:  # and the MP4 a slice writes, whose chapter ends are rebuilt from frame counts
+        assert video.read(indices=True)[1].tolist() == list(range(10))
+
+
 def test_resolution_resizes_a_chapter(tmp_path):
     out, _ = write(tmp_path, EXAMPLE, [ChapterClip(0, 3, (0, 0, 320, 240), resolution=(160, 112))])
     with Video(out) as video:

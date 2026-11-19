@@ -168,6 +168,8 @@ class Video:
     def rewind(self) -> None:
         """Back to the first frame, for reading `container` directly after a read has moved it."""
         if self._moved:
+            if not self.seekable:
+                raise ValueError("this stream cannot seek, so it can be read only once")
             self.container.seek(0)
         self._moved = True
 
@@ -198,10 +200,11 @@ class Video:
                 payload = json.loads(tags.get("payload") or tags.get("title") or "")  # MP4 keeps only a title
                 rate = Fraction(payload.get("rate") or self.stream.average_rate)
                 source = Fraction(payload["start_frame"]) / rate
-                if "end_frame" in payload:  # MP4 ends a chapter where the next one starts, gap included
-                    end = start + (payload["end_frame"] - payload["start_frame"]) / rate
-            except (ValueError, TypeError, KeyError, ZeroDivisionError):
-                continue
+                if "end_frame" in payload and "payload" not in tags:
+                    # MP4 ends a chapter where the next one starts, gap included; Matroska keeps the real end
+                    end = min(end, start + (payload["end_frame"] - payload["start_frame"]) / rate)
+            except (ValueError, TypeError, KeyError, AttributeError, ZeroDivisionError):
+                continue  # an ordinary marker: its title is not our JSON
             found.append(Chapter(chapter["id"], start, end, source, payload))
             # how far the file's clock runs from the source's, in frames: nothing in a whole file (a Matroska payload
             # tag), one amount throughout a slice (an MP4 title). A packed file closes its gaps, so it drifts.
@@ -270,26 +273,22 @@ class Video:
         time_base = str(stream.time_base) if stream.time_base else None
         return VideoMetadata(width, height, fps, frames, time_base, duration, self.rotation)
 
-    def _range(self, start, stop, seconds, fps, size) -> tuple[int, int | None]:
+    def _range(self, start, stop, seconds, fps, size) -> tuple:
         if fps is not None and fps <= 0:
             raise ValueError("fps must be positive")
         if size is not None and (len(size) != 2 or min(map(operator.index, size)) <= 0):
             raise ValueError("size must be two positive integers, (width, height)")
-        if seconds:
+        if seconds:  # a negative start reads from the beginning: padded windows are common
             if stop is not None and stop < max(start, 0):
                 raise ValueError("invalid time range")
-            if not self.fps:
-                raise ValueError("Video has no FPS information")
-            # the frames timed in [start, stop), from the beginning when start is negative (padded windows are
-            # common); the epsilon is for floats: 0.7 s at 30 fps is frame 20.999999999999996
-            start, stop = (None if t is None else max(math.ceil(t * self.fps - 1e-6), 0) for t in (start, stop))
+            return start, stop
         start, stop = operator.index(start), None if stop is None else operator.index(stop)
         if start < 0 or (stop is not None and stop < start):
             raise ValueError("invalid frame range")
         return start, stop
 
-    def _decode(self, start: int, stop: int | None) -> Iterator[tuple]:  # noqa: C901 - one loop, one indexing rule
-        """(index, chapter number, frame) for frames [start, stop).
+    def _decode(self, start, stop, seconds=False) -> Iterator[tuple]:  # noqa: C901 - one loop, one indexing rule
+        """(index, chapter number, frame) for frames [start, stop): frame indices, or with `seconds` their times.
 
         Frames are counted. After a seek the first one is placed by its timestamp; so is the first of each chapter,
         which makes the frames missing between chapters count too.
@@ -297,14 +296,15 @@ class Video:
         stream, fps, chapters = self.stream, self.fps, self.chapters
         if stop is not None and stop <= start:
             return
-        if (start or chapters) and not fps:
+        if (start > 0 or chapters) and not fps:
             raise ValueError("Video has no FPS information")
         first = float((stream.start_time or 0) * stream.time_base)
         # seconds from a frame's index time to its place in this file: a slice starts mid-source
         shift = [float(c.start - c.source) for c in chapters] or [first]
         starts, ends, half = [float(c.start) for c in chapters], [float(c.end) for c in chapters], 0.5 / (fps or 1)
-        at = start / fps + shift[0] if fps else first
-        if seeking := at - first >= 3:  # nearer than that, decoding from the start is as fast
+        tick = float(stream.time_base) / 2  # files round times to their clock, so a frame can sit half a tick early
+        at = (start if seconds else start / fps if fps else 0) + shift[0]
+        if seeking := self.seekable and at - first >= 3:  # nearer than that, decoding from the start is as fast
             self.container.seek(int((at - 1) / stream.time_base), stream=stream)
             self._moved = True
         else:
@@ -321,30 +321,38 @@ class Video:
                         continue  # the hidden edges of a slice
                     if number != chapter:
                         chapter, index = number, round((frame.time - shift[number]) * fps) - 1
-                elif index is None:
-                    if frame.time is None or round((frame.time - first) * locate) < start:
+                elif index is None:  # after a seek, the frame's time says which one it is
+                    if frame.time is None:
                         continue
-                    index = start - 1
+                    index = round((frame.time - first) * locate) - 1
+                    if not seconds:  # and the first to reach `start` is `start`, however the rate has drifted
+                        if index + 1 < start:
+                            index = None
+                            continue
+                        index = start - 1
                 index += 1
-                if stop is not None and index >= stop:
+                # a timed read goes by each frame's own time: an average rate cannot place the frames of a variable one
+                position = frame.time - shift[chapter or 0] + tick if seconds else index
+                if stop is not None and position >= stop:
                     return
-                if index >= start:
+                if position >= start:
                     yield index, chapter, frame
         except av.FFmpegError as e:
             raise RuntimeError("Failed to decode video") from e
 
-    def _frames(self, start: int, stop: int | None, fps: float | None, size) -> Iterator[tuple]:
-        items = self._decode(start, stop)
+    def _frames(self, start, stop, seconds, fps, size) -> Iterator[tuple]:
+        items = self._decode(start, stop, seconds)
         return _rgb(_pick(items, fps) if fps else items, size)
 
     def frames(self, start=0, stop=None, *, seconds=False, fps=None, size=None, indices=False) -> Iterator:
         """RGB (H, W, 3) uint8 arrays for frames [start, stop), decoded as they are asked for.
 
-        `seconds=True` takes times instead of frame indices. `fps` drops frames down to about that rate. `size` is
-        (width, height) as displayed. `indices=True` yields (array, frame index) pairs. In a file with chapters,
-        indices count on the source's clock, so the frames between chapters are skipped, not renumbered.
+        `seconds=True` takes times instead of frame indices, and selects by each frame's own timestamp. `fps` drops
+        frames down to about that rate. `size` is (width, height) as displayed. `indices=True` yields (array, frame
+        index) pairs. In a file with chapters, indices and times are the source's, so the frames between chapters are
+        skipped, not renumbered. A stream that cannot seek is read once.
         """
-        frames = self._frames(*self._range(start, stop, seconds, fps, size), fps, size)
+        frames = self._frames(*self._range(start, stop, seconds, fps, size), seconds, fps, size)
         return ((array, index) for index, _, array in frames) if indices else (array for _, _, array in frames)
 
     def read(self, start=0, stop=None, *, seconds=False, fps=None, size=None, indices=False):
@@ -353,12 +361,15 @@ class Video:
         # the header's count, else an estimate: it only sizes the batch
         held = sum(float(c.end - c.start) for c in self.chapters) or self.duration or 0
         total = self.stream.frames or math.ceil(held * self.fps)
-        wanted = (total if stop is None else stop) - start  # a chaptered read asks in source frames, more than it holds
+        low, high = (max(start, 0), stop) if not seconds else (math.ceil(max(start, 0) * self.fps),
+                                                               None if stop is None else math.ceil(stop * self.fps))
+        wanted = (total if high is None else high) - low  # a chaptered read asks in source frames, more than it holds
         hint = max(min(wanted, total or wanted), 0)
         if hint and fps and fps < self.fps:
             hint = int(hint * fps / self.fps) + 1
         numbers = []
-        frames = stack_frames((numbers.append(i) or a for i, _, a in self._frames(start, stop, fps, size)), hint)
+        frames = self._frames(start, stop, seconds, fps, size)
+        frames = stack_frames((numbers.append(i) or a for i, _, a in frames), hint)
         return (frames, np.array(numbers, dtype=np.int64)) if indices else frames
 
     def chapter_frames(self, fps=None, size=None) -> Iterator[tuple[Chapter | None, Iterator[np.ndarray]]]:
@@ -366,7 +377,7 @@ class Video:
 
         A file without chapters yields (None, frames) once. Each iterator ends when the next chapter is asked for.
         """
-        frames = self._frames(*self._range(0, None, False, fps, size), fps, size)
+        frames = self._frames(*self._range(0, None, False, fps, size), False, fps, size)
         for number, group in groupby(frames, key=operator.itemgetter(1)):
             yield (None if number is None else self.chapters[number]), (array for _, _, array in group)
 
