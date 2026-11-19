@@ -1,6 +1,6 @@
 # simple-video-utils
 
-Read, slice and crop videos for sign language processing. One class over [PyAV](https://pyav.org), under 900 lines.
+Read, slice and crop videos for sign language processing. One class over [PyAV](https://pyav.org), under 1,000 lines.
 
 ```bash
 pip install simple-video-utils  # Python 3.12+
