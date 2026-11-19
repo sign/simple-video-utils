@@ -192,8 +192,8 @@ def slice_video(
     Yields lazily so a long slice list never holds every clip in memory. ``size``
     center-crops each frame to a square and resizes to ``size`` x ``size``; a
     source that is already that size (and unrotated) is stream-copied instead.
-    Every slice must be within the video (``0 <= start <= end <= duration``);
-    an out-of-range or empty slice raises ``ValueError``.
+    A slice needs ``0 <= start < end``, else ``ValueError``. One running past the end of the video
+    is cut at the end; one with no frames (e.g. starting at or past the end) raises ``ValueError``.
 
     A chaptered video takes source seconds: a slice holds the frames its chapters
     keep, starts at t=0 on the first of them, and keeps gaps between chapters.
@@ -221,10 +221,11 @@ def slice_video(
         size is None or (meta.width == meta.height == size and meta.rotation == 0)
     )
 
-    for start, end in slices:
-        if start < 0 or end <= start or (duration is not None and end > duration):
-            msg = f"slice ({start}, {end}) out of range [0, {duration}]"
+    for start, asked in slices:
+        if start < 0 or asked <= start:
+            msg = f"slice ({start}, {asked}) out of range"
             raise ValueError(msg)
+        end = asked if duration is None else min(asked, duration)  # callers don't know the file's exact length
         window = timeline.window(start, end)
         marks = _clip_chapters(timeline, window, end, meta.fps, should_copy) if chapters and window else ()
         if window is None:
@@ -235,7 +236,7 @@ def slice_video(
         else:
             clip = _encode_clip(src, start, end, meta.fps, size, marks)
         if not clip:
-            msg = f"slice ({start}, {end}) has no frames"
+            msg = f"slice ({start}, {asked}) has no frames"
             raise ValueError(msg)
         yield clip
 
