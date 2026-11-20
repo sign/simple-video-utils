@@ -141,7 +141,7 @@ def test_clips_are_cut_at_the_last_frame_the_source_decodes(tmp_path):
     out, written = write(tmp_path, EXAMPLE, clips)
     assert written == [ChapterClip(100, 130, (0, 0, 160, 128))]
     with Video(out) as video:
-        assert [(c.payload["start_frame"], c.payload["end_frame"]) for c in video.chapters] == [(100, 130)]
+        assert [c.frames for c in video.chapters] == [range(100, 130)]
         assert video.read().indices.tolist() == list(range(100, 130))
 
 

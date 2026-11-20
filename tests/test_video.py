@@ -265,33 +265,18 @@ def test_stop_may_be_far_past_the_end():
         assert len(video.read(1.0, math.inf, seconds=True).frames) == 100
 
 
-def test_fps_drops_frames_and_never_repeats_them(full):
+def test_fps_drops_frames_never_repeats_them_and_keeps_the_last(full):
     with Video(EXAMPLE) as video:
         frames, indices = video.read(fps=10)
         assert indices.tolist() == list(range(0, 130, 3))
         assert np.array_equal(frames, full[::3])
         assert len(video.read(fps=120).frames) == 130
-        assert video.read(40, 60, fps=15).indices.tolist() == list(range(40, 60, 2))
-
-
-def test_keep_last_adds_the_last_frame_when_fps_would_drop_it(full):
-    with Video(EXAMPLE) as video:
-        assert video.read(0, 30, fps=10).indices.tolist() == list(range(0, 30, 3))
-        batch = video.read(0, 30, fps=10, keep_last=True)
-        assert batch.indices.tolist() == [*range(0, 30, 3), 29]
+        batch = video.read(0, 30, fps=10)
+        assert batch.indices.tolist() == [*range(0, 30, 3), 29], "the last frame, which the step alone would drop"
         assert np.array_equal(batch.frames, full[batch.indices])
-        assert video.read(0, 28, fps=10, keep_last=True).indices.tolist() == list(range(0, 28, 3)), "27 was kept anyway"
-        assert [index for _, index in video.frames(120, fps=10, keep_last=True, indices=True)] == [120, 123, 126, 129]
-        with pytest.raises(ValueError, match="keep_last"):
-            video.read(keep_last=True)
-
-
-def test_keep_last_keeps_the_last_frame_of_each_chapter(gapped):
-    with Video(gapped) as video:
-        kept = video.read(fps=15, keep_last=True, size=(32, 32)).indices.tolist()
-        assert kept == [*range(0, 20, 2), 19, *range(45, 80, 2), *range(100, 128, 2), 127]
-        counts = [sum(1 for _ in frames) for _, frames in video.chapter_frames(fps=15, size=(32, 32), keep_last=True)]
-        assert counts == [11, 18, 15]
+        assert video.read(0, 30, fps=10, keep_last=False).indices.tolist() == list(range(0, 30, 3))
+        assert video.read(0, 28, fps=10).indices.tolist() == list(range(0, 28, 3)), "27 is on the step"
+        assert [index for _, index in video.frames(120, fps=10, indices=True)] == [120, 123, 126, 129]
 
 
 def test_size_resizes_before_the_rgb_conversion():
@@ -304,6 +289,7 @@ def test_size_resizes_before_the_rgb_conversion():
 
 def test_one_video_serves_many_reads(full):
     with Video(EXAMPLE, thread_type="NONE") as video:
+        assert video.stream.codec_context.thread_count == 1, "some decoders (AV1's) thread by the count alone"
         assert video.meta.nb_frames == 130
         assert np.array_equal(video.read(5, 15).frames, full[5:15])
         assert video.keyframes() == [0]
@@ -363,8 +349,7 @@ def test_stack_frames():
 
 def test_chapters_place_frames_on_the_source(gapped, full):
     with Video(gapped) as video:
-        spans = [(c.payload["start_frame"], c.payload["end_frame"]) for c in video.chapters]
-        assert spans == [(0, 20), (45, 80), (100, 128)]
+        assert [c.frames for c in video.chapters] == [range(0, 20), range(45, 80), range(100, 128)]
         assert [float(c.source) for c in video.chapters] == pytest.approx([0, 1.5, 100 / 30])
         assert [float(c.start) for c in video.chapters] == pytest.approx([0, 1.5, 3.333])
         assert video.chapters[1].payload["payload"] == {"who": "signer"}
@@ -399,12 +384,14 @@ def test_chapter_frames_reads_each_chapter_from_one_decode(gapped, wrap):
                         (3, [((240, 320, 3), index) for index in range(100, 128)])]
 
 
-def test_fps_starts_over_in_each_chapter(gapped):
+def test_fps_starts_over_in_each_chapter_and_keeps_its_last_frame(gapped):
     with Video(gapped) as video:
         counts = [sum(1 for _ in frames) for _, frames in video.chapter_frames(fps=15, size=(32, 32))]
-        assert counts == [10, 18, 14]
+        assert counts == [11, 18, 15]
         kept = video.read(fps=15, size=(32, 32)).indices.tolist()
-        assert kept == [*range(0, 20, 2), *range(45, 80, 2), *range(100, 128, 2)]
+        assert kept == [*range(0, 20, 2), 19, *range(45, 80, 2), *range(100, 128, 2), 127]
+        stepped = video.read(fps=15, size=(32, 32), keep_last=False).indices.tolist()
+        assert stepped == [*range(0, 20, 2), *range(45, 80, 2), *range(100, 128, 2)]
 
 
 def test_packed_chapters_are_refused(tmp_path):
@@ -414,7 +401,7 @@ def test_packed_chapters_are_refused(tmp_path):
         {"id": i, "start": i * 1000, "end": (i + 1) * 1000, "time_base": Fraction(1, 1000),
          "metadata": {"payload": json.dumps({"start_frame": start, "end_frame": start + 30})}}
         for i, start in enumerate((30, 90))])
-    with Video(path) as video, pytest.raises(PackedChaptersError, match="packed"):
+    with Video(path) as video, pytest.raises(PackedChaptersError, match="other times than their source"):
         video.read()
     with pytest.raises(PackedChaptersError):
         video_metadata(str(path))
@@ -483,5 +470,7 @@ def test_what_pyav_cannot_decode_is_an_invalid_video(tmp_path):
     whole = (ASSETS / "no_nb_frames.webm").read_bytes()
     with Video(whole[:len(whole) // 50]) as video, pytest.raises(VideoError):  # the header, and nothing to seek to
         _ = video.meta
+    with Video(whole[:len(whole) // 50]) as video:  # no chapters and no frames is still one group, an empty one
+        assert [(chapter, list(frames)) for chapter, frames in video.chapter_frames()] == [(None, [])]
     with Video(whole[:len(whole) // 2]) as video:  # the header still promises 107 frames
         assert video.meta.nb_frames == len(video.read().frames) == 33

@@ -18,7 +18,7 @@ with Video("sign.mp4") as video:                      # a path, a URL, bytes, or
     frames, indices = video.read()                    # (N, H, W, 3) uint8 RGB, and each frame's index
     window = video.read(30, 60).frames                # frames 30..59
     second = video.read(1.0, 2.0, seconds=True)       # the frames timed in [1 s, 2 s)
-    small = video.read(fps=15, keep_last=True, size=(256, 256))
+    small = video.read(fps=15, size=(256, 256))
     for frame in video.frames(fps=15):                # the same arguments, decoded as you go
         ...
 ```
@@ -56,8 +56,8 @@ space, raises the `OSError` it is.
 | Argument | Meaning |
 |---|---|
 | `start`, `stop` | Frame indices, `stop` excluded. With `seconds=True`, times: the frames timestamped in `[start, stop)`. |
-| `fps` | Drop frames down to about this rate. Never repeats a frame; always keeps the first. |
-| `keep_last` | With `fps`, also keep the last frame of the range, which `fps` drops when it falls between steps. |
+| `fps` | Drop frames down to about this rate. Never repeats a frame; keeps the first and the last of the range. |
+| `keep_last` | `False` lets `fps` drop the last frame when it falls between steps. |
 | `size` | `(width, height)` as displayed. Resized before the RGB conversion. |
 | `format` | The arrays' pixel format: `"rgb24"` by default, `"gray"` for `(H, W)`, `"rgba"` for `(H, W, 4)`. |
 | `indices` | `frames()` and `chapter_frames()` only: yield `(array, index)` pairs. `read()` always returns the indices. |
@@ -91,7 +91,7 @@ written = write_chapters("source.mp4", "cropped.mkv", [
 ])
 
 with Video("cropped.mkv") as video:
-    video.chapters                                    # [Chapter(id, start, end, source, payload), ...]
+    video.chapters                                    # [Chapter(id, start, end, source, frames, payload), ...]
     video.read(30, 90)                                # the first chapter, by source frame index
     for chapter, frames in video.chapter_frames(fps=15, size=(256, 256)):
         ...                                           # one decode, so it works on a stream
@@ -100,8 +100,9 @@ with Video("cropped.mkv") as video:
 `box` is `(left, top, right, bottom)` in displayed pixels and may reach past the frame, which pads with black. Sizes
 must be multiples of 16. A clip running past the source's last frame is cut there; `write_chapters` returns what it
 wrote. Chapters of different sizes need `size=` to be read as one batch. `fps` treats each chapter as its own range in
-every read: it starts over on each chapter's first frame, and `keep_last` keeps each chapter's last. A video without
-chapters yields `(None, frames)` once from `chapter_frames`.
+every read: it starts over on each chapter's first frame and keeps each chapter's last. `chapter.frames` is the range
+of source frames a chapter holds. A chapter without frames is left out of `chapter_frames`, and a video without
+chapters yields `(None, frames)` once.
 
 Only chapters this library wrote count. Chapters may touch: `[0, 60)` and `[60, 120)` is a valid file. What is
 refused is a chapter stored at another time than its source's, as 0.x wrote them before 0.10 (source frames 90-119

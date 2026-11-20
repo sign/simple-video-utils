@@ -50,7 +50,7 @@ def test_a_slice_keeps_its_sources_clock_and_reads_like_it(tmp_path):
     clip = b"".join(VideoSlice(source, 2 / 30, 3.0))
     with Video(clip) as video:
         assert video.stream.time_base == Fraction(1, 1000)
-        assert numbers(video.read(fps=15).frames) == list(range(2, 90, 2))
+        assert numbers(video.read(fps=15).frames) == [*range(2, 90, 2), 89]
         assert len(video.read(fps=30).frames) == 88, "the source's own rate drops nothing"
         assert windows(video, range(88)) == [[index] for index in range(88)]
     assert numbers(read(b"".join(VideoSlice(clip, 2 / 30, 10 / 30)))) == list(range(4, 12))

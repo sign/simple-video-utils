@@ -53,6 +53,7 @@ class Chapter(NamedTuple):
     start: Fraction  # seconds in this file
     end: Fraction
     source: Fraction  # where `start` sits on the video this was cut from: the same, except in a slice
+    frames: range  # the source's frame indices it holds
     payload: dict
 
 
@@ -122,7 +123,8 @@ def _pick(items: Iterable[tuple], fps: float, keep_last: bool) -> Iterator[tuple
     """Thin frames out to about `fps`: the first of each 1/fps bucket, counted from each chapter's first frame.
 
     Frames are dropped, never repeated, so a target at or above the source rate keeps them all. `keep_last` also
-    keeps the last frame of each chapter, which would otherwise be dropped when it shares a bucket.
+    keeps the last frame of each chapter, which is dropped otherwise when it shares a bucket: a sign's last frame
+    matters more than an even step.
     """
     anchor = bucket = dropped = current = None
     for item in items:
@@ -220,6 +222,8 @@ class Video:
             raise InvalidVideoError(f"Failed to open video: it has no {'decoder for its ' * bool(streams)}video stream")
         self.stream = streams[0]
         self.stream.thread_type = thread_type
+        if thread_type == "NONE":
+            self.stream.codec_context.thread_count = 1  # libdav1d (AV1) goes by the count alone, and starts 12 threads
         # the header's: the decoder moves the stream's own size to each frame it decodes, and chapters differ in size
         self._stored = self.stream.width, self.stream.height
 
@@ -282,12 +286,15 @@ class Video:
                     end = min(end, start + (payload["end_frame"] - payload["start_frame"]) / rate)
             except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError, RecursionError):
                 continue  # an ordinary marker: its title is not our JSON
-            found.append(Chapter(chapter["id"], start, end, source, payload))
+            first = round(source * rate)
+            held = range(first, first + round((end - start) * rate))
+            found.append(Chapter(chapter["id"], start, end, source, held, payload))
             # how far the file's clock runs from the source's, in frames: nothing in a whole file (a Matroska payload
             # tag), one amount throughout a slice (an MP4 title). A packed file closes its gaps, so it drifts.
             base = 0 if "payload" in tags else found[0].source - found[0].start
             if abs(source - start - base) * rate > Fraction(1, 2):
-                raise PackedChaptersError("chapters are packed back to back; rewrite with version 1.0 or later")
+                raise PackedChaptersError("this video stores its chapters at other times than their source's, a layout "
+                                          "from before simple-video-utils 0.10 that is no longer read: write it again")
         if any(c.end <= c.start for c in found) or any(a.end > b.start for a, b in pairwise(found)):
             raise ValueError("chapters must not overlap and must have positive duration")
         return found
@@ -357,7 +364,7 @@ class Video:
             header = sum(not entry.is_discard for entry in entries) or None
         if self.chapters:
             # what the chapters hold: the file's clock also runs through the gaps between them
-            frames = sum(round((c.end - c.start) * fps) for c in self.chapters)
+            frames = sum(len(c.frames) for c in self.chapters)
         else:
             unsure = not stream.average_rate or (header and expected is not None and abs(header - expected) > 1)
             frames = self._decoded[1] if unsure else None
@@ -369,11 +376,9 @@ class Video:
         width, height = self._stored[::-1] if self.rotation % 180 == 90 else self._stored
         return VideoMetadata(width, height, fps, frames, str(stream.time_base), duration, self.rotation)
 
-    def _range(self, start, stop, seconds, fps, size, keep_last=False) -> tuple:
+    def _range(self, start, stop, seconds, fps, size) -> tuple:
         if fps is not None and fps <= 0:
             raise ValueError("fps must be positive")
-        if keep_last and fps is None:
-            raise ValueError("keep_last only applies with fps")
         if size is not None and (len(size) != 2 or min(map(operator.index, size)) <= 0):
             raise ValueError("size must be two positive integers, (width, height)")
         if seconds:  # a negative start reads from the beginning: padded windows are common
@@ -460,24 +465,24 @@ class Video:
         items = self._decode(start, stop, seconds)
         return _rgb(_pick(items, fps, keep_last) if fps else items, size, self.rotation, format)
 
-    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None, format="rgb24",
+    def frames(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=True, size=None, format="rgb24",
                indices=False) -> Iterator:
         """RGB (H, W, 3) uint8 arrays for frames [start, stop), decoded as they are asked for.
 
         `seconds=True` takes times instead of frame indices, and selects by each frame's own timestamp. `fps` drops
-        frames down to about that rate; it always keeps the first frame, and with `keep_last=True` the last one too.
+        frames down to about that rate; it keeps the first frame and the last, unless `keep_last=False`.
         `size` is (width, height) as displayed. `format` is the pixel format of the arrays: "gray" gives (H, W),
         "rgba" (H, W, 4). `indices=True` yields (array, frame index) pairs. In a file with chapters, indices and
         times are the source's, so the frames between chapters are skipped, not renumbered, and `fps` treats each
         chapter as its own range. A stream that cannot seek is read once.
         """
-        start, stop = self._range(start, stop, seconds, fps, size, keep_last)
+        start, stop = self._range(start, stop, seconds, fps, size)
         return _items(self._frames(start, stop, seconds, fps, size, keep_last, format), indices)
 
-    def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=False, size=None,
+    def read(self, start=0, stop=None, *, seconds=False, fps=None, keep_last=True, size=None,
              format="rgb24") -> Frames:
         """`frames()` as one batch: (frames, indices). Raises ValueError when the range is empty."""
-        start, stop = self._range(start, stop, seconds, fps, size, keep_last)
+        start, stop = self._range(start, stop, seconds, fps, size)
         # The header's count, else an estimate: it only sizes the batch. A read up to a `stop` decodes nothing to
         # measure a rate the header lacks; an open-ended one decodes the whole file anyway, and an exact batch saves
         # a copy of it.
@@ -496,16 +501,20 @@ class Video:
         frames = stack_frames((numbers.append(i) or a for i, _, a in frames), hint)
         return Frames(frames, np.array(numbers, dtype=np.int64))
 
-    def chapter_frames(self, fps=None, size=None, keep_last=False, format="rgb24",
+    def chapter_frames(self, fps=None, size=None, keep_last=True, format="rgb24",
                        indices=False) -> Iterator[tuple[Chapter | None, Iterator]]:
         """(chapter, its RGB frames) per chapter, from one decode, so it works on a stream that cannot seek.
 
-        The frames are arrays, or (array, index) pairs with `indices=True`, as from `frames()`. A file without
-        chapters yields (None, frames) once. Each iterator ends when the next chapter is asked for.
+        The frames are arrays, or (array, index) pairs with `indices=True`, as from `frames()`. A chapter without
+        frames is left out. A file without chapters yields (None, frames) once, whatever it holds. Each iterator
+        ends when the next chapter is asked for.
         """
-        frames = self._frames(*self._range(0, None, False, fps, size, keep_last), False, fps, size, keep_last, format)
+        frames = self._frames(*self._range(0, None, False, fps, size), False, fps, size, keep_last, format)
+        if not self.chapters:
+            yield None, _items(frames, indices)
+            return
         for number, group in groupby(frames, key=operator.itemgetter(1)):
-            yield (None if number is None else self.chapters[number]), _items(group, indices)
+            yield self.chapters[number], _items(group, indices)
 
     @property
     def codec(self) -> str:
