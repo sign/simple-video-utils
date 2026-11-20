@@ -7,6 +7,7 @@ import struct
 import sys
 import tempfile
 import threading
+import warnings
 from fractions import Fraction
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from simple_video_utils import (
     VideoError,
     VideoMetadata,
     stack_frames,
+    unpack_chapters,
     video_metadata,
     write_video,
 )
@@ -394,18 +396,43 @@ def test_fps_starts_over_in_each_chapter_and_keeps_its_last_frame(gapped):
         assert stepped == [*range(0, 20, 2), *range(45, 80, 2), *range(100, 128, 2)]
 
 
-def test_packed_chapters_are_refused(tmp_path):
-    # before 0.10 chapters played back to back: here source frames 30-59 and 90-119 sit at 0-1 s and 1-2 s
+@pytest.fixture
+def packed(tmp_path) -> Path:
+    # as 0.x wrote before 0.10, chapters back to back: source frames 30-59 and 90-119 sit at 0-1 s and 1-2 s
     path = Path(shutil.copy(EXAMPLE, tmp_path / "packed.mkv"))
     _replace_chapters(path, [
-        {"id": i, "start": i * 1000, "end": (i + 1) * 1000, "time_base": Fraction(1, 1000),
-         "metadata": {"payload": json.dumps({"start_frame": start, "end_frame": start + 30})}}
+        {"id": i + 1, "start": i * 1000, "end": (i + 1) * 1000, "time_base": Fraction(1, 1000),
+         "metadata": {"payload": json.dumps({"start_frame": start, "end_frame": start + 30, "who": "signer"})}}
         for i, start in enumerate((30, 90))])
-    with Video(path) as video, pytest.raises(PackedChaptersError, match="other times than their source"):
-        video.read()
-    with pytest.raises(PackedChaptersError):
-        video_metadata(str(path))
+    return path
+
+
+def test_a_packed_file_is_converted_in_place_when_opened_by_its_path(packed, full):
+    with pytest.warns(UserWarning, match="converting the file in place"), Video(packed) as video:
+        frames, indices = video.read()
+    assert indices.tolist() == [*range(30, 60), *range(90, 120)]
+    assert np.array_equal(frames, full[:60]), "the same pictures, each now at its source's time"
+    converted = packed.read_bytes()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # it is converted once: the second open has nothing to warn about
+        with Video(packed) as video:
+            assert [(c.id, float(c.start), float(c.end), c.payload["who"]) for c in video.chapters] == [
+                (1, 1, 2, "signer"), (2, 3, 4, "signer")]
+            assert video.meta.nb_frames == 60
+        unpack_chapters(packed)
+    assert packed.read_bytes() == converted, "a file that keeps source time is left alone"
+
+
+def test_a_packed_video_that_cannot_be_rewritten_is_refused(packed):
     assert issubclass(PackedChaptersError, ValueError)
+    with pytest.raises(PackedChaptersError, match="unpack_chapters"):  # bytes have no file to rewrite
+        Video(packed.read_bytes())
+    packed.parent.chmod(0o555)
+    try:
+        with pytest.warns(UserWarning, match="converting"), pytest.raises(PackedChaptersError, match="in place: "):
+            video_metadata(packed)
+    finally:
+        packed.parent.chmod(0o755)
 
 
 # ordinary markers, and titles that only look like ours: a title is anyone's text

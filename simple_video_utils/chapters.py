@@ -2,7 +2,8 @@
 
 import json
 import os
-from collections.abc import Iterator, Sequence
+from bisect import bisect_right
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from itertools import chain, islice, pairwise
@@ -12,7 +13,7 @@ from tempfile import TemporaryDirectory
 import av
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.video import Video, refusing, rotation_filters
+from simple_video_utils.video import PACKED, PackedChaptersError, Video, chapter_table, refusing, rotation_filters
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -101,14 +102,19 @@ def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to
     return written
 
 
-def _table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
+def _mark(number: int, start_frame: int, end_frame: int, payload: dict, rate: Fraction) -> dict:
     # each chapter states the rate: the header's comes back from Matroska rounded, and frame numbers drift with it
-    return [{"id": number, "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
-             "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)), "time_base": Fraction(1, 1000),
-             "metadata": {"payload": json.dumps(asdict(clip)), "rate": str(rate)}} for number, clip in enumerate(clips)]
+    start, end = (int(frame * 1000 / rate + Fraction(1, 2)) for frame in (start_frame, end_frame))
+    return {"id": number, "start": start, "end": end, "time_base": Fraction(1, 1000),
+            "metadata": {"payload": json.dumps(payload), "rate": str(rate)}}
 
 
-def _replace_chapters(path: Path, chapters: list[dict]) -> None:
+def _table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
+    return [_mark(number, clip.start_frame, clip.end_frame, asdict(clip), rate) for number, clip in enumerate(clips)]
+
+
+def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Packet], int] = lambda packet: 0) -> None:
+    """Copy the file's packets under a new chapter table, each `moved(packet)` ticks later."""
     # staged beside the output, so the replacement stays on one filesystem
     with TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as directory:
         staged = Path(directory) / path.name
@@ -117,9 +123,37 @@ def _replace_chapters(path: Path, chapters: list[dict]) -> None:
             track = output.add_stream_from_template(source.streams.video[0])
             for packet in source.demux(video=0):
                 if packet.size:  # the empty one only flushes
-                    packet.stream = track
+                    move = moved(packet)
+                    packet.pts, packet.stream = packet.pts + move, track
+                    if packet.dts is not None:
+                        packet.dts += move
                     output.mux(packet)
         staged.replace(path)
+
+
+def unpack_chapters(path: str | os.PathLike) -> None:
+    """Rewrite a Matroska file from before 0.10 where it lies, so that each chapter sits at its source time.
+
+    Transitional. Packets are copied and nothing is encoded, so the frames are the same and it takes milliseconds.
+    A file that already keeps source time is left alone.
+    """
+    with av.open(os.fspath(path)) as source:
+        chapters, packed = chapter_table(source)
+        stream = source.streams.video[0]
+        rate, clock = Fraction(stream.average_rate or 1), stream.time_base
+        matroska = source.format.name.startswith("matroska")
+    if not packed:
+        return
+    if not matroska:
+        raise PackedChaptersError(f"{path} has {PACKED}, and only a Matroska file can be converted")
+    table = [_mark(c.id, c.frames.start, c.frames.stop, c.payload, rate) for c in chapters]
+    starts = [c.start for c in chapters]
+    moves = [round((Fraction(mark["start"], 1000) - c.start) / clock) for mark, c in zip(table, chapters, strict=True)]
+
+    def moved(packet: av.Packet) -> int:  # by the chapter it sat in, with the reader's half frame of slack
+        return moves[max(bisect_right(starts, packet.pts * clock + Fraction(1, 2) / rate) - 1, 0)]
+
+    _replace_chapters(Path(path), table, moved)
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:

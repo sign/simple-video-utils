@@ -8,6 +8,7 @@ import os
 import ssl
 import struct
 import sys
+import warnings
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
@@ -90,7 +91,52 @@ def quiet() -> None:
 
 
 class PackedChaptersError(ValueError):
-    """The file plays its chapters back to back, as 0.x could write them. Only gapped files are read."""
+    """The video keeps its chapters at other times than their source's, as 0.x wrote them before 0.10."""
+
+
+PACKED = "chapters stored at other times than their source's, the layout from before simple-video-utils 0.10"
+
+
+def chapter_table(container: av.container.InputContainer) -> tuple[list[Chapter], bool]:
+    """(the chapters this library wrote, in order; whether they are packed). Other markers are not chapters here."""
+    found, packed = [], False
+    for chapter in sorted(container.chapters(), key=lambda c: c["start"] * c["time_base"]):
+        tags = {key.lower(): value for key, value in chapter["metadata"].items()}
+        start, end = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
+        try:
+            payload = json.loads(tags.get("payload") or tags.get("title") or "")  # MP4 keeps only a title
+            stated = payload.get("rate") or tags.get("rate")  # in an MP4 title, or beside a Matroska payload
+            if (rate := Fraction(stated or container.streams.video[0].average_rate)) <= 0:
+                continue
+            source = Fraction(payload["start_frame"]) / rate
+            if "end_frame" in payload and "payload" not in tags:
+                # MP4 ends a chapter where the next one starts, gap included; Matroska keeps the real end
+                end = min(end, start + (payload["end_frame"] - payload["start_frame"]) / rate)
+        except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError, RecursionError):
+            continue  # an ordinary marker: its title is not our JSON
+        first = round(source * rate)
+        held = range(first, first + round((end - start) * rate))
+        found.append(Chapter(chapter["id"], start, end, source, held, payload))
+        # how far the file's clock runs from the source's, in frames: nothing in a whole file (a Matroska payload
+        # tag), one amount throughout a slice (an MP4 title). A packed file closes its gaps, so it drifts.
+        base = 0 if "payload" in tags else found[0].source - found[0].start
+        packed = packed or abs(source - start - base) * rate > Fraction(1, 2)
+    if any(c.end <= c.start for c in found) or any(a.end > b.start for a, b in pairwise(found)):
+        raise ValueError("chapters must not overlap and must have positive duration")
+    return found, packed
+
+
+def _unpack(src) -> None:
+    """Transitional, for the files stored before 0.10: a packed file is rewritten where it lies, when it is a file."""
+    if not (isinstance(src, str) and os.path.isfile(src)):
+        raise PackedChaptersError(f"this video has {PACKED}, which is no longer read: convert the file with "
+                                  "simple_video_utils.unpack_chapters(path), or open it by its path")
+    warnings.warn(f"{src} has {PACKED}: converting the file in place", stacklevel=3)
+    from simple_video_utils.chapters import unpack_chapters  # noqa: PLC0415 - chapters.py imports this module
+    try:
+        unpack_chapters(src)
+    except (OSError, av.FFmpegError) as e:  # a read-only mount, or packets that cannot be moved
+        raise PackedChaptersError(f"{src} has {PACKED}, and could not be converted in place: {e}") from e
 
 
 def _open(src, **options) -> av.container.InputContainer:
@@ -224,6 +270,12 @@ class Video:
         self.stream.thread_type = thread_type
         if thread_type == "NONE":
             self.stream.codec_context.thread_count = 1  # libdav1d (AV1) goes by the count alone, and starts 12 threads
+        # The chapters this library wrote, in order. Other chapter markers are not chapters here.
+        self.chapters, packed = chapter_table(self.container)
+        if packed:
+            self.close()
+            _unpack(src)
+            self.__init__(src, thread_type, buffer_size, format, container_options)
         # the header's: the decoder moves the stream's own size to each frame it decodes, and chapters differ in size
         self._stored = self.stream.width, self.stream.height
 
@@ -267,37 +319,6 @@ class Video:
         if stream.duration:
             return float(stream.duration * stream.time_base)
         return self.container.duration / av.time_base if self.container.duration else None
-
-    @cached_property
-    def chapters(self) -> list[Chapter]:
-        """The chapters this library wrote, in order. Other chapter markers are not chapters here."""
-        found = []
-        for chapter in sorted(self.container.chapters(), key=lambda c: c["start"] * c["time_base"]):
-            tags = {key.lower(): value for key, value in chapter["metadata"].items()}
-            start, end = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
-            try:
-                payload = json.loads(tags.get("payload") or tags.get("title") or "")  # MP4 keeps only a title
-                stated = payload.get("rate") or tags.get("rate")  # in an MP4 title, or beside a Matroska payload
-                if (rate := Fraction(stated or self.stream.average_rate)) <= 0:
-                    continue
-                source = Fraction(payload["start_frame"]) / rate
-                if "end_frame" in payload and "payload" not in tags:
-                    # MP4 ends a chapter where the next one starts, gap included; Matroska keeps the real end
-                    end = min(end, start + (payload["end_frame"] - payload["start_frame"]) / rate)
-            except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError, RecursionError):
-                continue  # an ordinary marker: its title is not our JSON
-            first = round(source * rate)
-            held = range(first, first + round((end - start) * rate))
-            found.append(Chapter(chapter["id"], start, end, source, held, payload))
-            # how far the file's clock runs from the source's, in frames: nothing in a whole file (a Matroska payload
-            # tag), one amount throughout a slice (an MP4 title). A packed file closes its gaps, so it drifts.
-            base = 0 if "payload" in tags else found[0].source - found[0].start
-            if abs(source - start - base) * rate > Fraction(1, 2):
-                raise PackedChaptersError("this video stores its chapters at other times than their source's, a layout "
-                                          "from before simple-video-utils 0.10 that is no longer read: write it again")
-        if any(c.end <= c.start for c in found) or any(a.end > b.start for a, b in pairwise(found)):
-            raise ValueError("chapters must not overlap and must have positive duration")
-        return found
 
     @cached_property
     def _spans(self) -> tuple[list, list, list]:
