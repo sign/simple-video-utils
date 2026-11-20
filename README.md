@@ -124,10 +124,10 @@ clip = VideoSlice("cropped.mkv", 2.0, 8.0)                 # a path or bytes; no
 clip.size, clip.duration                              # measured without keeping the clip
 for chunk in clip:                                    # MP4 bytes, about 64 KiB at a time; iterate again to replay
     ...
-data = b"".join(clip)
+data = clip.read()                                    # or the whole clip at once
 ```
 
-A slice copies packets, so it is lossless and fast, and never holds the clip in memory. The MP4 puts `moov` first, so
+A slice copies packets, so it is lossless and fast, and iterating it never holds the clip in memory. The MP4 puts `moov` first, so
 it can be read from a pipe. It starts on its first frame and keeps the frames from the keyframe before it, hidden
 behind an edit list. With B-frames it also keeps the later frames its last ones are predicted from, and those stay
 visible: a few frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it

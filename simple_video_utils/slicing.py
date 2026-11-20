@@ -142,6 +142,10 @@ class VideoSlice:
         self._measure()
         return self._duration
 
+    def read(self) -> bytes:
+        """The whole clip."""
+        return b"".join(self)
+
     def _measure(self) -> None:
         if self._size is None:
             chunks = iter(self)
