@@ -42,7 +42,9 @@ is no rate.
 
 Whatever PyAV refuses, opening, decoding or writing, raises `VideoError`, a `RuntimeError`. When the data itself is
 not a video (garbage, a file cut off inside its header, no video stream, a codec with no decoder) it is an
-`InvalidVideoError`, a `VideoError`. A file cut off between frames is a shorter video, and reads as one. Arguments that
+`InvalidVideoError`, a `VideoError`. A file cut off between frames is a shorter video, and reads as one; cut off
+inside a frame, it raises with `thread_type="NONE"` or `"SLICE"` and reads as a shorter video with the default,
+because FFmpeg's frame threads drop that error. Arguments that
 make no sense raise `ValueError` or `TypeError`. A destination that cannot be written, for want of a directory or of
 space, raises the `OSError` it is.
 
@@ -101,8 +103,9 @@ wrote. Chapters of different sizes need `size=` to be read as one batch. `fps` t
 every read: it starts over on each chapter's first frame, and `keep_last` keeps each chapter's last. A video without
 chapters yields `(None, frames)` once from `chapter_frames`.
 
-Only chapters this library wrote count. Files written before 1.0 that play their chapters back to back raise
-`PackedChaptersError` (a `ValueError`) on any read: write them again.
+Only chapters this library wrote count. Chapters may touch: `[0, 60)` and `[60, 120)` is a valid file. What is
+refused is a chapter stored at another time than its source's, as 0.x wrote them before 0.10 (source frames 90-119
+stored at 1-2 s): such a file raises `PackedChaptersError` (a `ValueError`) on any read. Write it again.
 
 ## Slices
 
