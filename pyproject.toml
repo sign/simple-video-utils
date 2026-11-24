@@ -7,9 +7,9 @@ authors = [
 ]
 license = {text = "MIT"}
 readme = "README.md"
-requires-python = ">=3.12" # PyAV 19 dropped 3.11
+requires-python = ">=3.12" # PyAV 19 needs 3.12
 dependencies = [
-    "av>=19.0.0",
+    "av>=19.0.0", # the display matrix in the stream header, without decoding a frame
     "certifi", # HTTPS trust roots when Python has no default CA file (e.g. standalone builds)
     "numpy",
 ]
@@ -18,7 +18,6 @@ dependencies = [
 dev = [
     "ruff",
     "pytest",
-    "pytest-xdist", # For parallel test execution
 ]
 
 [tool.ruff]
@@ -36,7 +35,6 @@ select = [
     "B", # flake8-bugbear
     "PT", # flake8-pytest-style
     "BLE", # flake8-blind-except
-    "TRY", # tryceratops
 ]
 
 [tool.pytest.ini_options]

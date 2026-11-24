@@ -10,25 +10,14 @@ on:
 
 jobs:
   test:
-    name: Test (Python ${{ matrix.python-version }}, PyAV ${{ matrix.pyav }})
+    name: Test (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - python-version: "3.12"
-            pyav: "19"
-          - python-version: "3.13"
-            pyav: "19"
-
+        python-version: ["3.12", "3.14"]
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
-      - name: Verify ffprobe
-        run: ffprobe -version
 
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
@@ -38,7 +27,7 @@ jobs:
           activate-environment: true
 
       - name: Install dependencies
-        run: uv pip install ".[dev]" "av==${{ matrix.pyav }}.*"
+        run: uv pip install ".[dev]"
 
       - name: Test Code
-        run: python -m pytest -n auto --dist loadscope
+        run: python -m pytest

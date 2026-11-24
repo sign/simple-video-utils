@@ -1,28 +1,19 @@
-"""Store rectangular crops and time trims as chapters of one Matroska video."""
+"""Write crops and trims of a video as the chapters of one Matroska file, each frame at its place on the source."""
 
 import json
-import operator
-from collections.abc import Iterator, Sequence
+import os
+from bisect import bisect_right
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from itertools import chain, islice, pairwise
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import BinaryIO
 
 import av
-import numpy as np
 from av.video.reformatter import ColorRange
 
-from simple_video_utils.frames import (
-    FrameSize,
-    _rotation_filters,
-    _select_frames_by_fps,
-    _validate_fps,
-    read_frames_from_stream,
-)
-from simple_video_utils.metadata import _decoded_rate_and_count, _open_video
-from simple_video_utils.timeline import _source_start
+from simple_video_utils.video import PACKED, PackedChaptersError, Video, chapter_table, refusing, rotation_filters
 
 # pixels kept around a padded crop before its 4:4:4 conversion, past the reach of FFmpeg's chroma upsampling filter, so
 # the crop's chroma comes out as if the whole frame had been converted
@@ -45,205 +36,124 @@ class ChapterClip:
         return self.resolution or (right - left, bottom - top)
 
 
-def list_chapters(src: str | Path | BinaryIO | av.container.InputContainer) -> Iterator[dict]:
-    """Yield PyAV chapter dictionaries (start/end ticks, time_base and metadata)."""
-    if isinstance(src, av.container.InputContainer):
-        yield from src.chapters()
-        return
-    with _open_video(str(src) if isinstance(src, Path) else src) as container:
-        yield from container.chapters()
-
-
-def read_chapters(
-    src: str | Path | BinaryIO, *, fps: float | None = None, size: FrameSize | None = None,
-) -> Iterator[tuple[dict | None, Fraction, Iterator[np.ndarray]]]:
-    """Yield (native chapter, source start seconds, RGB frame iterator) from one continuous video decode.
-
-    Accepts files and incoming streams whose chapter table precedes the media. Consume each frame iterator
-    before advancing to the next chapter. Frames use half-open chapter times, without estimating indices from
-    average FPS, so non-keyframe boundaries and variable cadence work. Native resize and FPS selection are
-    shared with the frame readers; FPS selection restarts per chapter. Use ``stack_frames(frames)`` for a batch.
-
-    Chapters must not overlap and must have positive duration. A file without chapters yields one iterator
-    with chapter None and source start 0. Source starts default to native times; an optional writer payload
-    maps them to the original source timeline. No intermediate clips are produced.
-    """
-    _validate_fps(fps)
-    if size is not None and not isinstance(size, FrameSize):
-        message = "size must be a FrameSize"
-        raise TypeError(message)
-
-    def select(frames):
-        selected = _select_frames_by_fps(frames, fps, get_frame=operator.itemgetter(1)) if fps is not None else frames
-        return (array for array, _ in selected)
-
-    with _open_video(str(src) if isinstance(src, Path) else src) as container:
-        stream = container.streams.video[0]
-        found = sorted(list_chapters(container), key=lambda chapter: chapter["start"] * chapter["time_base"])
-        if any(chapter["end"] <= chapter["start"] for chapter in found) or any(
-            left["end"] * left["time_base"] > right["start"] * right["time_base"]
-            for left, right in pairwise(found)
-        ):
-            message = "chapters must not overlap and must have positive duration"
-            raise ValueError(message)
-        _, decoded = read_frames_from_stream(
-            container, size=size, fps=None if found else fps, return_frame_metadata=bool(found),
-        )
-        if not found:
-            yield None, Fraction(0), decoded
-            return
-        frame = next(decoded, None)
-        for chapter in found:
-            low, high = (chapter[key] * chapter["time_base"] for key in ("start", "end"))
-
-            def chapter_frames(low=low, high=high):
-                nonlocal frame
-                while frame is not None:
-                    time = frame[1].time
-                    if time is not None and time >= high:
-                        break
-                    if time is not None and time >= low:
-                        yield frame
-                    frame = next(decoded, None)
-
-            yield chapter, _source_start(chapter, stream.average_rate), select(chapter_frames())
-
-
-def write_chapters(
-    src: str | Path,
-    out: str | Path,
+@refusing("Failed to write chapters", keep=OSError)
+def write_chapters(  # noqa: C901 - the checks and the cleanup read best next to the write they guard
+    src: str | os.PathLike,
+    out: str | os.PathLike,
     clips: Sequence[ChapterClip],
     *,
     crf: int = 23,
     preset: str = "medium",
-    thread_type: str = "AUTO",
-    trim_to_source: bool = False,
 ) -> list[ChapterClip]:
-    """Write crops and trims on the source timeline without filler frames, returning the clips written.
+    """Write `clips` as H.264 chapters of the Matroska file `out`, and return the clips written.
 
-    Output must not exist, and a failed write removes it. Coordinates refer to the displayed frame, rotation applied,
-    as ``video_metadata`` and the frame readers report it, and a rotated source's chapters come out upright.
-    Each chapter stores its source specification in a JSON ``payload`` tag.
-    ``preset`` is the x264 preset, x264's own by default. ``thread_type`` is PyAV's for decoding the source ("AUTO",
-    "FRAME", "SLICE" or "NONE"); the frames do not change.
-    By default, clips extending past the last decoded frame raise ValueError. With ``trim_to_source=True``,
-    shorten them to the available frames and drop clips starting past the source. If none remain, raise ValueError.
-    Returned clips, chapter times and payloads all describe the frames actually written.
+    Frame i is written at i / rate, its source time when the source keeps one rate, so the stretches between clips
+    hold no frames. Boxes are in displayed pixels
+    (rotation applied) and may reach past the frame, which pads with black. Each chapter stores its clip as a JSON
+    `payload` tag, and the frame rate beside it. A clip running past the last frame the source decodes is cut there, and
+    later ones are dropped. `out` must not exist; a failed write removes it.
     """
-    # clips are checked before the source is decoded or the output created, so a bad clip costs nothing
     if not clips:
-        message = "write_chapters needs at least one clip"
-        raise ValueError(message)
+        raise ValueError("write_chapters needs at least one clip")
     if any(left.end_frame > right.start_frame for left, right in pairwise(clips)):
-        message = "clips must be in source order and must not overlap"
-        raise ValueError(message)
+        raise ValueError("clips must be in source order and must not overlap")
     for clip in clips:
         left, top, right, bottom = clip.box
         if not 0 <= clip.start_frame < clip.end_frame or left >= right or top >= bottom:
-            message = f"clip needs 0 <= start_frame < end_frame and a non-empty box: {clip}"
-            raise ValueError(message)
-        width, height = clip.size
-        if width % 16 or height % 16:
-            message = "H.264 chapter width and height must be multiples of 16"
-            raise ValueError(message)
-    with _open_video(str(src)) as source:
-        stream = source.streams.video[0]
-        # AUTO decodes single-slice H.264 frames in parallel, where FFmpeg's slice threading keeps one core busy
-        stream.thread_type = thread_type
-        # browser-recorded WebM has no average rate, and its guessed rate is the time base's reciprocal, so the
-        # cadence comes from decoding the whole stream, which then rewinds
-        rate = stream.average_rate or Fraction(_decoded_rate_and_count(source)[0] or 0).limit_denominator(1001)
+            raise ValueError(f"clip needs 0 <= start_frame < end_frame and a non-empty box: {clip}")
+        if clip.size[0] % 16 or clip.size[1] % 16:
+            raise ValueError("H.264 chapter width and height must be multiples of 16")
+    with Video(src) as video:
+        rate = video.rate
         if not rate:
-            message = "Video has no frame rate information"
-            raise ValueError(message)
+            raise ValueError("Video has no frame rate information")
         with open(out, "xb") as file:
             try:
-                with av.open(file, mode="w", format="matroska") as destination:
-                    destination.set_chapters(_chapter_table(clips, rate))
+                with av.open(file, mode="w", format="matroska") as output:
+                    output.set_chapters(_table(clips, rate))
                     width, height = clips[0].size
-                    # The muxer takes the header (avcC) from the first clip's packets.
-                    track = destination.add_mux_stream("h264", rate=rate, width=width, height=height)
-                    decoded = source.decode(stream)
-                    # PyAV reports the display-matrix rotation on decoded frames only
-                    first = next(decoded, None)
-                    rotation = 0 if first is None else first.rotation % 360
-                    decoded = chain(() if first is None else (first,), decoded)
-                    written = _write_clips(
-                        stream, track, clips, decoded, crf, preset, rate=rate, rotation=rotation,
-                        trim_to_source=trim_to_source,
-                    )
+                    # the muxer takes the stream header (avcC) from the first clip's packets
+                    track = output.add_mux_stream("h264", rate=rate, width=width, height=height)
+                    video.rewind()  # measuring a missing frame rate reads the whole source
+                    decoded = video.container.decode(video.stream)
+                    written, position = [], 0
+                    for clip in clips:
+                        # ponytail: decodes the frames between clips; seek to keyframes if long gaps get slow
+                        frames = islice(decoded, clip.start_frame - position, clip.end_frame - position)
+                        count = _write_clip(video, track, clip, frames, rate, crf, preset)
+                        if count:
+                            written.append(replace(clip, end_frame=clip.start_frame + count))
+                        if count < clip.end_frame - clip.start_frame:
+                            break  # the source ended
+                        position = clip.end_frame
+                if not written:
+                    raise ValueError("every clip starts past the last frame the source decodes")
                 if written != list(clips):
-                    # Matroska writes chapters before the frames reveal the source's actual end.
+                    # Matroska writes chapters ahead of the frames, before the source's real end is known
                     file.close()
-                    _remux_with_chapters(Path(out), _chapter_table(written, rate))
+                    _replace_chapters(Path(out), _table(written, rate))
             except BaseException:
-                # a trim past the source's end, an unencodable pixel format or an interrupt leaves a truncated MKV,
-                # which "xb" would then refuse to overwrite on retry
-                file.close()
-                Path(out).unlink()
+                # anything, an interrupt included, leaves a truncated file that "xb" would refuse to overwrite on retry
+                try:
+                    file.close()  # flushes, so it raises again when the device refused the bytes
+                finally:
+                    Path(out).unlink()
                 raise
-
     return written
 
 
-def _write_clips(
-    source: av.VideoStream,
-    track: av.VideoStream,
-    clips: Sequence[ChapterClip],
-    decoded: Iterator[av.VideoFrame],
-    crf: int,
-    preset: str,
-    rate: Fraction,
-    rotation: int,
-    trim_to_source: bool,
-) -> list[ChapterClip]:
-    written = []
-    source_end = 0
-    for clip in clips:
-        # shortcut: decodes gaps too; add keyframe seeking if long gaps matter.
-        frames = islice(decoded, clip.start_frame - source_end, clip.end_frame - source_end)
-        count = _write_clip(source, track, clip, frames, crf, preset, rate=rate, rotation=rotation)
-        short = count < clip.end_frame - clip.start_frame
-        if short and not trim_to_source:
-            message = f"source is shorter than requested clip: {clip}"
-            raise ValueError(message)
-        if count:
-            written.append(replace(clip, end_frame=clip.start_frame + count))
-        if short:
-            break
-        source_end = clip.end_frame
-    if not written:
-        message = "every clip starts past the last frame the source decodes"
-        raise ValueError(message)
-    return written
+def _mark(number: int, start_frame: int, end_frame: int, payload: dict, rate: Fraction) -> dict:
+    # each chapter states the rate: the header's comes back from Matroska rounded, and frame numbers drift with it
+    start, end = (int(frame * 1000 / rate + Fraction(1, 2)) for frame in (start_frame, end_frame))
+    return {"id": number, "start": start, "end": end, "time_base": Fraction(1, 1000),
+            "metadata": {"payload": json.dumps(payload), "rate": str(rate)}}
 
 
-def _chapter_table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
-    return [
-        {
-            "id": index,
-            "start": int(clip.start_frame * 1000 / rate + Fraction(1, 2)),
-            "end": int(clip.end_frame * 1000 / rate + Fraction(1, 2)),
-            "time_base": Fraction(1, 1000), "metadata": {"payload": json.dumps(asdict(clip))},
-        }
-        for index, clip in enumerate(clips)
-    ]
+def _table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
+    return [_mark(number, clip.start_frame, clip.end_frame, asdict(clip), rate) for number, clip in enumerate(clips)]
 
 
-def _remux_with_chapters(path: Path, chapters: list[dict]) -> None:
-    # Stage beside the output so replacement stays on the same filesystem.
+def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Packet], int] = lambda packet: 0) -> None:
+    """Copy the file's packets under a new chapter table, each `moved(packet)` ticks later."""
+    # staged beside the output, so the replacement stays on one filesystem
     with TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as directory:
         staged = Path(directory) / path.name
-        with av.open(str(path)) as source, av.open(str(staged), mode="w", format="matroska") as destination:
-            destination.set_chapters(chapters)
-            stream = source.streams.video[0]
-            track = destination.add_stream_from_template(stream)
-            for packet in source.demux(stream):
-                # Empty packets only flush the decoder; valid packets can have no DTS.
-                if packet.size:
-                    packet.stream = track
-                    destination.mux(packet)
+        with av.open(str(path)) as source, av.open(str(staged), mode="w", format="matroska") as output:
+            output.set_chapters(chapters)
+            track = output.add_stream_from_template(source.streams.video[0])
+            for packet in source.demux(video=0):
+                if packet.size:  # the empty one only flushes
+                    move = moved(packet)
+                    packet.pts, packet.stream = packet.pts + move, track
+                    if packet.dts is not None:
+                        packet.dts += move
+                    output.mux(packet)
         staged.replace(path)
+
+
+def unpack_chapters(path: str | os.PathLike) -> None:
+    """Rewrite a Matroska file from before 0.10 where it lies, so that each chapter sits at its source time.
+
+    Transitional. Packets are copied and nothing is encoded, so the frames are the same and it takes milliseconds.
+    A file that already keeps source time is left alone.
+    """
+    with av.open(os.fspath(path)) as source:
+        chapters, packed = chapter_table(source)
+        stream = source.streams.video[0]
+        rate, clock = Fraction(stream.average_rate or 1), stream.time_base
+        matroska = source.format.name.startswith("matroska")
+    if not packed:
+        return
+    if not matroska:
+        raise PackedChaptersError(f"{path} has {PACKED}, and only a Matroska file can be converted")
+    table = [_mark(c.id, c.frames.start, c.frames.stop, c.payload, rate) for c in chapters]
+    starts = [c.start for c in chapters]
+    moves = [round((Fraction(mark["start"], 1000) - c.start) / clock) for mark, c in zip(table, chapters, strict=True)]
+
+    def moved(packet: av.Packet) -> int:  # by the chapter it sat in, with the reader's half frame of slack
+        return moves[max(bisect_right(starts, packet.pts * clock + Fraction(1, 2) / rate) - 1, 0)]
+
+    _replace_chapters(Path(path), table, moved)
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
@@ -253,93 +163,72 @@ def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
     return (start, end) if end > start else (0, size)
 
 
-def _write_clip(
-    source: av.VideoStream,
-    track: av.VideoStream,
-    clip: ChapterClip,
-    frames: Iterator[av.VideoFrame],
-    crf: int,
-    preset: str,
-    rate: Fraction,
-    rotation: int = 0,
-) -> int:
+def _write_clip(video: Video, track: av.VideoStream, clip: ChapterClip, frames: Iterator[av.VideoFrame],
+                rate: Fraction, crf: int, preset: str) -> int:
+    # decoded before the graph is built: the first frame corrects header colour tags the scale filter would refuse
     first = next(frames, None)
     if first is None:
         return 0
+    source, context, rotation = video.stream, video.stream.codec_context, video.rotation
     graph = av.filter.Graph()
     left, top, right, bottom = clip.box
-    # a rotated source is turned upright first, as FFmpeg autorotates it, then cut like a source stored upright
+    # a rotated source is turned upright first, as FFmpeg autorotates it, then cut like one stored upright
     frame_width, frame_height = source.width, source.height
     if rotation in (90, 270):
         frame_width, frame_height = frame_height, frame_width
-    pixel_format = source.format
-    shifted_chroma = (left % 2 and pixel_format.chroma_width(2) == 1) or (
-        top % 2 and pixel_format.chroma_height(2) == 1
-    )
+    pixels = source.format
+    shifted_chroma = (left % 2 and pixels.chroma_width(2) == 1) or (top % 2 and pixels.chroma_height(2) == 1)
     padding, x, y = [], 0, 0
     outside = left < 0 or top < 0 or right > frame_width or bottom > frame_height
     inside_left, inside_top = max(left, 0), max(top, 0)
     inside_right, inside_bottom = min(right, frame_width), min(bottom, frame_height)
-    step_x, step_y = 4 // pixel_format.chroma_width(4), 4 // pixel_format.chroma_height(4)
-    on_chroma_grid = not (
-        left % step_x or right % step_x or inside_right % step_x
-        or top % step_y or bottom % step_y or inside_bottom % step_y
-    )
+    step_x, step_y = 4 // pixels.chroma_width(4), 4 // pixels.chroma_height(4)
+    on_chroma_grid = not (left % step_x or right % step_x or inside_right % step_x
+                          or top % step_y or bottom % step_y or inside_bottom % step_y)
     if outside or shifted_chroma:
-        needs_conversion = source.codec_context.color_range == ColorRange.JPEG or not (
-            on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom
-        )
-        if needs_conversion:
-            # Keep nearby pixels so conversion preserves chroma at the crop's edges.
-            x0, x1 = _neighbourhood(left, right, frame_width)
-            y0, y1 = _neighbourhood(top, bottom, frame_height)
+        converts = context.color_range == ColorRange.JPEG or not (
+            on_chroma_grid and inside_left < inside_right and inside_top < inside_bottom)
+        if converts:
+            # keep nearby pixels, so the conversion preserves chroma at the crop's edges
+            (x0, x1), (y0, y1) = _neighbourhood(left, right, frame_width), _neighbourhood(top, bottom, frame_height)
         else:
             x0, y0, x1, y1 = inside_left, inside_top, inside_right, inside_bottom
         left, top, right, bottom = left - x0, top - y0, right - x0, bottom - y0
         x, y = max(0, -left), max(0, -top)
         padding = [graph.add("crop", f"{x1 - x0}:{y1 - y0}:{x0}:{y0}:exact=1")]
-        if needs_conversion:
+        if converts:
             padding.append(graph.add("format", "yuv444p16le"))
         padding.append(graph.add("pad", f"{max(x1 - x0, right) + x}:{max(y1 - y0, bottom) + y}:{x}:{y}:black"))
     width, height = clip.size
     graph.link_nodes(
         graph.add_buffer(template=source),
         # turned in the decoded format, which FFmpeg would otherwise convert whole for the padding first
-        *_rotation_filters(graph=graph, rotation=rotation),
+        *rotation_filters(graph, rotation),
         *([graph.add("format", source.pix_fmt)] if rotation else []),
         *padding,
         graph.add("crop", f"{right - left}:{bottom - top}:{left + x}:{top + y}:exact=1"),
-        # Avoid implicit matrix or range conversions.
-        graph.add("scale", f"{width}:{height}:out_color_matrix={source.codec_context.colorspace}:"
-                  f"out_range={source.codec_context.color_range}"),
+        # no implicit matrix or range conversion
+        graph.add("scale", f"{width}:{height}:out_color_matrix={context.colorspace}:out_range={context.color_range}"),
         graph.add("format", source.pix_fmt),
         graph.add("buffersink"),
     )
     graph.configure()
-    # Each size needs its own encoder; H.264 keyframes carry the new dimensions.
+    # each size needs its own encoder: an H.264 keyframe carries the dimensions
     encoder = av.CodecContext.create("libx264", "w")
-    encoder.width, encoder.height = width, height
-    encoder.pix_fmt = source.pix_fmt
-    encoder.color_range = source.codec_context.color_range
-    encoder.colorspace = source.codec_context.colorspace
-    encoder.color_primaries = source.codec_context.color_primaries
-    encoder.color_trc = source.codec_context.color_trc
+    encoder.width, encoder.height, encoder.pix_fmt = width, height, source.pix_fmt
+    encoder.color_range, encoder.colorspace = context.color_range, context.colorspace
+    encoder.color_primaries, encoder.color_trc = context.color_primaries, context.color_trc
     encoder.time_base, encoder.framerate = 1 / rate, rate
-    # Independent encoders must not reorder packets across chapter boundaries.
-    encoder.max_b_frames = 0
+    encoder.max_b_frames = 0  # separate encoders must not reorder packets across a chapter boundary
     encoder.options = {"crf": str(crf), "preset": preset}
-    count = 0
     for index, frame in enumerate(chain((first,), frames), start=clip.start_frame):
-        count += 1
         graph.push(frame)
         cropped = graph.pull()
-        cropped.pts = index
-        cropped.time_base = 1 / rate
-        cropped.pict_type = 0
+        cropped.pts, cropped.time_base, cropped.pict_type = index, 1 / rate, 0
         for packet in encoder.encode(cropped):
             packet.stream = track
             track.container.mux(packet)
     for packet in encoder.encode():
         packet.stream = track
         track.container.mux(packet)
-    return count
+    return index + 1 - clip.start_frame
