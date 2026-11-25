@@ -2,7 +2,6 @@
 
 import json
 import os
-import shutil
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -114,13 +113,11 @@ def _table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
     return [_mark(number, clip.start_frame, clip.end_frame, asdict(clip), rate) for number, clip in enumerate(clips)]
 
 
-def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Packet], int] = lambda packet: 0,
-                      out: Path | None = None) -> None:
-    """Copy the file's packets under a new chapter table, each `moved(packet)` ticks later, over it or to `out`."""
-    out = out or path
+def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Packet], int] = lambda packet: 0) -> None:
+    """Copy the file's packets under a new chapter table, each `moved(packet)` ticks later."""
     # staged beside the output, so the replacement stays on one filesystem
-    with TemporaryDirectory(prefix=f".{out.name}.", dir=out.parent) as directory:
-        staged = Path(directory) / out.name
+    with TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as directory:
+        staged = Path(directory) / path.name
         with av.open(str(path)) as source, av.open(str(staged), mode="w", format="matroska") as output:
             output.set_chapters(chapters)
             track = output.add_stream_from_template(source.streams.video[0])
@@ -131,15 +128,14 @@ def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Pack
                     if packet.dts is not None:
                         packet.dts += move
                     output.mux(packet)
-        staged.replace(out)
+        staged.replace(path)
 
 
-def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = None) -> None:
+def unpack_chapters(path: str | os.PathLike) -> None:
     """Rewrite a Matroska file from before 0.10 where it lies, so that each chapter sits at its source time.
 
     Transitional. Packets are copied and nothing is encoded, so the frames are the same and it takes milliseconds.
-    A file that already keeps source time is left alone. With `out` the file is written there instead, converted or
-    as it is, and `path` is only read.
+    A file that already keeps source time is left alone.
     """
     with av.open(os.fspath(path)) as source:
         chapters, packed = chapter_table(source)
@@ -147,9 +143,6 @@ def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = Non
         rate, clock = Fraction(stream.average_rate or 1), stream.time_base
         matroska = source.format.name.startswith("matroska")
     if not packed:
-        if out is not None:
-            # whoever asked for `out` opens it next, also when another process converted `path` a moment ago
-            shutil.copyfile(path, out)
         return
     if not matroska:
         raise PackedChaptersError(f"{path} has {PACKED}, and only a Matroska file can be converted")
@@ -160,7 +153,7 @@ def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = Non
     def moved(packet: av.Packet) -> int:  # by the chapter it sat in, with the reader's half frame of slack
         return moves[max(bisect_right(starts, packet.pts * clock + Fraction(1, 2) / rate) - 1, 0)]
 
-    _replace_chapters(Path(path), table, moved, None if out is None else Path(out))
+    _replace_chapters(Path(path), table, moved)
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:

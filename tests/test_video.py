@@ -420,9 +420,7 @@ def test_a_packed_file_is_converted_in_place_when_opened_by_its_path(packed, ful
                 (1, 1, 2, "signer"), (2, 3, 4, "signer")]
             assert video.meta.nb_frames == 60
         unpack_chapters(packed)
-        unpack_chapters(packed, packed.with_name("elsewhere.mkv"))
     assert packed.read_bytes() == converted, "a file that keeps source time is left alone"
-    assert packed.with_name("elsewhere.mkv").read_bytes() == converted, "and written elsewhere as it is"
 
 
 def test_a_packed_video_that_cannot_be_rewritten_is_read_from_a_temporary_copy(packed, full, tmp_path, monkeypatch):

@@ -5,6 +5,7 @@ import json
 import math
 import operator
 import os
+import shutil
 import ssl
 import struct
 import sys
@@ -130,8 +131,8 @@ def chapter_table(container: av.container.InputContainer) -> tuple[list[Chapter]
 def _unpack(src) -> tuple[str, TemporaryDirectory | None]:
     """Transitional, for the files stored before 0.10: (the path to open, a folder to remove once it is closed).
 
-    A packed file is rewritten where it lies. One that cannot be written (a read-only mount) is converted into a
-    temporary folder instead, which nothing keeps: the next open converts it again.
+    A packed file is rewritten where it lies. One that cannot be written (a read-only mount) is copied into a
+    temporary folder and converted there, which nothing keeps: the next open converts it again.
     """
     if not (isinstance(src, str) and os.path.isfile(src)):
         raise PackedChaptersError(f"this video has {PACKED}, which is no longer read: convert the file with "
@@ -142,14 +143,11 @@ def _unpack(src) -> tuple[str, TemporaryDirectory | None]:
             unpack_chapters(src)
         except OSError as unwritable:
             folder = TemporaryDirectory()
-            try:
-                copy = os.path.join(folder.name, os.path.basename(src))
-                unpack_chapters(src, copy)
-                warnings.warn(f"{src} has {PACKED} and cannot be rewritten ({unwritable}): reading a temporary "
-                              "converted copy, made again on every open", stacklevel=3)
-            except BaseException:
-                folder.cleanup()  # nobody gets the folder to remove it later
-                raise
+            # ponytail: the folder holds the file twice while it converts; convert straight into it if room matters
+            copy = shutil.copyfile(src, os.path.join(folder.name, os.path.basename(src)))
+            unpack_chapters(copy)
+            warnings.warn(f"{src} has {PACKED} and cannot be rewritten ({unwritable}): reading a temporary "
+                          "converted copy, made again on every open", stacklevel=3)
             return copy, folder
     except (OSError, av.FFmpegError) as e:  # nowhere to write, or packets that cannot be moved
         raise PackedChaptersError(f"{src} has {PACKED}, and could not be converted: {e}") from e

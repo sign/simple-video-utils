@@ -110,11 +110,10 @@ stored at 1-2 s).
 
 Such a file is converted where it lies the first time it is opened by its path, with a warning: its packets are copied
 to their source times, nothing is encoded again, and it takes milliseconds. `unpack_chapters(path)` does the same on
-request, or writes the converted file elsewhere with `unpack_chapters(path, out)`. A file that cannot be rewritten (a
-read-only mount) is converted into a temporary copy instead, which is read and removed when the video is closed: it
-works, but every open converts again and needs room for the copy. As bytes or a stream there is no file to convert, so
-opening it raises `PackedChaptersError` (a `ValueError`). This is a bridge for the files stored before 0.10, to be
-removed once they are converted.
+request. A file that cannot be rewritten (a read-only mount) is copied to a temporary folder and converted there
+instead; the copy is read and removed when the video is closed. It works, but every open converts again and needs
+room for the copy. As bytes or a stream there is no file to convert, so opening it raises `PackedChaptersError` (a
+`ValueError`). This is a bridge for the files stored before 0.10, to be removed once they are converted.
 
 ## Slices
 
