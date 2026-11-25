@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from fractions import Fraction
 from functools import cached_property, lru_cache
 from itertools import groupby, pairwise
+from tempfile import TemporaryDirectory
 from typing import BinaryIO, NamedTuple
 
 import av
@@ -126,17 +127,30 @@ def chapter_table(container: av.container.InputContainer) -> tuple[list[Chapter]
     return found, packed
 
 
-def _unpack(src) -> None:
-    """Transitional, for the files stored before 0.10: a packed file is rewritten where it lies, when it is a file."""
+def _unpack(src) -> tuple[str, TemporaryDirectory | None]:
+    """Transitional, for the files stored before 0.10: (the path to open, a folder to remove once it is closed).
+
+    A packed file is rewritten where it lies. One that cannot be written (a read-only mount) is converted into a
+    temporary folder instead, which nothing keeps: the next open converts it again.
+    """
     if not (isinstance(src, str) and os.path.isfile(src)):
         raise PackedChaptersError(f"this video has {PACKED}, which is no longer read: convert the file with "
                                   "simple_video_utils.unpack_chapters(path), or open it by its path")
-    warnings.warn(f"{src} has {PACKED}: converting the file in place", stacklevel=3)
     from simple_video_utils.chapters import unpack_chapters  # noqa: PLC0415 - chapters.py imports this module
     try:
-        unpack_chapters(src)
-    except (OSError, av.FFmpegError) as e:  # a read-only mount, or packets that cannot be moved
-        raise PackedChaptersError(f"{src} has {PACKED}, and could not be converted in place: {e}") from e
+        try:
+            unpack_chapters(src)
+        except OSError:
+            folder = TemporaryDirectory()
+            copy = os.path.join(folder.name, os.path.basename(src))
+            unpack_chapters(src, copy)
+            warnings.warn(f"{src} has {PACKED} and cannot be rewritten: reading a temporary converted copy, made "
+                          "again on every open", stacklevel=3)
+            return copy, folder
+    except (OSError, av.FFmpegError) as e:  # nowhere to write, or packets that cannot be moved
+        raise PackedChaptersError(f"{src} has {PACKED}, and could not be converted: {e}") from e
+    warnings.warn(f"{src} has {PACKED}: converting the file in place", stacklevel=3)
+    return src, None
 
 
 def _open(src, **options) -> av.container.InputContainer:
@@ -254,6 +268,8 @@ class Video:
     demuxer's (`{"probesize": "32"}` to stop it reading ahead on a live one).
     """
 
+    _copy: TemporaryDirectory | None = None  # holds the converted copy of a packed file that could not be rewritten
+
     def __init__(self, src: str | os.PathLike | bytes | BinaryIO, thread_type: str = "AUTO", buffer_size: int = 32768,
                  format: str | None = None, container_options: dict[str, str] | None = None):
         self._moves = 0  # times the container was repositioned or closed: a read still running then has lost its place
@@ -274,7 +290,7 @@ class Video:
         self.chapters, packed = chapter_table(self.container)
         if packed:
             self.close()
-            _unpack(src)
+            src, self._copy = _unpack(src)
             self.__init__(src, thread_type, buffer_size, format, container_options)
         # the header's: the decoder moves the stream's own size to each frame it decodes, and chapters differ in size
         self._stored = self.stream.width, self.stream.height
@@ -288,6 +304,8 @@ class Video:
     def close(self) -> None:
         self._moves += 1
         self.container.close()
+        if self._copy:
+            self._copy.cleanup()
 
     def __del__(self):
         # PyAV's container and streams refer to each other, so a Video that is only dropped would keep its file and

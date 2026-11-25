@@ -113,11 +113,13 @@ def _table(clips: Sequence[ChapterClip], rate: Fraction) -> list[dict]:
     return [_mark(number, clip.start_frame, clip.end_frame, asdict(clip), rate) for number, clip in enumerate(clips)]
 
 
-def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Packet], int] = lambda packet: 0) -> None:
-    """Copy the file's packets under a new chapter table, each `moved(packet)` ticks later."""
+def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Packet], int] = lambda packet: 0,
+                      out: Path | None = None) -> None:
+    """Copy the file's packets under a new chapter table, each `moved(packet)` ticks later, over it or to `out`."""
+    out = out or path
     # staged beside the output, so the replacement stays on one filesystem
-    with TemporaryDirectory(prefix=f".{path.name}.", dir=path.parent) as directory:
-        staged = Path(directory) / path.name
+    with TemporaryDirectory(prefix=f".{out.name}.", dir=out.parent) as directory:
+        staged = Path(directory) / out.name
         with av.open(str(path)) as source, av.open(str(staged), mode="w", format="matroska") as output:
             output.set_chapters(chapters)
             track = output.add_stream_from_template(source.streams.video[0])
@@ -128,14 +130,15 @@ def _replace_chapters(path: Path, chapters: list[dict], moved: Callable[[av.Pack
                     if packet.dts is not None:
                         packet.dts += move
                     output.mux(packet)
-        staged.replace(path)
+        staged.replace(out)
 
 
-def unpack_chapters(path: str | os.PathLike) -> None:
+def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = None) -> None:
     """Rewrite a Matroska file from before 0.10 where it lies, so that each chapter sits at its source time.
 
     Transitional. Packets are copied and nothing is encoded, so the frames are the same and it takes milliseconds.
-    A file that already keeps source time is left alone.
+    A file that already keeps source time is left alone. With `out` the converted file is written there instead,
+    and `path` is only read.
     """
     with av.open(os.fspath(path)) as source:
         chapters, packed = chapter_table(source)
@@ -153,7 +156,7 @@ def unpack_chapters(path: str | os.PathLike) -> None:
     def moved(packet: av.Packet) -> int:  # by the chapter it sat in, with the reader's half frame of slack
         return moves[max(bisect_right(starts, packet.pts * clock + Fraction(1, 2) / rate) - 1, 0)]
 
-    _replace_chapters(Path(path), table, moved)
+    _replace_chapters(Path(path), table, moved, out and Path(out))
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:
