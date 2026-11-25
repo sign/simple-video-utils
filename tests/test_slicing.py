@@ -1,3 +1,4 @@
+import asyncio
 import io
 import struct
 from fractions import Fraction
@@ -9,7 +10,7 @@ import numpy as np
 import pytest
 from conftest import ASSETS, EXAMPLE, Pipe, make_video, numbers, windows
 
-from simple_video_utils import Video, VideoSlice
+from simple_video_utils import Video, VideoSlice, slicing
 
 
 @pytest.fixture
@@ -118,6 +119,53 @@ def test_slice_streams_as_it_is_read(tmp_path):
     assert data.index(b"moov") < data.index(b"mdat")
     with Video(Pipe(data)) as video:  # moov first: a reader needs no seeking
         assert np.array_equal(video.read().frames, whole[12:117])
+
+
+def test_slice_is_cut_in_a_worker_thread_for_an_async_reader(tmp_path, monkeypatch):
+    opened, closed = [], []
+
+    class Counted(Video):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+        def close(self):
+            if self not in closed:  # dropping a Video closes it a second time
+                closed.append(self)
+            super().close()
+
+    monkeypatch.setattr(slicing, "Video", Counted)
+    clip = VideoSlice(make_video(tmp_path / "noise.mp4", frames=120, noise=True), 0.4, 3.9)
+    turns = 0
+
+    async def others():
+        nonlocal turns
+        while True:
+            await asyncio.sleep(0)
+            turns += 1
+
+    async def read():
+        ticking = asyncio.create_task(others())
+        first = [chunk async for chunk in clip]
+        assert turns >= len(first), "the event loop ran its other tasks while every chunk was cut"
+        assert [chunk async for chunk in clip] == first, "replays, as a retried upload needs"
+
+        async def all_closed():  # by the worker thread once it lets go of the chunk it cut: moments later, not at once
+            while len(closed) < len(opened):
+                await asyncio.sleep(0.001)
+
+        chunks = aiter(clip)
+        await anext(chunks)
+        await chunks.aclose()  # a reader that stops early
+        await all_closed()
+        cut = asyncio.create_task(anext(aiter(clip)))
+        await asyncio.sleep(0)
+        cut.cancel()  # a reader cancelled while its chunk is being cut
+        await all_closed()
+        ticking.cancel()
+        return first
+
+    assert asyncio.run(asyncio.wait_for(read(), 30)) == list(clip)
 
 
 def test_slice_of_bytes_and_of_b_frames(tmp_path):

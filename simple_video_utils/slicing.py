@@ -1,10 +1,11 @@
 """Cut seconds out of a video without re-encoding, as an MP4 that is never held in memory whole."""
 
+import asyncio
 import json
 import math
 import os
 from bisect import bisect_left
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from fractions import Fraction
 from itertools import islice
 
@@ -113,8 +114,9 @@ def _keyframe_header(stream: av.VideoStream, packet: av.Packet) -> tuple[bytes, 
 class VideoSlice:
     """Seconds [start, stop) of a video as a streamable MP4 (moov first), produced as it is read.
 
-    Iterate for its bytes; iterate again to replay it. Packets are copied, so nothing is re-encoded and codecs MP4
-    cannot carry raise. Times are matched at the precision of the file's clock (a millisecond in Matroska). The clip
+    Iterate for its bytes; iterate again to replay it. `async for` gives the same chunks, each cut in a worker
+    thread. Packets are copied, so nothing is re-encoded and codecs MP4 cannot carry raise. Times are matched at the
+    precision of the file's clock (a millisecond in Matroska). The clip
     starts on its first frame and holds the frames from the keyframe before that one, hidden behind an edit list.
     With B-frames it also holds the later frames its last ones are predicted from, and those stay visible: a few
     frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it spans
@@ -233,3 +235,9 @@ class VideoSlice:
                 del header
                 if head.size > len(head.head):
                     yield from self._mux(_Sink(len(head.head), queue=True), video, begin, end)
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        # a reader that stops early or is cancelled drops `chunks`; the source closes once no thread is cutting from it
+        chunks = iter(self)
+        while (chunk := await asyncio.to_thread(next, chunks, None)) is not None:
+            yield chunk

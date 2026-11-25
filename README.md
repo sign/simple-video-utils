@@ -125,6 +125,8 @@ clip = VideoSlice("cropped.mkv", 2.0, 8.0)                 # a path or bytes; no
 clip.size, clip.duration                              # measured without keeping the clip
 for chunk in clip:                                    # MP4 bytes, about 64 KiB at a time; iterate again to replay
     ...
+async for chunk in clip:                              # the same, each chunk cut in a worker thread
+    ...
 data = clip.read()                                    # or the whole clip at once
 ```
 
