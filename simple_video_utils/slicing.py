@@ -114,14 +114,14 @@ def _keyframe_header(stream: av.VideoStream, packet: av.Packet) -> tuple[bytes, 
 class VideoSlice:
     """Seconds [start, stop) of a video as a streamable MP4 (moov first), produced as it is read.
 
-    Iterate for its bytes; iterate again to replay it. `async for` gives the same chunks, each cut in a worker
-    thread. Packets are copied, so nothing is re-encoded and codecs MP4 cannot carry raise. Times are matched at the
-    precision of the file's clock (a millisecond in Matroska). The clip
-    starts on its first frame and holds the frames from the keyframe before that one, hidden behind an edit list.
-    With B-frames it also holds the later frames its last ones are predicted from, and those stay visible: a few
-    frames at or past `stop`, not always consecutive. Gaps between chapters stay gaps, and the chapters it spans
-    come along, so `Video` reads exactly the frames in range from a chaptered slice. Where chapters differ in size
-    the clip's header describes the chapter it starts in. The source must not change between reads.
+    Iterate for its bytes; iterate again to replay it. `async for` gives the same chunks, each cut in a worker thread.
+    Packets are copied, so nothing is re-encoded and codecs MP4 cannot carry raise. Times are matched at the precision
+    of the file's clock (a millisecond in Matroska). The clip starts on its first frame and holds the frames from the
+    keyframe before that one, hidden behind an edit list. With B-frames it also holds the later frames its last ones are
+    predicted from, and those stay visible: a few frames at or past `stop`, not always consecutive. Gaps between
+    chapters stay gaps, and the chapters it spans come along, so `Video` reads exactly the frames in range from a
+    chaptered slice. Where chapters differ in size the clip's header describes the chapter it starts in. The source must
+    not change between reads.
     """
 
     def __init__(self, src: str | os.PathLike | bytes, start: float, stop: float):
@@ -237,7 +237,12 @@ class VideoSlice:
                     yield from self._mux(_Sink(len(head.head), queue=True), video, begin, end)
 
     async def __aiter__(self) -> AsyncIterator[bytes]:
-        # a reader that stops early or is cancelled drops `chunks`; the source closes once no thread is cutting from it
-        chunks = iter(self)
-        while (chunk := await asyncio.to_thread(next, chunks, None)) is not None:
-            yield chunk
+        chunks, cut = iter(self), asyncio.get_running_loop().run_in_executor
+        try:
+            while (chunk := await cut(None, next, chunks, None)) is not None:
+                yield chunk
+        finally:
+            # a reader that stops early or is cancelled lets go of `chunks`, and the source closes once no thread is
+            # cutting from it. Let go here: a cancelled task's traceback keeps this frame for as long as the task is
+            # kept, and `asyncio.to_thread` would leave a frame of its own there, holding `chunks` too.
+            del chunks

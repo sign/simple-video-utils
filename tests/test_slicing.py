@@ -1,6 +1,7 @@
 import asyncio
 import io
 import struct
+import threading
 from fractions import Fraction
 from itertools import pairwise
 from pathlib import Path
@@ -122,12 +123,14 @@ def test_slice_streams_as_it_is_read(tmp_path):
 
 
 def test_slice_is_cut_in_a_worker_thread_for_an_async_reader(tmp_path, monkeypatch):
-    opened, closed = [], []
+    opened, closed, go = [], [], threading.Event()
+    go.set()
 
     class Counted(Video):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             opened.append(self)
+            go.wait()
 
         def close(self):
             if self not in closed:  # dropping a Video closes it a second time
@@ -158,9 +161,12 @@ def test_slice_is_cut_in_a_worker_thread_for_an_async_reader(tmp_path, monkeypat
         await anext(chunks)
         await chunks.aclose()  # a reader that stops early
         await all_closed()
+        go.clear()
         cut = asyncio.create_task(anext(aiter(clip)))
-        await asyncio.sleep(0)
-        cut.cancel()  # a reader cancelled while its chunk is being cut
+        while len(opened) == len(closed):  # until a worker thread has the source open, and waits
+            await asyncio.sleep(0.001)
+        cut.cancel()  # a reader cancelled while its chunk is being cut, whose task is kept, traceback and all
+        go.set()
         await all_closed()
         ticking.cancel()
         return first
