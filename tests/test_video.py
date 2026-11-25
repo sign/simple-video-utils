@@ -423,16 +423,35 @@ def test_a_packed_file_is_converted_in_place_when_opened_by_its_path(packed, ful
     assert packed.read_bytes() == converted, "a file that keeps source time is left alone"
 
 
-def test_a_packed_video_that_cannot_be_rewritten_is_refused(packed):
-    assert issubclass(PackedChaptersError, ValueError)
-    with pytest.raises(PackedChaptersError, match="unpack_chapters"):  # bytes have no file to rewrite
-        Video(packed.read_bytes())
-    packed.parent.chmod(0o555)
+def test_a_packed_video_that_cannot_be_rewritten_is_read_from_a_temporary_copy(packed, full, tmp_path, monkeypatch):
+    spare = tmp_path / "spare"
+    spare.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(spare))
+    stored = packed.read_bytes()
+    packed.parent.chmod(0o555)  # as on a read-only mount
     try:
-        with pytest.warns(UserWarning, match="converting"), pytest.raises(PackedChaptersError, match="in place: "):
+        for _ in range(2):  # nothing is kept, so every open converts again
+            with pytest.warns(UserWarning, match="cannot be rewritten"):
+                video = Video(packed)
+            assert any(spare.iterdir())
+            frames, indices = video.read()
+            video.close()
+            assert indices.tolist() == [*range(30, 60), *range(90, 120)]
+            assert np.array_equal(frames, full[:60])
+            assert not any(spare.iterdir()), "the copy goes when the video is closed"
+        assert packed.read_bytes() == stored
+        spare.chmod(0o555)
+        with pytest.raises(PackedChaptersError, match="could not be converted: "):
             video_metadata(packed)
     finally:
         packed.parent.chmod(0o755)
+        spare.chmod(0o755)
+
+
+def test_a_packed_video_without_a_file_is_refused(packed):
+    assert issubclass(PackedChaptersError, ValueError)
+    with pytest.raises(PackedChaptersError, match="unpack_chapters"):  # bytes have no file to convert
+        Video(packed.read_bytes())
 
 
 # ordinary markers, and titles that only look like ours: a title is anyone's text
