@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 from bisect import bisect_right
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, replace
@@ -137,8 +138,8 @@ def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = Non
     """Rewrite a Matroska file from before 0.10 where it lies, so that each chapter sits at its source time.
 
     Transitional. Packets are copied and nothing is encoded, so the frames are the same and it takes milliseconds.
-    A file that already keeps source time is left alone. With `out` the converted file is written there instead,
-    and `path` is only read.
+    A file that already keeps source time is left alone. With `out` the file is written there instead, converted or
+    as it is, and `path` is only read.
     """
     with av.open(os.fspath(path)) as source:
         chapters, packed = chapter_table(source)
@@ -146,6 +147,9 @@ def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = Non
         rate, clock = Fraction(stream.average_rate or 1), stream.time_base
         matroska = source.format.name.startswith("matroska")
     if not packed:
+        if out is not None:
+            # whoever asked for `out` opens it next, also when another process converted `path` a moment ago
+            shutil.copyfile(path, out)
         return
     if not matroska:
         raise PackedChaptersError(f"{path} has {PACKED}, and only a Matroska file can be converted")
@@ -156,7 +160,7 @@ def unpack_chapters(path: str | os.PathLike, out: str | os.PathLike | None = Non
     def moved(packet: av.Packet) -> int:  # by the chapter it sat in, with the reader's half frame of slack
         return moves[max(bisect_right(starts, packet.pts * clock + Fraction(1, 2) / rate) - 1, 0)]
 
-    _replace_chapters(Path(path), table, moved, out and Path(out))
+    _replace_chapters(Path(path), table, moved, None if out is None else Path(out))
 
 
 def _neighbourhood(low: int, high: int, size: int) -> tuple[int, int]:

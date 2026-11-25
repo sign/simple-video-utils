@@ -140,12 +140,16 @@ def _unpack(src) -> tuple[str, TemporaryDirectory | None]:
     try:
         try:
             unpack_chapters(src)
-        except OSError:
+        except OSError as unwritable:
             folder = TemporaryDirectory()
-            copy = os.path.join(folder.name, os.path.basename(src))
-            unpack_chapters(src, copy)
-            warnings.warn(f"{src} has {PACKED} and cannot be rewritten: reading a temporary converted copy, made "
-                          "again on every open", stacklevel=3)
+            try:
+                copy = os.path.join(folder.name, os.path.basename(src))
+                unpack_chapters(src, copy)
+                warnings.warn(f"{src} has {PACKED} and cannot be rewritten ({unwritable}): reading a temporary "
+                              "converted copy, made again on every open", stacklevel=3)
+            except BaseException:
+                folder.cleanup()  # nobody gets the folder to remove it later
+                raise
             return copy, folder
     except (OSError, av.FFmpegError) as e:  # nowhere to write, or packets that cannot be moved
         raise PackedChaptersError(f"{src} has {PACKED}, and could not be converted: {e}") from e
